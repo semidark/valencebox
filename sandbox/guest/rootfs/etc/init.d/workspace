@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+description="Mount the workspace disk at /workspace"
+
+depend() {
+	need localmount
+}
+
+start() {
+	ebegin "Mounting /workspace"
+	mkdir -p /workspace
+	DEV=$(blkid -t TYPE=ext4 -o device | grep -E '/dev/(vd|sd|hd)b' | head -1)
+	if [ -z "$DEV" ]; then
+		eerror "no workspace disk found"
+		eend 1
+		return 1
+	fi
+	mountinfo -q /workspace || mount -o noatime,nodiratime "$DEV" /workspace
+	eend $?
+}
+
+stop() {
+	ebegin "Unmounting /workspace"
+	umount /workspace 2>/dev/null
+	eend 0
+}

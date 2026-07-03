@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>v86 Coding Sandbox</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font: 13px ui-monospace, Menlo, monospace; background: #0b0d10; color: #cdd3da; display: flex; flex-direction: column; height: 100vh; }
+      header { display: flex; gap: 16px; align-items: center; padding: 8px 12px; background: #12151a; border-bottom: 1px solid #222; }
+      .badge { padding: 2px 8px; border-radius: 4px; background: #1d2530; }
+      .badge.ready { background: #143d1e; color: #7fe08f; }
+      .badge.error { background: #3d1414; color: #ff9a9a; }
+      .stat { color: #7d8794; }
+      .stat b { color: #cdd3da; font-weight: 600; }
+      #term { flex: 1; overflow-y: auto; white-space: pre-wrap; word-break: break-all; padding: 10px 12px; }
+      footer { display: flex; gap: 8px; padding: 8px 12px; background: #12151a; border-top: 1px solid #222; }
+      input { flex: 1; background: #0b0d10; border: 1px solid #2a2f38; color: #cdd3da; padding: 6px 8px; border-radius: 4px; font: inherit; }
+      button { background: #1d2530; color: #cdd3da; border: 1px solid #2a2f38; padding: 6px 12px; border-radius: 4px; cursor: pointer; font: inherit; }
+      button:hover { background: #263040; }
+      #conflicts { color: #e0c07f; padding: 0 12px; max-height: 80px; overflow-y: auto; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span id="phase" class="badge">starting…</span>
+      <span class="stat">boot <b id="boot">–</b></span>
+      <span class="stat">↑<b id="pushed">0</b> ↓<b id="pulled">0</b> ✕<b id="deleted">0</b></span>
+      <span class="stat">conflicts <b id="conflicts-n">0</b></span>
+      <span class="stat">net <b id="net">–</b></span>
+      <span style="flex:1"></span>
+      <button id="snap">Snapshot</button>
+    </header>
+    <div id="conflicts"></div>
+    <div id="term"></div>
+    <footer>
+      <input id="cmd" placeholder="run a command in the guest… (e.g. ls -la /workspace)" />
+      <button id="send">Run</button>
+    </footer>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "name": "v86-sandbox",
+  "version": "0.1.0",
+  "description": "Secure v86 microVM coding sandbox for an AI agent (Electron)",
+  "main": "dist/main/main.js",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p . && node scripts/copy-renderer.js",
+    "start": "npm run build && electron .",
+    "test:boot": "tsx test/boot.test.ts",
+    "test:bridge": "tsx test/bridge.test.ts",
+    "test:sync": "tsx test/sync.test.ts",
+    "test:snapshot": "tsx test/snapshot.test.ts",
+    "test:net": "tsx test/net.test.ts",
+    "test:e2e": "tsx test/e2e.test.ts",
+    "test:ui": "electron test/ui-smoke.js",
+    "images": "./scripts/build-guest.sh"
+  },
+  "dependencies": {
+    "@mercuryworkshop/wisp-js": "^0.4.1",
+    "@mongodb-js/zstd": "^2.0.0",
+    "chokidar": "^4.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "electron": "^37.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
