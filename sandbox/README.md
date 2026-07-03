@@ -31,41 +31,44 @@ CoreOS can't run here).
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph App["Electron app"]
         direction TB
         subgraph Host["Main process / Sandbox"]
-            direction TB
+            direction LR
+            Snap["SnapshotManager"]
             VM["SandboxVM"]
             Sync["SyncManager"]
             Bridge["HostBridge"]
             Data["DataPlane"]
-            Snap["SnapshotManager"]
             Wisp["WispServer + DoH"]
         end
-        Preload["preload"]
+
+        subgraph Render["Renderer process"]
+            direction LR
+            Preload["preload"]
+            Renderer["renderer UI + console"]
+        end
     end
 
     subgraph Guest["Alpine guest (v86 WASM)"]
-        direction TB
+        direction LR
         Root["root fs /"]
         Agent["sync-agent"]
         Work["/workspace"]
         Net["eth0"]
     end
 
-    Renderer["renderer UI + console"]
-
-    VM -->|hda ext4| Root
-    VM -->|hdb ext4| Work
-    Bridge <-->|virtio-console /dev/hvc0| Agent
-    Data <-->|TCP over virtio-net + WISP| Agent
-    Agent -->|native I/O| Work
-    Wisp -->|wisp:// WS| Net
-    Preload <-->|IPC| Renderer
+    Snap -.->|save_state / restore| VM
     Sync --- Bridge
     Sync --- Data
-    Snap -.->|save_state / restore| VM
+    Preload <-->|IPC| Renderer
+    VM -->|hda ext4| Root
+    VM -->|hdb ext4| Work
+    Bridge <-->|virtio-console| Agent
+    Data <-->|TCP data plane| Agent
+    Agent -->|native I/O| Work
+    Wisp -->|WISP egress| Net
 ```
 
 - `HostBridge` is the low-latency control path carrying the framed protocol from `PROTOCOL.md`.
