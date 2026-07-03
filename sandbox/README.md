@@ -30,22 +30,49 @@ CoreOS can't run here).
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    subgraph App["Electron app"]
+        direction TB
+        subgraph Host["Main process / Sandbox"]
+            direction TB
+            VM["SandboxVM"]
+            Sync["SyncManager"]
+            Bridge["HostBridge"]
+            Data["DataPlane"]
+            Snap["SnapshotManager"]
+            Wisp["WispServer + DoH"]
+        end
+        Preload["preload"]
+    end
+
+    subgraph Guest["Alpine guest (v86 WASM)"]
+        direction TB
+        Root["root fs /"]
+        Agent["sync-agent"]
+        Work["/workspace"]
+        Net["eth0"]
+    end
+
+    Renderer["renderer UI + console"]
+
+    VM -->|hda ext4| Root
+    VM -->|hdb ext4| Work
+    Bridge <-->|virtio-console /dev/hvc0| Agent
+    Data <-->|TCP over virtio-net + WISP| Agent
+    Agent -->|native I/O| Work
+    Wisp -->|wisp:// WS| Net
+    Preload <-->|IPC| Renderer
+    Sync --- Bridge
+    Sync --- Data
+    Snap -.->|save_state / restore| VM
 ```
-Electron main process                         Alpine guest (v86 WASM)
-─────────────────────                         ───────────────────────
-Sandbox                                        hda ext4 → /
-├─ SandboxVM (v86, headless)  ── hdb ext4 ──►  /workspace  (native I/O)
-├─ HostBridge  ─── virtio-console /dev/hvc0 ─► sync-agent (Go, static i386)
-│    control channel (PROTOCOL.md)                inotify + framed protocol
-├─ DataPlane  ◄── TCP over virtio-net+WISP ──►  bulk file transfers
-│    in-process VIP, token-gated, ~2-5x faster
-├─ SyncManager   manifests, chunked xfer, LWW
-├─ SnapshotManager  zstd save_state / restore
-└─ WispServer + DoH gate  ─── wisp:// WS ────►  eth0 DHCP (virtio-net)
-     egress allowlist (sole network path)
-        │
-     preload (contextIsolation) ── IPC ──► renderer (status UI + console)
-```
+
+- `HostBridge` is the low-latency control path carrying the framed protocol from `PROTOCOL.md`.
+- `DataPlane` is the token-gated bulk-transfer path over the guest's virtio-net/WISP route, usually ~2-5x faster than the console.
+- `SyncManager` owns manifest diffing, chunked transfer, and LWW conflict handling.
+- `sync-agent` is a static Go/i386 guest agent that watches `/workspace` and applies transfers.
+- `WispServer + DoH` is the guest's sole allowlisted egress path.
 
 Full walkthrough with diagrams (why two channels, how the data-plane VIP
 trick works, why small files get batched):
