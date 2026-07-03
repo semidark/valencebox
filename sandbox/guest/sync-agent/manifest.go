@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"io/fs"
 	"os"
@@ -22,6 +23,17 @@ type Manifest struct {
 }
 
 const tmpDirName = ".sync-tmp"
+
+// ignoredRel: paths never synced, at any depth. Mirrors src/main/manifest.ts.
+func ignoredRel(rel string) bool {
+	for _, seg := range strings.Split(rel, "/") {
+		switch seg {
+		case tmpDirName, ".git", "node_modules", "lost+found", ".DS_Store":
+			return true
+		}
+	}
+	return false
+}
 
 func hashFile(p string) (string, error) {
 	f, err := os.Open(p)
@@ -47,7 +59,7 @@ func buildManifest(root string) (*Manifest, error) {
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
-		if strings.HasPrefix(rel, tmpDirName) || rel == "lost+found" {
+		if ignoredRel(rel) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -76,6 +88,30 @@ func buildManifest(root string) (*Manifest, error) {
 		return nil
 	})
 	return m, err
+}
+
+// A whole-workspace manifest can exceed MaxPayload, so it is sent as
+// multiple MANIFEST frames that the host merges. Mirrors splitManifest in
+// src/main/manifest.ts (same batch limit and per-entry size estimate).
+const manifestBatchLimit = 160 * 1024
+
+func marshalManifestBatches(m *Manifest) [][]byte {
+	var batches [][]byte
+	cur := &Manifest{Files: map[string]FileMeta{}}
+	curLen := 0
+	for rel, meta := range m.Files {
+		entLen := len(rel) + 160
+		if curLen > 0 && curLen+entLen > manifestBatchLimit {
+			b, _ := json.Marshal(cur)
+			batches = append(batches, b)
+			cur = &Manifest{Files: map[string]FileMeta{}}
+			curLen = 0
+		}
+		cur.Files[rel] = meta
+		curLen += entLen
+	}
+	b, _ := json.Marshal(cur)
+	return append(batches, b)
 }
 
 // safeJoin resolves a protocol-relative path under root, rejecting escapes.

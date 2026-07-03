@@ -15,7 +15,7 @@ import {
   encodeChunk,
 } from "../shared/protocol";
 import { HostBridge } from "./bridge";
-import { TMP_DIR_NAME, buildManifest, hashFileSync, safeJoin } from "./manifest";
+import { TMP_DIR_NAME, buildManifest, hashFileSync, isIgnored, safeJoin, splitManifest } from "./manifest";
 
 interface Incoming {
   meta: PutMeta;
@@ -65,8 +65,13 @@ export class SyncManager extends EventEmitter {
     super();
     fs.mkdirSync(hostDir, { recursive: true });
     bridge.on(`frame:${FrameType.MANIFEST}`, (f: Frame) => {
+      // manifests arrive as one or more parts (see splitManifest) — merge
       try {
-        this.guestManifest = JSON.parse(f.payload.toString("utf8"));
+        const part: ManifestPayload = JSON.parse(f.payload.toString("utf8"));
+        if (!this.guestManifest) this.guestManifest = { files: {} };
+        for (const [rel, meta] of Object.entries(part.files ?? {})) {
+          if (!isIgnored(rel)) this.guestManifest.files[rel] = meta;
+        }
         this.emit("guest-manifest", this.guestManifest);
       } catch {
         /* ignore malformed */
@@ -107,7 +112,10 @@ export class SyncManager extends EventEmitter {
     const toDelete = Object.keys(guest.files).filter((rel) => !host.files[rel]);
 
     // announce host manifest so the guest can seed its own lastSync
-    this.bridge.send(FrameType.MANIFEST, Buffer.from(JSON.stringify(host)));
+    // (chunked: a whole-project manifest can exceed the frame payload cap)
+    for (const part of splitManifest(host)) {
+      this.bridge.send(FrameType.MANIFEST, Buffer.from(JSON.stringify(part)));
+    }
 
     for (const rel of toPush) await this.pushFile(rel);
     for (const rel of toDelete) await this.pushDelete(rel);
@@ -119,8 +127,8 @@ export class SyncManager extends EventEmitter {
     this.watcher = chokidar.watch(this.hostDir, {
       ignoreInitial: true,
       ignored: (p: string) => {
-        const rel = path.relative(this.hostDir, p);
-        return rel.split(path.sep).some((seg) => seg === TMP_DIR_NAME || seg === ".git");
+        const rel = path.relative(this.hostDir, p).split(path.sep).join("/");
+        return rel !== "" && isIgnored(rel);
       },
       awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 50 },
     });
@@ -297,6 +305,7 @@ export class SyncManager extends EventEmitter {
     }
     const abs = safeJoin(this.hostDir, meta.path);
     if (!abs) return this.nak(f.seq, "illegal path", { xfer: meta.xfer });
+    if (isIgnored(meta.path)) return this.nak(f.seq, "ignored path", { xfer: meta.xfer });
 
     // LWW conflict: local edited since last sync?
     const verdict = this.resolveIncoming(meta, abs);
@@ -368,6 +377,7 @@ export class SyncManager extends EventEmitter {
     }
     const abs = safeJoin(this.hostDir, body.path);
     if (!abs) return this.nak(f.seq, "illegal path");
+    if (isIgnored(body.path)) return this.ack(f.seq); // never synced, nothing to do
     await fsp.rm(abs, { recursive: true, force: true });
     this.lastSync.delete(body.path);
     this.stats.deleted++;

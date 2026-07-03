@@ -87,9 +87,11 @@ func run() error {
 		case TypeHello:
 			recv.ack(f.Seq, map[string]any{"role": "guest"})
 			// host (re)connected: it will drive manifest exchange; send ours
+			// (chunked — a big workspace manifest exceeds one frame)
 			if m, merr := buildManifest(*flagRoot); merr == nil {
-				b, _ := json.Marshal(m)
-				fw.Send(TypeManifest, b)
+				for _, b := range marshalManifestBatches(m) {
+					fw.Send(TypeManifest, b)
+				}
 			}
 		case TypePing:
 			recv.ack(f.Seq, nil)

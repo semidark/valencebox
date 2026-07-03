@@ -7,7 +7,23 @@ import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as path from "path";
 import { compress, decompress } from "@mongodb-js/zstd";
-import { SandboxVM } from "./vm";
+import { SandboxVM, imagesDir } from "./vm";
+
+// A snapshot is RAM+device state on top of specific disk images; restoring
+// it over a rebuilt image corrupts the guest. Fingerprint the images at save
+// time and refuse to restore on mismatch (cold boot instead).
+export function imageFingerprint(): string {
+  return ["vmlinuz.bin", "initramfs.bin", "alpine-root.img", "workspace.img"]
+    .map((name) => {
+      try {
+        const st = fs.statSync(path.join(imagesDir(), name));
+        return `${name}:${st.size}:${Math.floor(st.mtimeMs)}`;
+      } catch {
+        return `${name}:missing`;
+      }
+    })
+    .join("|");
+}
 
 export interface SnapshotOptions {
   /** check cadence; a save happens at most this often (default 5 min) */
@@ -68,6 +84,10 @@ export class SnapshotManager extends EventEmitter {
       const tmp = this.file + ".tmp";
       await fsp.writeFile(tmp, z);
       await fsp.rename(tmp, this.file);
+      await fsp.writeFile(
+        this.file + ".meta.json",
+        JSON.stringify({ fingerprint: imageFingerprint(), savedAt: Date.now() })
+      );
       const res = { rawBytes: state.byteLength, compressedBytes: z.length, ms: Date.now() - t0 };
       this.emit("saved", res);
       return res;
@@ -82,6 +102,17 @@ export class SnapshotManager extends EventEmitter {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /** snapshot exists AND was taken against the current disk images */
+  static usable(file: string): boolean {
+    if (!SnapshotManager.exists(file)) return false;
+    try {
+      const meta = JSON.parse(fs.readFileSync(file + ".meta.json", "utf8"));
+      return meta.fingerprint === imageFingerprint();
+    } catch {
+      return false; // no/unreadable meta (pre-fingerprint snapshot) → cold boot
     }
   }
 

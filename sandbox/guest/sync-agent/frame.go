@@ -87,6 +87,10 @@ type FrameWriter struct {
 func NewFrameWriter(w io.Writer) *FrameWriter { return &FrameWriter{w: w} }
 
 func (fw *FrameWriter) Send(typ byte, payload []byte) (uint32, error) {
+	if len(payload) > MaxPayload {
+		// an oversized frame would be silently discarded by the host parser
+		return 0, fmt.Errorf("payload too large: %d", len(payload))
+	}
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
 	fw.seq++

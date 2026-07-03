@@ -44,8 +44,8 @@ func (w *Watcher) watchTree(dir string) error {
 		if err != nil || !d.IsDir() {
 			return nil
 		}
-		base := filepath.Base(p)
-		if base == tmpDirName || base == "lost+found" {
+		if rel, rerr := filepath.Rel(w.root, p); rerr == nil && rel != "." &&
+			ignoredRel(filepath.ToSlash(rel)) {
 			return filepath.SkipDir
 		}
 		wd, werr := syscall.InotifyAddWatch(w.fd, p, watchMask)
@@ -90,10 +90,13 @@ func (w *Watcher) handle(wd int, mask uint32, name string) {
 	}
 	abs := filepath.Join(dir, name)
 	rel, err := filepath.Rel(w.root, abs)
-	if err != nil || strings.HasPrefix(rel, tmpDirName) {
+	if err != nil {
 		return
 	}
 	rel = filepath.ToSlash(rel)
+	if ignoredRel(rel) {
+		return
+	}
 
 	isDir := mask&syscall.IN_ISDIR != 0
 	switch {

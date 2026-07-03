@@ -50,7 +50,10 @@ export class Sandbox extends EventEmitter {
       await this.wisp.start();
     }
 
-    const restoring = SnapshotManager.exists(this.cfg.snapshotFile);
+    const restoring = SnapshotManager.usable(this.cfg.snapshotFile);
+    if (!restoring && SnapshotManager.exists(this.cfg.snapshotFile)) {
+      this.emit("log", "snapshot is from different disk images — cold booting");
+    }
     let initialState: ArrayBuffer | undefined;
     if (restoring) {
       this.setStatus({ phase: "restore" });
@@ -130,11 +133,23 @@ export class Sandbox extends EventEmitter {
   }
 
   private async reconcileAfterRestore(): Promise<void> {
-    // Ask the guest for its manifest, then hydrate() diffs host→guest.
+    // Wait for the guest manifest, which arrives as multiple frames for big
+    // workspaces: settle 1s after the last part (cap 10s; proceed if quiet).
     await new Promise<void>((resolve) => {
-      const done = () => resolve();
-      this.sync.once("guest-manifest", done);
-      setTimeout(done, 5000); // proceed even if guest is quiet
+      let settle: NodeJS.Timeout | undefined;
+      const done = () => {
+        clearTimeout(cap);
+        if (settle) clearTimeout(settle);
+        this.sync.off("guest-manifest", onPart);
+        resolve();
+      };
+      const cap = setTimeout(done, 10000);
+      const onPart = () => {
+        if (settle) clearTimeout(settle);
+        settle = setTimeout(done, 1000);
+      };
+      this.sync.on("guest-manifest", onPart);
+      settle = setTimeout(done, 5000); // guest silent → proceed
     });
     await this.sync.hydrate();
   }

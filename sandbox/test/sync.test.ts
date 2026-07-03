@@ -31,12 +31,12 @@ function makeTree(): { files: number; bytes: number } {
     files++;
     bytes += data.length;
   };
-  // node_modules-ish: many small files across nested dirs
+  // dependency-tree-ish: many small files across nested dirs
   for (let p = 0; p < 20; p++) {
     for (let f = 0; f < 15; f++) {
-      put(`node_modules/pkg-${p}/lib/mod-${f}.js`, prand(500 + ((p * f * 37) % 4000), p * 100 + f));
+      put(`vendor/pkg-${p}/lib/mod-${f}.js`, prand(500 + ((p * f * 37) % 4000), p * 100 + f));
     }
-    put(`node_modules/pkg-${p}/package.json`, Buffer.from(JSON.stringify({ name: `pkg-${p}` })));
+    put(`vendor/pkg-${p}/package.json`, Buffer.from(JSON.stringify({ name: `pkg-${p}` })));
   }
   // some source files
   for (let i = 0; i < 30; i++) put(`src/file-${i}.ts`, prand(2000 + i * 111, 7000 + i));
@@ -44,6 +44,12 @@ function makeTree(): { files: number; bytes: number } {
   put("dist/bundle.bin", prand(8 * 1024 * 1024, 42));
   put("dist/assets.bin", prand(4 * 1024 * 1024, 43));
   put("README.md", Buffer.from("# sync test\n"));
+  // ignored trees: present on host, must never reach the guest (not counted)
+  for (const rel of ["node_modules/some-pkg/index.js", ".git/config", ".DS_Store"]) {
+    const abs = path.join(HOST_WS, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, `ignored ${rel}\n`);
+  }
   return { files, bytes };
 }
 
@@ -81,6 +87,12 @@ async function main() {
     new RegExp(`COUNT=${tree.files}\\b`)
   );
   console.log("✓ guest file count matches");
+
+  await run(
+    "echo IGNORED_MISSING=$(ls /workspace/node_modules /workspace/.git /workspace/.DS_Store 2>&1 | grep -c 'No such')",
+    /IGNORED_MISSING=3/
+  );
+  console.log("✓ ignored trees (node_modules, .git, .DS_Store) not synced");
 
   const bundleHash = sha(path.join(HOST_WS, "dist/bundle.bin"));
   await run("sha256sum /workspace/dist/bundle.bin", new RegExp(bundleHash));

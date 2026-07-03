@@ -1,9 +1,25 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { FileMeta, ManifestPayload } from "../shared/protocol";
+import { FileMeta, ManifestPayload, MAX_PAYLOAD } from "../shared/protocol";
 
 export const TMP_DIR_NAME = ".sync-tmp";
+
+// Never synced, at any depth. Mirrors guest/sync-agent/manifest.go.
+// node_modules: host-native binaries are useless in the i386 Linux guest
+// (install inside the guest instead); .git: history isn't workspace content.
+export const IGNORE_SEGMENTS = new Set([
+  TMP_DIR_NAME,
+  ".git",
+  "node_modules",
+  "lost+found",
+  ".DS_Store",
+]);
+
+/** true if a protocol-relative path falls under the sync ignore rules */
+export function isIgnored(rel: string): boolean {
+  return rel.split("/").some((seg) => IGNORE_SEGMENTS.has(seg));
+}
 
 export function hashFileSync(p: string): string {
   const h = crypto.createHash("sha256");
@@ -21,8 +37,6 @@ export function hashFileSync(p: string): string {
   return h.digest("hex");
 }
 
-const SKIP_DIRS = new Set([TMP_DIR_NAME, "lost+found", ".git", "node_modules/.cache"]);
-
 export function buildManifest(root: string): ManifestPayload {
   const files: Record<string, FileMeta> = {};
   const walk = (dir: string) => {
@@ -35,7 +49,7 @@ export function buildManifest(root: string): ManifestPayload {
     for (const e of entries) {
       const abs = path.join(dir, e.name);
       const rel = path.relative(root, abs).split(path.sep).join("/");
-      if (SKIP_DIRS.has(e.name) || SKIP_DIRS.has(rel)) continue;
+      if (IGNORE_SEGMENTS.has(e.name)) continue;
       if (e.isDirectory()) {
         walk(abs);
       } else if (e.isFile()) {
@@ -56,6 +70,31 @@ export function buildManifest(root: string): ManifestPayload {
   };
   walk(root);
   return { files };
+}
+
+// A whole-project manifest easily exceeds MAX_PAYLOAD (a ~5k-file tree is
+// ~1 MB of JSON), so it crosses the wire as multiple MANIFEST frames that the
+// receiver merges. Batch limit leaves headroom under the frame cap.
+const MANIFEST_BATCH_LIMIT = Math.min(160 * 1024, MAX_PAYLOAD - 32 * 1024);
+
+/** Split a manifest into payload-sized parts (always at least one). */
+export function splitManifest(m: ManifestPayload): ManifestPayload[] {
+  const parts: ManifestPayload[] = [];
+  let cur: Record<string, FileMeta> = {};
+  let curLen = 0;
+  for (const [rel, meta] of Object.entries(m.files)) {
+    // serialized entry size: key + hash(64) + numbers + JSON punctuation
+    const entLen = Buffer.byteLength(rel) + 160;
+    if (curLen > 0 && curLen + entLen > MANIFEST_BATCH_LIMIT) {
+      parts.push({ files: cur });
+      cur = {};
+      curLen = 0;
+    }
+    cur[rel] = meta;
+    curLen += entLen;
+  }
+  parts.push({ files: cur });
+  return parts;
 }
 
 /** Resolve a protocol-relative path under root, rejecting escapes. */

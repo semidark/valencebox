@@ -32,6 +32,12 @@ function registerIpc() {
 
 async function startSandbox() {
   const paths = defaultPaths(app.getPath("userData"));
+  // WORKSPACE_DIR points the sync engine at an arbitrary host project dir
+  // (default: <userData>/workspace). Not a live mount — see README.
+  if (process.env.WORKSPACE_DIR) {
+    paths.hostDir = path.resolve(process.env.WORKSPACE_DIR);
+  }
+  console.log("[sandbox] host workspace:", paths.hostDir);
   sandbox = new Sandbox({
     ...paths,
     memoryMB: 512,

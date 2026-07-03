@@ -22,7 +22,7 @@ over the one port via the frame type (this v86 build exposes one port).
 | # | Type       | Payload | Semantics |
 |---|-----------|---------|-----------|
 | 1 | HELLO      | JSON `{version, role, root}` | sent on connect by both sides; reply = ACK. Host sends MANIFEST after guest HELLO is ACKed. |
-| 2 | MANIFEST   | JSON `{files: {path: {hash,size,mode,mtimeMs}}}` | full tree state of sender. |
+| 2 | MANIFEST   | JSON `{files: {path: {hash,size,mode,mtimeMs}}}` | tree state of sender. Sent as **one or more frames** (a whole-project manifest exceeds the payload cap); receiver merges the parts. |
 | 3 | FILE_PUT   | JSON `{xfer,path,size,mode,mtimeMs,hash}` | announces incoming file. Receiver opens temp file, replies ACK `{ack:seq,xfer}`. |
 | 4 | FILE_CHUNK | binary `[u32le xfer][u64le offset][bytes]` | data. Cumulative ACK `{xfer,received}` every 16 chunks. When `offset+n == size`: receiver verifies sha256, atomically renames into place, sets mode+mtime, sends ACK `{ack:seq,xfer,done:true}` or NAK `{xfer,error}`. |
 | 5 | FILE_DEL   | JSON `{path}` | delete file (or dir recursively). ACK. |
@@ -45,3 +45,6 @@ over the one port via the frame type (this v86 build exposes one port).
   (deterministic). Loser is logged as EVENT op=conflict and to the host
   conflict log.
 - Symlinks/special files: skipped, logged (EVENT op=log).
+- Ignored paths (never synced, any depth): `node_modules`, `.git`,
+  `.sync-tmp`, `lost+found`, `.DS_Store`. Both sides exclude them from
+  manifests/watchers; the host additionally rejects incoming PUT/DEL on them.

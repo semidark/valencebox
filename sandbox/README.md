@@ -54,6 +54,28 @@ npm start        # launch the Electron app
 
 `npm run images` requires Docker (for the 32-bit Alpine build) and Go.
 
+### Pointing `/workspace` at your own project
+
+There is deliberately **no live host mount** (see HARDENING.md) — instead a
+host directory is continuously synced with the guest's `/workspace` disk
+(bidirectional, conflict-resolved). By default that directory is
+`<Electron userData>/workspace` (macOS:
+`~/Library/Application Support/v86-sandbox/workspace`). Override it:
+
+```sh
+WORKSPACE_DIR=~/src/myproject npm start
+```
+
+Files present at boot are hydrated into the guest; edits on either side sync
+within ~1 s while the app runs.
+
+**Never synced** (any depth): `node_modules`, `.git`, `.DS_Store`,
+`.sync-tmp`, `lost+found`. Host-native `node_modules` binaries would be
+useless in the i386 Linux guest — run `npm install` inside the guest instead
+(its `node_modules` stays guest-local too). Big manifests are sent chunked
+across frames, so project size isn't limited by the protocol's 256 KiB frame
+cap. Note the workspace disk is 512 MB.
+
 ## Test (headless, no display needed)
 
 Each phase has a standalone harness that boots a real VM and asserts behavior:

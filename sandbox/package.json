@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc -p . && node scripts/copy-renderer.js",
     "start": "npm run build && electron .",
+    "test:unit": "tsx test/manifest.unit.ts",
     "test:boot": "tsx test/boot.test.ts",
     "test:bridge": "tsx test/bridge.test.ts",
     "test:sync": "tsx test/sync.test.ts",
