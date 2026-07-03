@@ -29,5 +29,5 @@ export const IPC = {
   onSerial: "sandbox:serial",
   onConflict: "sandbox:conflict",
   saveSnapshot: "sandbox:saveSnapshot",
-  runCommand: "sandbox:runCommand", // {cmd} → runs in guest via serial
+  serialInput: "sandbox:serialInput", // raw keystrokes renderer→guest serial (fire-and-forget)
 } as const;

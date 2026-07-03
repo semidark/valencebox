@@ -41,7 +41,7 @@ Sandbox                                        hda ext4 → /
 | `src/main/snapshot.ts` | periodic zstd `save_state()` / restore |
 | `src/main/wisp.ts` + `doh.ts` | WISP egress relay + DNS-gated IP-pinned allowlist |
 | `src/main/sandbox.ts` | orchestrator tying it together (headless-usable) |
-| `src/main/main.ts` + `preload.ts` + `src/renderer/` | Electron shell + UI |
+| `src/main/main.ts` + `preload.ts` + `src/renderer/` | Electron shell + UI (interactive xterm.js terminal + status bar) |
 
 ## Build
 
@@ -99,3 +99,11 @@ canonical store on the host so durability never depends on VM disk internals.
   caveat in HARDENING.md.
 - Single console port multiplexes control + data (the spec's optional 4-port
   split is a latency optimization not yet needed).
+- **Interactive terminal via xterm.js.** The renderer runs a real xterm.js
+  terminal wired to the guest's serial line: output is interpreted as
+  ANSI/VT100 and keystrokes stream straight through (colors, cursor, history,
+  ctrl-c, tab completion). Vendored as UMD bundles into `dist/renderer/vendor/`
+  by `scripts/copy-renderer.js` (no bundler). Limitation: `fitAddon.fit()`
+  only resizes the *visual* viewport — plain serial has no way to renegotiate
+  the guest's terminal columns (no TIOCSWINSZ over the wire), so the guest
+  keeps its default width regardless of window size. Cosmetic only.

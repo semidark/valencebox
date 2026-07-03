@@ -139,6 +139,11 @@ export class Sandbox extends EventEmitter {
     await this.sync.hydrate();
   }
 
+  /** forward raw keystrokes from the UI terminal to the guest serial line */
+  sendInput(data: string): void {
+    this.vm.serialWrite(data);
+  }
+
   /** run a shell line in the guest via the serial root session */
   async runInGuest(cmd: string, expect: RegExp, timeoutMs = 30000): Promise<string> {
     const mark = this.vm.serialLog.length;

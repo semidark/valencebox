@@ -4,6 +4,24 @@
 set -e
 cd "$(dirname "$0")/.."
 
+mkdir -p images assets/v86
+
+echo "==> copying v86 runtime assets from env86 submodule"
+ENV86_ASSETS="../env86/assets"
+missing=""
+for f in libv86.js v86.wasm seabios.bin vgabios.bin; do
+	if [ ! -f "$ENV86_ASSETS/$f" ]; then missing="$missing $f"; fi
+done
+if [ -n "$missing" ]; then
+	echo "ERROR: env86 assets not built:$missing" >&2
+	echo "  Run first (from the repo root):" >&2
+	echo "    git submodule update --init && make -C env86 all" >&2
+	exit 1
+fi
+for f in libv86.js v86.wasm seabios.bin vgabios.bin; do
+	cp "$ENV86_ASSETS/$f" "assets/v86/$f"
+done
+
 echo "==> building sync-agent (linux/386, static)"
 (cd guest/sync-agent && GOOS=linux GOARCH=386 CGO_ENABLED=0 \
 	go build -trimpath -ldflags='-s -w' -o ../sync-agent.bin .)

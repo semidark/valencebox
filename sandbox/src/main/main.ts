@@ -27,9 +27,7 @@ function registerIpc() {
   // never races the handler. sandbox may still be null at that point.
   ipcMain.handle(IPC.getStatus, () => sandbox?.status ?? { phase: "boot" });
   ipcMain.handle(IPC.saveSnapshot, () => sandbox?.saveSnapshot());
-  ipcMain.handle(IPC.runCommand, async (_e, cmd: string) => {
-    await sandbox?.runInGuest(cmd, /:~#/, 30000).catch(() => {});
-  });
+  ipcMain.on(IPC.serialInput, (_e, data: string) => sandbox?.sendInput(data));
 }
 
 async function startSandbox() {

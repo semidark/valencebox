@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <title>v86 Coding Sandbox</title>
+    <link rel="stylesheet" href="./vendor/xterm.css" />
     <style>
       :root { color-scheme: dark; }
       body { margin: 0; font: 13px ui-monospace, Menlo, monospace; background: #0b0d10; color: #cdd3da; display: flex; flex-direction: column; height: 100vh; }
@@ -12,9 +13,8 @@
       .badge.error { background: #3d1414; color: #ff9a9a; }
       .stat { color: #7d8794; }
       .stat b { color: #cdd3da; font-weight: 600; }
-      #term { flex: 1; overflow-y: auto; white-space: pre-wrap; word-break: break-all; padding: 10px 12px; }
-      footer { display: flex; gap: 8px; padding: 8px 12px; background: #12151a; border-top: 1px solid #222; }
-      input { flex: 1; background: #0b0d10; border: 1px solid #2a2f38; color: #cdd3da; padding: 6px 8px; border-radius: 4px; font: inherit; }
+      #term { flex: 1; min-height: 0; padding: 6px 8px; }
+      #term .xterm { height: 100%; }
       button { background: #1d2530; color: #cdd3da; border: 1px solid #2a2f38; padding: 6px 12px; border-radius: 4px; cursor: pointer; font: inherit; }
       button:hover { background: #263040; }
       #conflicts { color: #e0c07f; padding: 0 12px; max-height: 80px; overflow-y: auto; }
@@ -32,10 +32,8 @@
     </header>
     <div id="conflicts"></div>
     <div id="term"></div>
-    <footer>
-      <input id="cmd" placeholder="run a command in the guest… (e.g. ls -la /workspace)" />
-      <button id="send">Run</button>
-    </footer>
+    <script src="./vendor/xterm.js"></script>
+    <script src="./vendor/addon-fit.js"></script>
     <script src="./renderer.js"></script>
   </body>
 </html>

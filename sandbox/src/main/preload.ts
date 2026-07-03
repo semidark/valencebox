@@ -4,7 +4,7 @@ import { IPC, SandboxStatus, ConflictRecordDTO } from "../shared/ipc";
 contextBridge.exposeInMainWorld("sandbox", {
   getStatus: (): Promise<SandboxStatus> => ipcRenderer.invoke(IPC.getStatus),
   saveSnapshot: (): Promise<void> => ipcRenderer.invoke(IPC.saveSnapshot),
-  runCommand: (cmd: string): Promise<void> => ipcRenderer.invoke(IPC.runCommand, cmd),
+  sendInput: (data: string): void => ipcRenderer.send(IPC.serialInput, data),
   onStatus: (cb: (s: SandboxStatus) => void) =>
     ipcRenderer.on(IPC.onStatus, (_e, s) => cb(s)),
   onSerial: (cb: (chunk: string) => void) =>

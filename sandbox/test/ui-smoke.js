@@ -1,6 +1,6 @@
 // Headless Electron smoke test for the renderer: loads the real index.html
 // with a stub sandbox API (via preload), replays the events the main process
-// sends, and reads back the rendered DOM.
+// sends, and reads back the rendered DOM + xterm state.
 const { app, BrowserWindow } = require("electron");
 const path = require("path");
 
@@ -24,11 +24,21 @@ app.whenReady().then(async () => {
       cbs.status({ phase: "ready", bootMs: 34200, restored: true,
         sync: { pushed: 353, pulled: 2, deleted: 1, conflicts: 1, bytesOut: 13300000, bytesIn: 0 },
         net: { relayUrl: "wisp://127.0.0.1:5000/", policyHosts: ["a","b","c"] } });
+      // serial output → terminal via the real api.onSerial wiring, then
+      // flush xterm's async write queue before reading the buffer back
       cbs.serial("sandbox:~# echo hi\\r\\nhi\\r\\n");
+      await new Promise(r => window.__term.write("", r));
       cbs.conflict({ path: "src/app.ts", winner: "remote", at: Date.now() });
-      document.getElementById("cmd").value = "ls -la";
-      document.getElementById("send").click();
+      // simulate a keystroke: xterm paste() fires onData → api.sendInput
+      window.__term.paste("whoami\\n");
       await new Promise(r => setTimeout(r, 50));
+      // read the terminal buffer back
+      const buf = window.__term.buffer.active;
+      let termText = "";
+      for (let i = 0; i < buf.length; i++) {
+        const line = buf.getLine(i);
+        if (line) termText += line.translateToString(true) + "\\n";
+      }
       return {
         phase: document.getElementById("phase").textContent,
         phaseClass: document.getElementById("phase").className,
@@ -36,9 +46,11 @@ app.whenReady().then(async () => {
         pushed: document.getElementById("pushed").textContent,
         conflictsN: document.getElementById("conflicts-n").textContent,
         net: document.getElementById("net").textContent,
-        termHasSerial: document.getElementById("term").textContent.includes("hi"),
+        xtermMounted: !!document.querySelector("#term .xterm"),
+        termHasSerial: termText.includes("hi"),
         conflictShown: document.getElementById("conflicts").textContent.includes("src/app.ts"),
-        lastCmd: globalThis.__lastCmd,
+        lastInput: globalThis.__lastInput,
+        noCmdBox: document.getElementById("cmd") === null && document.getElementById("send") === null,
       };
     })()
   `);
@@ -50,9 +62,12 @@ app.whenReady().then(async () => {
     ["pushed 353", result.pushed === "353"],
     ["conflicts 1", result.conflictsN === "1"],
     ["net 3 hosts", result.net === "3 hosts"],
-    ["serial rendered", result.termHasSerial === true],
+    ["xterm mounted", result.xtermMounted === true],
+    ["serial reached terminal", result.termHasSerial === true],
     ["conflict banner", result.conflictShown === true],
-    ["runCommand IPC", result.lastCmd === "ls -la"],
+    // xterm normalizes the pasted \n to \r (Enter = carriage return)
+    ["keystroke → sendInput IPC", result.lastInput === "whoami\r"],
+    ["old command box removed", result.noCmdBox === true],
   ];
   let ok = true;
   for (const [name, pass] of checks) {

@@ -29,6 +29,12 @@ export interface VMOptions {
 export class SandboxVM {
   emulator: any;
   private serialBuf = "";
+  // coalesce serial output for the UI callback: v86 emits one byte per event,
+  // so firing onSerial per byte would be one IPC message per character on
+  // heavy output. Batch bytes and flush once per event-loop turn. (serialBuf
+  // is still updated synchronously below — tests read it immediately.)
+  private serialOutPending = "";
+  private serialFlushScheduled = false;
 
   constructor(private opts: VMOptions = {}) {}
 
@@ -73,7 +79,18 @@ export class SandboxVM {
       const ch = String.fromCharCode(byte);
       this.serialBuf += ch;
       if (this.serialBuf.length > 65536) this.serialBuf = this.serialBuf.slice(-32768);
-      this.opts.onSerial?.(ch);
+      if (this.opts.onSerial) {
+        this.serialOutPending += ch;
+        if (!this.serialFlushScheduled) {
+          this.serialFlushScheduled = true;
+          setImmediate(() => {
+            this.serialFlushScheduled = false;
+            const chunk = this.serialOutPending;
+            this.serialOutPending = "";
+            if (chunk) this.opts.onSerial!(chunk);
+          });
+        }
+      }
     });
 
     await new Promise<void>((resolve) => {

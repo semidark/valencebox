@@ -6,7 +6,7 @@ globalThis.__cbs = cbs;
 const api = {
   getStatus: async () => ({ phase: "boot" }),
   saveSnapshot: async () => {},
-  runCommand: async (c) => { globalThis.__lastCmd = c; },
+  sendInput: (d) => { globalThis.__lastInput = (globalThis.__lastInput || "") + d; },
   onStatus: (cb) => { cbs.status = cb; },
   onSerial: (cb) => { cbs.serial = cb; },
   onConflict: (cb) => { cbs.conflict = cb; },

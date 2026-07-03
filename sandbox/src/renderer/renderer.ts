@@ -1,5 +1,6 @@
 // Plain browser script (no imports/exports) so tsc emits no CommonJS wrapper.
-// The preload-exposed API and status shape are described locally.
+// Terminal + FitAddon come from the xterm.js UMD bundles loaded before this
+// script (globals: window.Terminal, window.FitAddon.FitAddon).
 interface RSyncStats { pushed: number; pulled: number; deleted: number; conflicts: number; bytesOut: number; bytesIn: number; }
 interface RStatus {
   phase: string;
@@ -13,17 +14,51 @@ interface RConflict { path: string; winner: string; at: number; }
 interface SandboxAPI {
   getStatus(): Promise<RStatus>;
   saveSnapshot(): Promise<void>;
-  runCommand(cmd: string): Promise<void>;
+  sendInput(data: string): void;
   onStatus(cb: (s: RStatus) => void): void;
   onSerial(cb: (chunk: string) => void): void;
   onConflict(cb: (c: RConflict) => void): void;
 }
+declare const Terminal: any;
+declare const FitAddon: any;
 const api: SandboxAPI = (window as unknown as { sandbox: SandboxAPI }).sandbox;
 
 const $ = (id: string) => document.getElementById(id)!;
-const term = $("term");
-let raw = "";
 
+// ---- interactive terminal ----
+const term = new Terminal({
+  fontSize: 13,
+  fontFamily: "ui-monospace, Menlo, monospace",
+  cursorBlink: true,
+  scrollback: 5000,
+  theme: {
+    background: "#0b0d10",
+    foreground: "#cdd3da",
+    cursor: "#cdd3da",
+    selectionBackground: "#264056",
+  },
+});
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open($("term"));
+fitAddon.fit();
+(window as any).__term = term; // debug hook (same convention as the earlier window.vm)
+
+// guest serial output → terminal; keystrokes → guest serial line
+api.onSerial((chunk) => term.write(chunk));
+term.onData((data: string) => api.sendInput(data));
+term.focus();
+
+const refit = () => {
+  try {
+    fitAddon.fit();
+  } catch {
+    /* container not laid out yet */
+  }
+};
+window.addEventListener("resize", refit);
+
+// ---- status bar ----
 function render(s: RStatus) {
   const phase = $("phase");
   phase.textContent = s.phase + (s.restored ? " (restored)" : "");
@@ -36,34 +71,18 @@ function render(s: RStatus) {
     $("conflicts-n").textContent = String(s.sync.conflicts);
   }
   $("net").textContent = s.net ? `${s.net.policyHosts.length} hosts` : "off";
-  if (s.error) appendTerm(`\n[error] ${s.error}\n`);
-}
-
-function appendTerm(chunk: string) {
-  raw += chunk;
-  if (raw.length > 200000) raw = raw.slice(-120000);
-  term.textContent = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
-  term.scrollTop = term.scrollHeight;
+  if (s.error) term.write(`\r\n\x1b[31m[error] ${s.error}\x1b[0m\r\n`);
 }
 
 api.onStatus(render);
-api.onSerial(appendTerm);
 api.onConflict((c) => {
   const el = $("conflicts");
   el.textContent = `⚠ conflict: ${c.path} — ${c.winner} won @ ${new Date(c.at).toLocaleTimeString()}\n` + el.textContent;
 });
 
-const input = $("cmd") as HTMLInputElement;
-const run = () => {
-  const cmd = input.value.trim();
-  if (!cmd) return;
-  api.runCommand(cmd);
-  input.value = "";
-};
-$("send").addEventListener("click", run);
-input.addEventListener("keydown", (e) => {
-  if ((e as KeyboardEvent).key === "Enter") run();
+$("snap").addEventListener("click", () => {
+  api.saveSnapshot();
+  term.focus();
 });
-$("snap").addEventListener("click", () => api.saveSnapshot());
 
 api.getStatus().then((s) => s && render(s));
