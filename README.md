@@ -9,16 +9,6 @@ console. No sound, no graphics stack, no USB, no printers/parallel port, no
 wireless/bluetooth — the corresponding kernel modules are deleted from the
 image.
 
-## Why not Fedora CoreOS
-
-v86 emulates a **32-bit** x86 CPU. Fedora CoreOS only ships x86_64 (and other
-64-bit) images, so it cannot boot on env86/v86 — no build tricks change that.
-The guest here is a stripped 32-bit Alpine (pinned to 3.18.6 because newer
-mkinitfs breaks 9p root), configured to the same spirit: minimal userland,
-serial login, nothing legacy. If real Fedora CoreOS in a tab is a hard
-requirement, the tech has to change (e.g. qemu-wasm / container2wasm style
-x86_64 emulation — much slower, or CheerpX — proprietary).
-
 ## Layout
 
 - `env86/` — cloned upstream tool (built with `make -C env86 all`)
