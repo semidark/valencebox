@@ -1,0 +1,18 @@
+node_modules/
+dist/
+*.log
+
+# local Claude Code state (keep .claude/launch.json — it's project config)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# root env86/v86 browser-tab experiment (regenerate: make image && make www)
+/vm/
+/www/
+
+# sandbox app build artifacts (regenerate: npm run images && npm run build)
+sandbox/images/
+sandbox/guest/sync-agent.bin
+sandbox/assets/v86/
+sandbox/snapshots/
+sandbox/workspace/
