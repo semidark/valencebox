@@ -19,7 +19,14 @@ async function createWindow() {
       sandbox: false, // preload needs require(); renderer stays isolated
     },
   });
+  win.on("closed", () => {
+    win = null;
+  });
   await win.loadFile(path.join(__dirname, "..", "renderer", "index.html"));
+}
+
+function sendToWindow(channel: string, ...args: any[]) {
+  if (win && !win.isDestroyed()) win.webContents.send(channel, ...args);
 }
 
 function registerIpc() {
@@ -42,16 +49,16 @@ async function startSandbox() {
     ...paths,
     memoryMB: 512,
     enableNetwork: true,
-    onSerial: (chunk) => win?.webContents.send(IPC.onSerial, chunk),
+    onSerial: (chunk) => sendToWindow(IPC.onSerial, chunk),
   });
-  sandbox.on("status", (s) => win?.webContents.send(IPC.onStatus, s));
-  sandbox.on("conflict", (c) => win?.webContents.send(IPC.onConflict, c));
+  sandbox.on("status", (s) => sendToWindow(IPC.onStatus, s));
+  sandbox.on("conflict", (c) => sendToWindow(IPC.onConflict, c));
   sandbox.on("log", (m) => console.log("[sandbox]", m));
 
   try {
     await sandbox.start();
   } catch (e: any) {
-    win?.webContents.send(IPC.onStatus, { phase: "error", error: e.message });
+    sendToWindow(IPC.onStatus, { phase: "error", error: e.message });
     console.error("sandbox failed to start:", e);
   }
 }
@@ -67,6 +74,16 @@ app.on("window-all-closed", async () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", async () => {
-  await sandbox?.stop();
+// Electron doesn't wait for an async "before-quit" listener — without
+// preventDefault() the process can exit mid-snapshot (e.g. Cmd+Q). Defer the
+// actual quit until sandbox.stop() (final snapshot included) has finished,
+// then let it through on the second pass.
+let quitting = false;
+app.on("before-quit", (e) => {
+  if (quitting) return;
+  e.preventDefault();
+  quitting = true;
+  void (sandbox?.stop() ?? Promise.resolve())
+    .catch((err) => console.error("sandbox failed to stop cleanly:", err))
+    .finally(() => app.quit());
 });

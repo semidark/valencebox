@@ -15,6 +15,9 @@ export enum FrameType {
   NAK = 7,
   EVENT = 8,
   PING = 9,
+  // announces a batched small-file archive; the archive body streams as
+  // FILE_CHUNK frames under the same xfer id (see PROTOCOL.md)
+  TREE_PUT = 10,
 }
 
 export interface Frame {
@@ -104,6 +107,23 @@ export interface ManifestPayload {
 export interface PutMeta extends FileMeta {
   xfer: number;
   path: string;
+}
+
+export interface TreePutMeta {
+  xfer: number;
+  size: number; // total archive bytes
+  count: number; // number of entries
+}
+
+/**
+ * One archive entry for TREE_PUT: [u32le header-len][JSON header][raw bytes].
+ * The header is a PutMeta-like JSON object {path, size, mode, mtimeMs, hash}.
+ */
+export function encodeTreeEntry(header: object, data: Buffer): Buffer {
+  const h = Buffer.from(JSON.stringify(header), "utf8");
+  const len = Buffer.alloc(4);
+  len.writeUInt32LE(h.length, 0);
+  return Buffer.concat([len, h, data]);
 }
 
 export function encodeChunk(xfer: number, offset: number, data: Buffer): Buffer {

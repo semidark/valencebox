@@ -1,9 +1,23 @@
 # Host↔Guest Sync Protocol v1
 
-Transport: single virtio-console port. Guest: `/dev/hvc0`. Host: v86 bus
-`virtio-console0-input-bytes` (host→guest) / `virtio-console0-output-bytes`
-(guest→host). Byte stream; framed. Control/RPC and file data are multiplexed
-over the one port via the frame type (this v86 build exposes one port).
+Transports (same framing on both):
+
+- **Control channel** — virtio-console port. Guest: `/dev/hvc0`. Host: v86
+  bus `virtio-console0-input-bytes` / `virtio-console0-output-bytes`.
+  Carries HELLO/PING/MANIFEST/EVENT and serves as the transfer fallback.
+- **Data channel** — a guest→host TCP stream over virtio-net, terminated
+  in-process by the host's WISP relay (`data-plane.ts`). The host advertises
+  `{ip, port, token}` in its HELLO / hello-ACK payload (`dataPlane` field);
+  the guest dials it and must open with HELLO `{token}` or the stream is
+  closed. Bulk FILE_PUT/FILE_CHUNK/FILE_DEL prefer this channel (~2-5x the
+  console's throughput; per-file round trips are pipelined). Each transfer
+  runs end-to-end on one channel; xfer-id ranges are disjoint per sender
+  (console guest: 0+, data guest: 0x40000000+, host: 0x80000000+). On the
+  data channel the host streams chunks immediately after FILE_PUT (TCP
+  ordering makes the ready-ACK redundant) and the guest skips the sha256
+  read-back verify (frame CRC32 + TCP checksums cover integrity). The guest
+  keepalive-pings every 15 s and re-dials on 45 s silence, on drop, or on a
+  changed advert (e.g. after snapshot restore).
 
 ## Frame
 
@@ -30,6 +44,7 @@ over the one port via the frame type (this v86 build exposes one port).
 | 7 | NAK        | JSON `{ack: seq, error}` | |
 | 8 | EVENT      | JSON `{events:[{op:"mkdir"\|"conflict"\|"log", path, …}]}` | out-of-band notices. |
 | 9 | PING       | empty | reply = ACK. |
+| 10 | TREE_PUT  | JSON `{xfer,size,count}` | announces a batched small-file archive of `size` bytes / `count` entries. The body streams as FILE_CHUNK frames under the same `xfer` (sequential offsets; sender starts immediately — no ready-ACK). Archive entry: `[u32le header-len][JSON {path,size,mode,mtimeMs,hash}][raw bytes]`. Receiver unpacks streamingly, applies LWW per entry (losers are skipped, not NAKed), cumulative ACK every 16 chunks, final ACK `{ack,xfer,done:true,skipped:[paths]}`. Data-plane only; used by hydrate for files < 256 KiB. |
 
 ## Rules
 

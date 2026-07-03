@@ -18,7 +18,9 @@ Electron main process                         Alpine guest (v86 WASM)
 Sandbox                                        hda ext4 → /
 ├─ SandboxVM (v86, headless)  ── hdb ext4 ──►  /workspace  (native I/O)
 ├─ HostBridge  ─── virtio-console /dev/hvc0 ─► sync-agent (Go, static i386)
-│    framed binary protocol (PROTOCOL.md)         inotify + framed protocol
+│    control channel (PROTOCOL.md)                inotify + framed protocol
+├─ DataPlane  ◄── TCP over virtio-net+WISP ──►  bulk file transfers
+│    in-process VIP, token-gated, ~2-5x faster
 ├─ SyncManager   manifests, chunked xfer, LWW
 ├─ SnapshotManager  zstd save_state / restore
 └─ WispServer + DoH gate  ─── wisp:// WS ────►  eth0 DHCP (virtio-net)
@@ -26,6 +28,10 @@ Sandbox                                        hda ext4 → /
         │
      preload (contextIsolation) ── IPC ──► renderer (status UI + console)
 ```
+
+Full walkthrough with diagrams (why two channels, how the data-plane VIP
+trick works, why small files get batched):
+[docs/data-plane-architecture.md](docs/data-plane-architecture.md).
 
 ## Components
 
@@ -40,6 +46,7 @@ Sandbox                                        hda ext4 → /
 | `src/main/sync-manager.ts` | host side of bidirectional sync + conflict policy |
 | `src/main/snapshot.ts` | periodic zstd `save_state()` / restore |
 | `src/main/wisp.ts` + `doh.ts` | WISP egress relay + DNS-gated IP-pinned allowlist |
+| `src/main/data-plane.ts` | TCP sync channel over virtio-net (in-process VIP, token-gated) |
 | `src/main/sandbox.ts` | orchestrator tying it together (headless-usable) |
 | `src/main/main.ts` + `preload.ts` + `src/renderer/` | Electron shell + UI (interactive xterm.js terminal + status bar) |
 
@@ -85,6 +92,7 @@ npm run test:boot     # boot, dual-disk /workspace mount, virtio-console handsha
 npm run test:sync     # bulk hydrate throughput + bidirectional sync + LWW conflict
 npm run test:snapshot # zstd save_state → restore continues the session
 npm run test:net      # WISP egress: allowlisted host works, others blocked
+npm run test:dataplane # TCP data plane: throughput, token auth, restore re-dial
 npm run test:e2e      # full Sandbox lifecycle incl. offline-drift reconciliation
 npm run test:ui       # headless renderer smoke test (Electron offscreen)
 ```
@@ -95,9 +103,14 @@ Set `SCRATCH=/path` to control where tests write host dirs (default `/tmp`),
 ### Measured results (this machine)
 
 - Cold boot to ready: ~34 s; **warm restore from snapshot: ~0.3 s**
-- Bulk hydrate: 353 files / 13.3 MB in ~4.8 s (**~2.8 MB/s** over one console port)
+- Hydrate over the TCP data plane: 802-file / 22.9 MB tree in ~7.3 s vs a
+  ~11.9 s console baseline (single big file ~7 MB/s; raw channel ~12 MB/s —
+  the ceiling is the guest's emulated CPU). Small files are batched into
+  TREE_PUT archives: ~3.9 ms guest work per file vs ~16 ms pushed
+  individually. Console fallback: ~2.9 MB/s + ~5 ms/file, serial.
 - Snapshot: 89 MB RAM state → ~33 MB zstd in ~0.3 s
-- virtio-console ping RTT: <1 ms
+- virtio-console ping RTT: <1 ms (control); TCP path RTT is tens of ms,
+  which is why transfers pipeline 8-wide during hydrate
 
 ## Security
 

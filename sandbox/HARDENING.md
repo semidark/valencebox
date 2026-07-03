@@ -33,6 +33,17 @@ automated check or the code that enforces it.
       host also permits other hostnames sharing that IP. Acceptable for a
       registry allowlist; document per-deployment. UDP is off by default so
       DNS is the only UDP and it is host-mediated.
+- [x] **Sync data plane does not widen egress.** The guest's TCP sync stream
+      targets a virtual IP (`11.86.86.86:7575`, `data-plane.ts`) that is
+      terminated *in-process* by a socket class injected into the WISP
+      server — packets to it never leave the process, and the VIP handler
+      refuses any port but the sync port. The channel is gated by a per-boot
+      random token advertised only over the virtio-console; a wrong token
+      closes the stream. Residual: the VIP/port pair joins the whitelist, so
+      a pinned CDN IP could be dialed on the sync port (remote-refused) —
+      no in-process surface is exposed. Verified: `test/dataplane.test.ts`
+      (token auth, restore re-dial with fresh token) and `test/net.test.ts`
+      (egress policy unchanged).
 
 ## Persistence & durability
 
@@ -59,5 +70,5 @@ automated check or the code that enforces it.
   depth (agent builds already confined to `/workspace`).
 - WISP allowlist is hostname/port only; no request-content inspection.
 - No per-file encryption of snapshots at rest.
-- Single virtio-console port multiplexes control + data; spec's 4-port split
-  (port 0 data / port 1 RPC) is a latency optimization not yet needed.
+- Data-plane transfers skip the guest's sha256 read-back verify (frame CRC32
+  + TCP checksums still apply); the console path keeps full verification.

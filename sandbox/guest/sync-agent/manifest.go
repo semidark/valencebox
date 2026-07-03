@@ -48,7 +48,7 @@ func hashFile(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func buildManifest(root string) (*Manifest, error) {
+func buildManifest(root string, ss *SyncState) (*Manifest, error) {
 	m := &Manifest{Files: map[string]FileMeta{}}
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -75,7 +75,7 @@ func buildManifest(root string) (*Manifest, error) {
 		if ierr != nil {
 			return nil
 		}
-		h, herr := hashFile(p)
+		h, herr := ss.hashCachedStat(rel, p, info.Size(), info.ModTime().UnixMilli())
 		if herr != nil {
 			return nil
 		}

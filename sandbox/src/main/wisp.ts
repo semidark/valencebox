@@ -42,9 +42,19 @@ export class WispServer {
   // Enforcement is therefore IP-pinning: only IPs that the DoH gate answered
   // for allowlisted hostnames are connectable (see doh.ts).
   private pinnedIps = new Set<string>();
+  // in-process sync data plane (see data-plane.ts): its VIP/port join the
+  // whitelist and its socket class replaces the stock one for all streams
+  private vip?: { ip: string; port: number; socketClass: any };
   port = 0;
 
   constructor(private policy: EgressPolicy = DEFAULT_POLICY) {}
+
+  /** route an internal VIP to an in-process socket class (before start()) */
+  attachDataPlane(dp: { advert(): { ip: string; port: number }; socketClass(): any }): void {
+    const a = dp.advert();
+    this.vip = { ip: a.ip, port: a.port, socketClass: dp.socketClass() };
+    if (this.wisp) this.applyPolicy();
+  }
 
   /** wisp:// URL for v86's net_device.relay_url */
   get relayUrl(): string {
@@ -77,10 +87,18 @@ export class WispServer {
   private applyPolicy(): void {
     const o = this.wisp.options;
     // whitelist matches the CONNECT "hostname" field — which is an IP here
-    o.hostname_whitelist = [...this.pinnedIps].map(
-      (ip) => new RegExp(`^${ip.replace(/\./g, "\\.")}$`)
-    );
-    o.port_whitelist = this.policy.allowPorts ?? [80, 443];
+    const ips = [...this.pinnedIps];
+    const ports: (number | [number, number])[] = [...(this.policy.allowPorts ?? [80, 443])];
+    if (this.vip) {
+      ips.push(this.vip.ip);
+      ports.push(this.vip.port);
+      if (this.pinnedIps.has(this.vip.ip)) {
+        // a DoH answer collided with the sync VIP — the VIP shadows it
+        console.warn(`wisp: pinned IP collides with sync VIP ${this.vip.ip}`);
+      }
+    }
+    o.hostname_whitelist = ips.map((ip) => new RegExp(`^${ip.replace(/\./g, "\\.")}$`));
+    o.port_whitelist = ports;
     o.allow_udp_streams = this.policy.allowUdp ?? false;
     o.allow_direct_ip = true; // IPs are the only currency; whitelist gates them
     o.allow_private_ips = false;
@@ -99,7 +117,12 @@ export class WispServer {
       res.end("wisp endpoint");
     });
     this.server.on("upgrade", (req, socket, head) => {
-      this.wisp.routeRequest(req, socket, head);
+      this.wisp.routeRequest(
+        req,
+        socket,
+        head,
+        this.vip ? { TCPSocket: this.vip.socketClass } : {}
+      );
     });
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);

@@ -7,17 +7,27 @@ import (
 	"sync"
 )
 
+// statHash is a content hash keyed by the (size, mtime) it was computed
+// from, so a stat that still matches proves the content hasn't changed
+// without re-reading it.
+type statHash struct {
+	hash    string
+	size    int64
+	mtimeMs int64
+}
+
 // SyncState tracks the last-synced content hash per path. It answers two
 // questions: "is this local FS event an echo of a remote write?" and "does
 // this incoming write conflict with a concurrent local edit?"
 type SyncState struct {
-	mu       sync.Mutex
-	lastSync map[string]string // rel path → hash at last successful sync
-	fw       *FrameWriter
+	mu        sync.Mutex
+	lastSync  map[string]string   // rel path → hash at last successful sync
+	statCache map[string]statHash // rel path → hash cache, invalidated by stat
+	fw        *FrameWriter
 }
 
 func NewSyncState(fw *FrameWriter) *SyncState {
-	return &SyncState{lastSync: map[string]string{}, fw: fw}
+	return &SyncState{lastSync: map[string]string{}, statCache: map[string]statHash{}, fw: fw}
 }
 
 func (ss *SyncState) MarkSynced(rel, hash string) {
@@ -29,7 +39,41 @@ func (ss *SyncState) MarkSynced(rel, hash string) {
 func (ss *SyncState) MarkDeleted(rel string) {
 	ss.mu.Lock()
 	delete(ss.lastSync, rel)
+	delete(ss.statCache, rel)
 	ss.mu.Unlock()
+}
+
+// HashCached hashes the file at abs, reusing a previously computed hash if
+// the file's size and mtime haven't changed since. A full-workspace re-hash
+// (guest startup, host reconnect after VM restore) is the common case where
+// almost nothing actually changed, so this turns it from O(bytes read) into
+// O(stat calls) for the unchanged majority.
+func (ss *SyncState) HashCached(rel, abs string) (string, error) {
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	return ss.hashCachedStat(rel, abs, info.Size(), info.ModTime().UnixMilli())
+}
+
+// hashCachedStat is HashCached's core, for callers that already stat'd the
+// file (e.g. a directory walk) and would otherwise pay for a redundant stat.
+func (ss *SyncState) hashCachedStat(rel, abs string, size, mtimeMs int64) (string, error) {
+	ss.mu.Lock()
+	c, ok := ss.statCache[rel]
+	ss.mu.Unlock()
+	if ok && c.size == size && c.mtimeMs == mtimeMs {
+		return c.hash, nil
+	}
+
+	h, err := hashFile(abs)
+	if err != nil {
+		return "", err
+	}
+	ss.mu.Lock()
+	ss.statCache[rel] = statHash{hash: h, size: size, mtimeMs: mtimeMs}
+	ss.mu.Unlock()
+	return h, nil
 }
 
 func (ss *SyncState) LastHash(rel string) (string, bool) {

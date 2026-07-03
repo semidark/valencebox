@@ -41,9 +41,24 @@ func run() error {
 	ss := NewSyncState(fw)
 	recv := NewReceiver(*flagRoot, fw, ss)
 	send := NewSender(*flagRoot, fw, ss)
+	dplane := NewDataPlane(*flagRoot, ss)
+	defer dplane.Shutdown()
 
 	hello, _ := json.Marshal(map[string]any{"version": 1, "role": "guest", "root": *flagRoot})
 	fw.Send(TypeHello, hello)
+
+	// prefer the TCP data plane for pushes; console is the fallback (and the
+	// retry path if a push dies mid-transfer on a dropping connection)
+	pushVia := func(op func(s *Sender) error) error {
+		if ds := dplane.Sender(); ds != nil {
+			if err := op(ds); err == nil {
+				return nil
+			} else {
+				log.Printf("data-plane push failed, retrying over console: %v", err)
+			}
+		}
+		return op(send)
+	}
 
 	pushQueue := make(chan map[string]string, 64)
 	go func() {
@@ -58,14 +73,12 @@ func run() error {
 					if ss.IsEcho(rel, abs) {
 						continue // our own applied write bounced back from inotify
 					}
-					if err := send.PushFile(rel); err != nil {
+					if err := pushVia(func(s *Sender) error { return s.PushFile(rel) }); err != nil {
 						log.Printf("push %s: %v", rel, err)
 					}
 				case "del":
-					if _, wasKnown := ss.LastHash(rel); !wasKnown {
-						// deletion of something never synced — still forward it
-					}
-					if err := send.PushDelete(rel); err != nil {
+					// forwarded even if never synced — the host no-ops on unknown paths
+					if err := pushVia(func(s *Sender) error { return s.PushDelete(rel) }); err != nil {
 						log.Printf("push del %s: %v", rel, err)
 					}
 				}
@@ -86,9 +99,16 @@ func run() error {
 		switch f.Type {
 		case TypeHello:
 			recv.ack(f.Seq, map[string]any{"role": "guest"})
+			// the host HELLO may advertise the TCP data plane
+			var hh struct {
+				DataPlane *dataPlaneCfg `json:"dataPlane"`
+			}
+			if json.Unmarshal(f.Payload, &hh) == nil && hh.DataPlane != nil {
+				dplane.Update(*hh.DataPlane)
+			}
 			// host (re)connected: it will drive manifest exchange; send ours
 			// (chunked — a big workspace manifest exceeds one frame)
-			if m, merr := buildManifest(*flagRoot); merr == nil {
+			if m, merr := buildManifest(*flagRoot, ss); merr == nil {
 				for _, b := range marshalManifestBatches(m) {
 					fw.Send(TypeManifest, b)
 				}
@@ -101,7 +121,7 @@ func run() error {
 			if json.Unmarshal(f.Payload, &m) == nil {
 				for rel, meta := range m.Files {
 					if abs, ok := safeJoin(*flagRoot, rel); ok {
-						if h, herr := hashFile(abs); herr == nil && h == meta.Hash {
+						if h, herr := ss.HashCached(rel, abs); herr == nil && h == meta.Hash {
 							ss.MarkSynced(rel, h)
 						}
 					}
@@ -110,13 +130,22 @@ func run() error {
 			recv.ack(f.Seq, nil)
 		case TypeFilePut:
 			recv.HandlePut(f)
+		case TypeTreePut:
+			recv.HandleTreePut(f)
 		case TypeFileChunk:
 			recv.HandleChunk(f)
 		case TypeFileDel:
 			recv.HandleDel(f)
 		case TypeAck, TypeNak:
 			if !send.HandleAck(f) {
-				// non-transfer ack (hello/ping replies) — nothing to do
+				// non-transfer ack: the reply to our HELLO may carry the
+				// data-plane advert (cold-boot path)
+				var ha struct {
+					DataPlane *dataPlaneCfg `json:"dataPlane"`
+				}
+				if json.Unmarshal(f.Payload, &ha) == nil && ha.DataPlane != nil {
+					dplane.Update(*ha.DataPlane)
+				}
 			}
 		case TypeEvent:
 			log.Printf("event from host: %s", string(f.Payload))

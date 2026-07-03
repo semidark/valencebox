@@ -10,7 +10,10 @@ export interface TestVM {
   run: (cmd: string, expect: RegExp, timeout?: number) => Promise<string>;
 }
 
-export async function bootAndLogin(opts: VMOptions = {}): Promise<TestVM> {
+export async function bootAndLogin(
+  opts: VMOptions = {},
+  extras: { helloExtra?: Record<string, unknown> } = {}
+): Promise<TestVM> {
   const vm = new SandboxVM({
     memoryMB: 512,
     onSerial: process.env.VERBOSE ? (t) => process.stdout.write(t) : undefined,
@@ -18,6 +21,7 @@ export async function bootAndLogin(opts: VMOptions = {}): Promise<TestVM> {
   });
   await vm.start();
   const bridge = new HostBridge(vm);
+  if (extras.helloExtra) bridge.helloExtra = extras.helloExtra;
   const helloP = bridge.waitGuestHello(120000);
 
   await vm.waitSerial(/login:/, 120000);

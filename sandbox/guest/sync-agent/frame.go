@@ -19,6 +19,7 @@ const (
 	TypeNak       = 7
 	TypeEvent     = 8
 	TypePing      = 9
+	TypeTreePut   = 10 // batched small-file archive; body streams as chunks
 
 	MaxPayload = 262144
 	ChunkSize  = 48 * 1024

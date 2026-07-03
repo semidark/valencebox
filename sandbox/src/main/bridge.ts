@@ -1,4 +1,6 @@
-// HostBridge: framed request/response + event routing over virtio-console.
+// FrameChannel: framed request/response + event routing over any byte
+// stream. HostBridge binds it to the virtio-console (control channel); the
+// data plane (data-plane.ts) binds it to a wisp-routed TCP stream.
 import { EventEmitter } from "events";
 import {
   Frame,
@@ -14,20 +16,31 @@ interface Pending {
   timer: NodeJS.Timeout;
 }
 
-export class HostBridge extends EventEmitter {
+export class FrameChannel extends EventEmitter {
   private parser = new FrameParser();
   private seq = 0;
   private pending = new Map<number, Pending>(); // our seq → awaiting ACK/NAK
   private xferWaiters = new Map<number, (f: Frame) => void>(); // xfer id → cb
 
-  constructor(private vm: SandboxVM) {
+  /** bytes queued but not yet consumed by the transport (backpressure);
+   *  set by the transport owner (data-plane), unset ⇒ no signal available */
+  bufferedBytes?: () => number;
+
+  constructor(private writeRaw: (buf: Buffer) => void) {
     super();
-    vm.onVirtioConsole((data) => {
-      for (const frame of this.parser.push(data)) this.dispatch(frame);
-    });
+  }
+
+  /** feed raw bytes received from the peer into the frame parser */
+  feed(data: Uint8Array): void {
+    for (const frame of this.parser.push(data)) this.dispatch(frame);
   }
 
   private dispatch(frame: Frame): void {
+    if (frame.type === FrameType.PING) {
+      // liveness probe from the guest (data-plane keepalive) — always answer
+      this.send(FrameType.ACK, Buffer.from(JSON.stringify({ ack: frame.seq })));
+      return;
+    }
     if (frame.type === FrameType.ACK || frame.type === FrameType.NAK) {
       let body: any = {};
       try {
@@ -63,7 +76,7 @@ export class HostBridge extends EventEmitter {
   /** Fire-and-forget frame. Returns the sequence number used. */
   send(type: FrameType, payload: Buffer): number {
     const seq = ++this.seq;
-    this.vm.virtioConsoleWrite(encodeFrame(type, seq, payload));
+    this.writeRaw(encodeFrame(type, seq, payload));
     return seq;
   }
 
@@ -76,7 +89,7 @@ export class HostBridge extends EventEmitter {
         reject(new Error(`timeout waiting for ack of ${FrameType[type]} seq ${seq}`));
       }, timeoutMs);
       this.pending.set(seq, { resolve, reject, timer });
-      this.vm.virtioConsoleWrite(encodeFrame(type, seq, payload));
+      this.writeRaw(encodeFrame(type, seq, payload));
     });
   }
 
@@ -93,9 +106,21 @@ export class HostBridge extends EventEmitter {
     await this.request(FrameType.PING, Buffer.alloc(0), timeoutMs);
     return Date.now() - t0;
   }
+}
+
+export class HostBridge extends FrameChannel {
+  /** extra fields merged into HELLO / hello-ACK payloads (data-plane advert) */
+  helloExtra: Record<string, unknown> = {};
+
+  constructor(vm: SandboxVM) {
+    super((buf) => vm.virtioConsoleWrite(buf));
+    vm.onVirtioConsole((data) => this.feed(data));
+  }
 
   hello(): Promise<Frame> {
-    const body = Buffer.from(JSON.stringify({ version: 1, role: "host", root: "/workspace" }));
+    const body = Buffer.from(
+      JSON.stringify({ version: 1, role: "host", root: "/workspace", ...this.helloExtra })
+    );
     return this.request(FrameType.HELLO, body);
   }
 
@@ -108,8 +133,11 @@ export class HostBridge extends EventEmitter {
       );
       this.once(`frame:${FrameType.HELLO}`, (f: Frame) => {
         clearTimeout(timer);
-        // acknowledge the guest's hello
-        this.send(FrameType.ACK, Buffer.from(JSON.stringify({ ack: f.seq, role: "host" })));
+        // acknowledge the guest's hello (and advertise the data plane)
+        this.send(
+          FrameType.ACK,
+          Buffer.from(JSON.stringify({ ack: f.seq, role: "host", ...this.helloExtra }))
+        );
         resolve(f);
       });
     });

@@ -7,12 +7,13 @@
   "scripts": {
     "build": "tsc -p . && node scripts/copy-renderer.js",
     "start": "npm run build && electron .",
-    "test:unit": "tsx test/manifest.unit.ts",
+    "test:unit": "tsx test/manifest.unit.ts && tsx test/hydrate-channel-switch.unit.ts",
     "test:boot": "tsx test/boot.test.ts",
     "test:bridge": "tsx test/bridge.test.ts",
     "test:sync": "tsx test/sync.test.ts",
     "test:snapshot": "tsx test/snapshot.test.ts",
     "test:net": "tsx test/net.test.ts",
+    "test:dataplane": "tsx test/dataplane.test.ts",
     "test:e2e": "tsx test/e2e.test.ts",
     "test:ui": "electron test/ui-smoke.js",
     "images": "./scripts/build-guest.sh"

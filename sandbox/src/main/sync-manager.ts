@@ -1,6 +1,7 @@
 // SyncManager: host side of the bidirectional /workspace sync.
 // Canonical store = host directory. See PROTOCOL.md for wire semantics.
 import { EventEmitter } from "events";
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as path from "path";
@@ -13,9 +14,13 @@ import {
   PutMeta,
   decodeChunk,
   encodeChunk,
+  encodeTreeEntry,
 } from "../shared/protocol";
-import { HostBridge } from "./bridge";
+import { FrameChannel } from "./bridge";
 import { TMP_DIR_NAME, buildManifest, hashFileSync, isIgnored, safeJoin, splitManifest } from "./manifest";
+
+// bigger chunks on the TCP data plane: fewer frames, same 256 KiB frame cap
+const DATA_CHUNK_SIZE = 192 * 1024;
 
 interface Incoming {
   meta: PutMeta;
@@ -23,6 +28,7 @@ interface Incoming {
   tmpPath: string;
   received: number;
   chunks: number;
+  ch: FrameChannel; // replies go back on the channel the transfer arrived on
 }
 
 export interface ConflictRecord {
@@ -44,6 +50,15 @@ export interface SyncStats {
 
 const WINDOW = 32;
 const ACK_EVERY = 16;
+// data-plane flow control is byte-based (transport queue depth), so its
+// chunk window is just a safety cap; throttling happens at HIGH_WATER
+const DATA_WINDOW = 256;
+const HIGH_WATER = 4 * 1024 * 1024;
+// hydrate batches files below this size into TREE_PUT archives of roughly
+// this many bytes — per-transfer round trips (~30 ms RTT on the data plane)
+// otherwise dominate many-small-file syncs
+const SMALL_FILE_LIMIT = 256 * 1024;
+const TREE_BATCH_BYTES = 2 * 1024 * 1024;
 
 export class SyncManager extends EventEmitter {
   private lastSync = new Map<string, string>(); // rel → hash at last sync
@@ -57,14 +72,42 @@ export class SyncManager extends EventEmitter {
   stats: SyncStats = { pushed: 0, pulled: 0, deleted: 0, conflicts: 0, bytesOut: 0, bytesIn: 0 };
   conflicts: ConflictRecord[] = [];
 
+  private dataCh?: FrameChannel;
+
   constructor(
-    private bridge: HostBridge,
+    private bridge: FrameChannel,
     public readonly hostDir: string,
-    private opts: { conflictLog?: string } = {}
+    private opts: { conflictLog?: string; expectDataChannel?: boolean } = {}
   ) {
     super();
     fs.mkdirSync(hostDir, { recursive: true });
-    bridge.on(`frame:${FrameType.MANIFEST}`, (f: Frame) => {
+    this.wireChannel(bridge);
+  }
+
+  /** route bulk transfers over a faster channel (console stays fallback) */
+  attachDataChannel(ch: FrameChannel): void {
+    this.dataCh = ch;
+    ch.setMaxListeners(64); // concurrent transfers each hold a drain listener
+    this.wireChannel(ch);
+    this.emit("data-channel", true);
+  }
+
+  detachDataChannel(): void {
+    this.dataCh = undefined;
+    this.emit("data-channel", false);
+  }
+
+  get dataChannelActive(): boolean {
+    return this.dataCh !== undefined;
+  }
+
+  /** the channel new host→guest transfers should use */
+  private txChannel(): FrameChannel {
+    return this.dataCh ?? this.bridge;
+  }
+
+  private wireChannel(ch: FrameChannel): void {
+    ch.on(`frame:${FrameType.MANIFEST}`, (f: Frame) => {
       // manifests arrive as one or more parts (see splitManifest) — merge
       try {
         const part: ManifestPayload = JSON.parse(f.payload.toString("utf8"));
@@ -76,12 +119,12 @@ export class SyncManager extends EventEmitter {
       } catch {
         /* ignore malformed */
       }
-      this.bridge.send(FrameType.ACK, Buffer.from(JSON.stringify({ ack: f.seq })));
+      ch.send(FrameType.ACK, Buffer.from(JSON.stringify({ ack: f.seq })));
     });
-    bridge.on(`frame:${FrameType.FILE_PUT}`, (f: Frame) => void this.handlePut(f));
-    bridge.on(`frame:${FrameType.FILE_CHUNK}`, (f: Frame) => void this.handleChunk(f));
-    bridge.on(`frame:${FrameType.FILE_DEL}`, (f: Frame) => void this.handleDel(f));
-    bridge.on(`frame:${FrameType.EVENT}`, (f: Frame) => {
+    ch.on(`frame:${FrameType.FILE_PUT}`, (f: Frame) => void this.handlePut(ch, f));
+    ch.on(`frame:${FrameType.FILE_CHUNK}`, (f: Frame) => void this.handleChunk(ch, f));
+    ch.on(`frame:${FrameType.FILE_DEL}`, (f: Frame) => void this.handleDel(ch, f));
+    ch.on(`frame:${FrameType.EVENT}`, (f: Frame) => {
       try {
         const body = JSON.parse(f.payload.toString("utf8"));
         for (const ev of body.events ?? []) {
@@ -117,7 +160,52 @@ export class SyncManager extends EventEmitter {
       this.bridge.send(FrameType.MANIFEST, Buffer.from(JSON.stringify(part)));
     }
 
-    for (const rel of toPush) await this.pushFile(rel);
+    // On the TCP data plane, per-transfer round trips dominate for small
+    // files (RTT through the emulated netstack is tens of ms, vs <1 ms on
+    // the console) — batch small files into TREE_PUT archives and pipeline
+    // the transfers. The protocol multiplexes by xfer id, and the guest
+    // keeps per-xfer state, so interleaved transfers are safe. Console
+    // stays serial per-file (its paced writer gains nothing from either).
+    //
+    // The data plane can connect *after* hydrate has already started (its
+    // connect races the console login handshake and doesn't always win —
+    // see Sandbox.waitDataPlane). So batching/channel choice is decided
+    // lazily, per claim, not once up front: a small-file queue is drained
+    // into TREE_PUT batches only while dataChannelActive is actually true
+    // at claim time, and a late connection is picked up by the next claim.
+    const smallQueue: string[] = [];
+    const bigQueue: string[] = [];
+    for (const rel of toPush) {
+      (host.files[rel].size >= SMALL_FILE_LIMIT ? bigQueue : smallQueue).push(rel);
+    }
+    const claim = (): (() => Promise<void>) | null => {
+      if (this.dataChannelActive && smallQueue.length) {
+        const batch: string[] = [];
+        let bytes = 0;
+        while (smallQueue.length && bytes < TREE_BATCH_BYTES) {
+          const rel = smallQueue.shift()!;
+          batch.push(rel);
+          bytes += host.files[rel].size + 256; // entry header overhead
+        }
+        return () => this.pushTree(batch);
+      }
+      const rel = smallQueue.shift() ?? bigQueue.shift();
+      return rel ? () => this.pushFile(rel) : null;
+    };
+    // size the worker pool for the fast path whenever a data plane is
+    // configured at all, even if not connected yet — otherwise a late
+    // connection is stuck behind a pool that was sized for serial console.
+    const concurrency = this.dataChannelActive || this.opts.expectDataChannel ? 8 : 1;
+    const workers = Math.max(1, Math.min(concurrency, toPush.length));
+    await Promise.all(
+      Array.from({ length: workers }, async () => {
+        for (;;) {
+          const job = claim();
+          if (!job) return;
+          await job();
+        }
+      })
+    );
     for (const rel of toDelete) await this.pushDelete(rel);
     this.emit("hydrated", { pushed: toPush.length, deleted: toDelete.length });
     this.startWatcher();
@@ -188,6 +276,8 @@ export class SyncManager extends EventEmitter {
     if (!st.isFile()) return;
     const hash = hashFileSync(abs);
     const xfer = ++this.nextXfer;
+    const ch = this.txChannel(); // transfer stays on one channel end to end
+    const chunkSize = ch === this.bridge ? CHUNK_SIZE : DATA_CHUNK_SIZE;
     const meta: PutMeta = {
       xfer,
       path: rel,
@@ -203,24 +293,29 @@ export class SyncManager extends EventEmitter {
       let readDone = false;
       let fd: number | null = null;
       const timer = setTimeout(() => finish(new Error(`timeout pushing ${rel}`)), 120000);
+      const maxWindow = ch.bufferedBytes ? DATA_WINDOW : WINDOW;
+      const onDrain = () => pump();
 
       const finish = (err: Error | null, frame?: Frame) => {
         clearTimeout(timer);
-        this.bridge.offXfer(xfer);
+        ch.offXfer(xfer);
+        ch.off("drain", onDrain);
         if (fd !== null) fs.closeSync(fd);
         err ? reject(err) : resolve(frame!);
       };
 
       const pump = () => {
         if (fd === null || readDone) return;
-        while (window < WINDOW && !readDone) {
-          const buf = Buffer.alloc(CHUNK_SIZE);
-          const n = fs.readSync(fd, buf, 0, CHUNK_SIZE, sent);
+        while (window < maxWindow && !readDone) {
+          // primary throttle on the data plane: transport queue depth
+          if (ch.bufferedBytes && ch.bufferedBytes() > HIGH_WATER) return;
+          const buf = Buffer.alloc(chunkSize);
+          const n = fs.readSync(fd, buf, 0, chunkSize, sent);
           if (n <= 0) {
             readDone = true;
             break;
           }
-          this.bridge.send(FrameType.FILE_CHUNK, encodeChunk(xfer, sent, buf.subarray(0, n)));
+          ch.send(FrameType.FILE_CHUNK, encodeChunk(xfer, sent, buf.subarray(0, n)));
           this.stats.bytesOut += n;
           sent += n;
           window++;
@@ -230,8 +325,9 @@ export class SyncManager extends EventEmitter {
           }
         }
       };
+      ch.on("drain", onDrain);
 
-      this.bridge.onXfer(xfer, (f: Frame) => {
+      ch.onXfer(xfer, (f: Frame) => {
         let body: any = {};
         try {
           body = JSON.parse(f.payload.toString("utf8"));
@@ -256,14 +352,24 @@ export class SyncManager extends EventEmitter {
           pump();
           return;
         }
-        // initial ready-ack → start data
+        // initial ready-ack → start data (console path; the data plane
+        // starts optimistically below and ignores this ack)
         if (meta.size > 0 && fd === null) {
           fd = fs.openSync(abs, "r");
           pump();
         }
       });
 
-      this.bridge.send(FrameType.FILE_PUT, Buffer.from(JSON.stringify(meta)));
+      ch.send(FrameType.FILE_PUT, Buffer.from(JSON.stringify(meta)));
+      // Data plane: TCP delivery order guarantees the guest sees FILE_PUT
+      // before any chunk, so skip the ready-ack round trip (it dominates
+      // small-file cost — RTT through the emulated netstack is tens of ms).
+      // On a conflict-NAK the first NAK finishes the transfer; stray
+      // unknown-xfer NAKs for already-sent chunks are ignored.
+      if (ch !== this.bridge && meta.size > 0) {
+        fd = fs.openSync(abs, "r");
+        pump();
+      }
     });
 
     let doneBody: any = {};
@@ -279,8 +385,109 @@ export class SyncManager extends EventEmitter {
     }
   }
 
+  /**
+   * Push a batch of small files as one TREE_PUT archive (data plane only).
+   * Archive entries: [u32le header-len][JSON {path,size,mode,mtimeMs,hash}]
+   * [raw bytes]. The body streams as FILE_CHUNK frames under one xfer id;
+   * the guest unpacks sequentially and reports LWW-skipped paths in the
+   * done-ACK.
+   */
+  async pushTree(rels: string[]): Promise<void> {
+    const ch = this.txChannel();
+    const parts: Buffer[] = [];
+    const meta: { rel: string; hash: string }[] = [];
+    for (const rel of rels) {
+      const abs = safeJoin(this.hostDir, rel);
+      if (!abs) throw new Error(`illegal path ${rel}`);
+      let st: fs.Stats;
+      let data: Buffer;
+      try {
+        st = fs.statSync(abs);
+        if (!st.isFile()) continue;
+        data = fs.readFileSync(abs);
+      } catch {
+        continue; // raced deletion
+      }
+      const hash = crypto.createHash("sha256").update(data).digest("hex");
+      parts.push(
+        encodeTreeEntry(
+          {
+            path: rel,
+            size: data.length,
+            mode: st.mode & 0o777,
+            mtimeMs: Math.floor(st.mtimeMs),
+            hash,
+          },
+          data
+        )
+      );
+      meta.push({ rel, hash });
+    }
+    if (!meta.length) return;
+    const archive = Buffer.concat(parts);
+    const xfer = ++this.nextXfer;
+
+    await new Promise<void>((resolve, reject) => {
+      let sent = 0;
+      let window = 0;
+      const timer = setTimeout(() => finish(new Error(`timeout pushing tree (${meta.length} files)`)), 120000);
+      const onDrain = () => pump();
+
+      const finish = (err: Error | null) => {
+        clearTimeout(timer);
+        ch.offXfer(xfer);
+        ch.off("drain", onDrain);
+        err ? reject(err) : resolve();
+      };
+
+      const pump = () => {
+        while (sent < archive.length && window < DATA_WINDOW) {
+          if (ch.bufferedBytes && ch.bufferedBytes() > HIGH_WATER) return;
+          const n = Math.min(DATA_CHUNK_SIZE, archive.length - sent);
+          ch.send(FrameType.FILE_CHUNK, encodeChunk(xfer, sent, archive.subarray(sent, sent + n)));
+          this.stats.bytesOut += n;
+          sent += n;
+          window++;
+        }
+      };
+
+      ch.onXfer(xfer, (f: Frame) => {
+        let body: any = {};
+        try {
+          body = JSON.parse(f.payload.toString("utf8"));
+        } catch {
+          /* ignore */
+        }
+        if (f.type === FrameType.NAK) {
+          return finish(new Error(`guest NAK on tree: ${body.error}`));
+        }
+        if (body.done) {
+          const skipped = new Set<string>(body.skipped ?? []);
+          for (const m of meta) {
+            if (skipped.has(m.rel)) continue;
+            this.lastSync.set(m.rel, m.hash);
+            this.stats.pushed++;
+            this.emit("pushed", m.rel);
+          }
+          return finish(null);
+        }
+        if (body.received !== undefined) {
+          window = Math.max(0, window - ACK_EVERY);
+          pump();
+        }
+      });
+      ch.on("drain", onDrain);
+
+      ch.send(
+        FrameType.TREE_PUT,
+        Buffer.from(JSON.stringify({ xfer, size: archive.length, count: meta.length }))
+      );
+      pump(); // stream immediately — TCP ordering delivers TREE_PUT first
+    });
+  }
+
   async pushDelete(rel: string): Promise<void> {
-    await this.bridge.request(FrameType.FILE_DEL, Buffer.from(JSON.stringify({ path: rel })));
+    await this.txChannel().request(FrameType.FILE_DEL, Buffer.from(JSON.stringify({ path: rel })));
     this.lastSync.delete(rel);
     this.stats.deleted++;
     this.emit("deleted", rel);
@@ -288,29 +495,29 @@ export class SyncManager extends EventEmitter {
 
   // ---------- guest → host ----------
 
-  private ack(seq: number, extra: Record<string, unknown> = {}): void {
-    this.bridge.send(FrameType.ACK, Buffer.from(JSON.stringify({ ack: seq, ...extra })));
+  private ack(ch: FrameChannel, seq: number, extra: Record<string, unknown> = {}): void {
+    ch.send(FrameType.ACK, Buffer.from(JSON.stringify({ ack: seq, ...extra })));
   }
 
-  private nak(seq: number, error: string, extra: Record<string, unknown> = {}): void {
-    this.bridge.send(FrameType.NAK, Buffer.from(JSON.stringify({ ack: seq, error, ...extra })));
+  private nak(ch: FrameChannel, seq: number, error: string, extra: Record<string, unknown> = {}): void {
+    ch.send(FrameType.NAK, Buffer.from(JSON.stringify({ ack: seq, error, ...extra })));
   }
 
-  private async handlePut(f: Frame): Promise<void> {
+  private async handlePut(ch: FrameChannel, f: Frame): Promise<void> {
     let meta: PutMeta;
     try {
       meta = JSON.parse(f.payload.toString("utf8"));
     } catch {
-      return this.nak(f.seq, "bad FILE_PUT json");
+      return this.nak(ch, f.seq, "bad FILE_PUT json");
     }
     const abs = safeJoin(this.hostDir, meta.path);
-    if (!abs) return this.nak(f.seq, "illegal path", { xfer: meta.xfer });
-    if (isIgnored(meta.path)) return this.nak(f.seq, "ignored path", { xfer: meta.xfer });
+    if (!abs) return this.nak(ch, f.seq, "illegal path", { xfer: meta.xfer });
+    if (isIgnored(meta.path)) return this.nak(ch, f.seq, "ignored path", { xfer: meta.xfer });
 
     // LWW conflict: local edited since last sync?
     const verdict = this.resolveIncoming(meta, abs);
     if (verdict === "local") {
-      return this.nak(f.seq, "conflict: local wins", { xfer: meta.xfer, conflict: true });
+      return this.nak(ch, f.seq, "conflict: local wins", { xfer: meta.xfer, conflict: true });
     }
 
     await fsp.mkdir(path.dirname(abs), { recursive: true });
@@ -318,16 +525,16 @@ export class SyncManager extends EventEmitter {
     await fsp.mkdir(tmpDir, { recursive: true });
     const tmpPath = path.join(tmpDir, `put-${meta.xfer}-${Date.now()}`);
     const fd = await fsp.open(tmpPath, "w");
-    const inc: Incoming = { meta, fd, tmpPath, received: 0, chunks: 0 };
+    const inc: Incoming = { meta, fd, tmpPath, received: 0, chunks: 0, ch };
     this.incoming.set(meta.xfer, inc);
     if (meta.size === 0) return void this.finishIncoming(f.seq, inc);
-    this.ack(f.seq, { xfer: meta.xfer });
+    this.ack(ch, f.seq, { xfer: meta.xfer });
   }
 
-  private async handleChunk(f: Frame): Promise<void> {
+  private async handleChunk(ch: FrameChannel, f: Frame): Promise<void> {
     const { xfer, offset, data } = decodeChunk(f.payload);
     const inc = this.incoming.get(xfer);
-    if (!inc) return this.nak(f.seq, "unknown xfer", { xfer });
+    if (!inc) return this.nak(ch, f.seq, "unknown xfer", { xfer });
     try {
       await inc.fd.write(data, 0, data.length, offset);
     } catch (e: any) {
@@ -339,7 +546,7 @@ export class SyncManager extends EventEmitter {
     if (inc.received >= inc.meta.size) {
       await this.finishIncoming(f.seq, inc);
     } else if (inc.chunks % ACK_EVERY === 0) {
-      this.ack(f.seq, { xfer, received: inc.received });
+      this.ack(inc.ch, f.seq, { xfer, received: inc.received });
     }
   }
 
@@ -358,31 +565,31 @@ export class SyncManager extends EventEmitter {
     this.incoming.delete(inc.meta.xfer);
     this.stats.pulled++;
     this.emit("pulled", inc.meta.path);
-    this.ack(seq, { xfer: inc.meta.xfer, done: true });
+    this.ack(inc.ch, seq, { xfer: inc.meta.xfer, done: true });
   }
 
   private async abortIncoming(seq: number, inc: Incoming, msg: string): Promise<void> {
     await inc.fd.close().catch(() => {});
     await fsp.unlink(inc.tmpPath).catch(() => {});
     this.incoming.delete(inc.meta.xfer);
-    this.nak(seq, msg, { xfer: inc.meta.xfer });
+    this.nak(inc.ch, seq, msg, { xfer: inc.meta.xfer });
   }
 
-  private async handleDel(f: Frame): Promise<void> {
+  private async handleDel(ch: FrameChannel, f: Frame): Promise<void> {
     let body: { path: string };
     try {
       body = JSON.parse(f.payload.toString("utf8"));
     } catch {
-      return this.nak(f.seq, "bad FILE_DEL json");
+      return this.nak(ch, f.seq, "bad FILE_DEL json");
     }
     const abs = safeJoin(this.hostDir, body.path);
-    if (!abs) return this.nak(f.seq, "illegal path");
-    if (isIgnored(body.path)) return this.ack(f.seq); // never synced, nothing to do
+    if (!abs) return this.nak(ch, f.seq, "illegal path");
+    if (isIgnored(body.path)) return this.ack(ch, f.seq); // never synced, nothing to do
     await fsp.rm(abs, { recursive: true, force: true });
     this.lastSync.delete(body.path);
     this.stats.deleted++;
     this.emit("deleted", body.path);
-    this.ack(f.seq);
+    this.ack(ch, f.seq);
   }
 
   // ---------- conflicts ----------

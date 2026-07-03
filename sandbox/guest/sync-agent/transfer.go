@@ -28,17 +28,46 @@ type incoming struct {
 	chunks   int
 }
 
+// incomingTree is a streaming unpacker for a TREE_PUT archive: entries are
+// [u32le header-len][JSON header {path,size,mode,mtimeMs,hash}][raw bytes],
+// delivered in order via FILE_CHUNK frames under one xfer id.
+type incomingTree struct {
+	xfer     uint32
+	size     int64 // total archive bytes announced
+	received int64
+	chunks   int
+	buf      []byte // unconsumed carry-over (partial header or entry tail)
+	cur      *PutMeta
+	curFile  *os.File
+	curPath  string // tmp path of current entry
+	curLeft  int64
+	skipping bool // current entry discarded (LWW local-win / bad path)
+	skipped  []string
+}
+
 // Receiver applies host→guest file operations.
 type Receiver struct {
-	mu    sync.Mutex
-	root  string
-	fw    *FrameWriter
-	xfers map[uint32]*incoming
-	sync  *SyncState
+	mu     sync.Mutex
+	root   string
+	fw     *FrameWriter
+	xfers  map[uint32]*incoming
+	trees  map[uint32]*incomingTree
+	sync   *SyncState
+	verify bool // re-hash received files (console); TCP+frame-CRC skips it
 }
 
 func NewReceiver(root string, fw *FrameWriter, ss *SyncState) *Receiver {
-	return &Receiver{root: root, fw: fw, xfers: map[uint32]*incoming{}, sync: ss}
+	return &Receiver{root: root, fw: fw, xfers: map[uint32]*incoming{},
+		trees: map[uint32]*incomingTree{}, sync: ss, verify: true}
+}
+
+// NewReceiverNoVerify skips the sha256 read-back pass on completed files.
+// Used on the data plane: every frame is CRC32-checked on top of TCP
+// checksums, and the extra full pass over each file costs real time on the
+// emulated CPU.
+func NewReceiverNoVerify(root string, fw *FrameWriter, ss *SyncState) *Receiver {
+	return &Receiver{root: root, fw: fw, xfers: map[uint32]*incoming{},
+		trees: map[uint32]*incomingTree{}, sync: ss, verify: false}
 }
 
 func (rc *Receiver) ack(seq uint32, extra map[string]any) {
@@ -106,7 +135,12 @@ func (rc *Receiver) HandleChunk(f *Frame) {
 	data := f.Payload[12:]
 	rc.mu.Lock()
 	in := rc.xfers[xfer]
+	tr := rc.trees[xfer]
 	rc.mu.Unlock()
+	if tr != nil {
+		rc.handleTreeChunk(f.Seq, tr, offset, data)
+		return
+	}
 	if in == nil {
 		rc.nak(f.Seq, "unknown xfer", map[string]any{"xfer": xfer})
 		return
@@ -126,10 +160,12 @@ func (rc *Receiver) HandleChunk(f *Frame) {
 
 func (rc *Receiver) finish(seq uint32, in *incoming) {
 	in.tmp.Close()
-	h, err := hashFile(in.tmpPath)
-	if err != nil || h != in.meta.Hash {
-		rc.abort(seq, in, fmt.Sprintf("hash mismatch: got %s want %s", h, in.meta.Hash))
-		return
+	if rc.verify {
+		h, err := hashFile(in.tmpPath)
+		if err != nil || h != in.meta.Hash {
+			rc.abort(seq, in, fmt.Sprintf("hash mismatch: got %s want %s", h, in.meta.Hash))
+			return
+		}
 	}
 	abs, _ := safeJoin(rc.root, in.meta.Path)
 	os.Chmod(in.tmpPath, os.FileMode(in.meta.Mode))
@@ -154,6 +190,145 @@ func (rc *Receiver) abort(seq uint32, in *incoming, msg string) {
 	delete(rc.xfers, in.meta.Xfer)
 	rc.mu.Unlock()
 	rc.nak(seq, msg, map[string]any{"xfer": in.meta.Xfer})
+}
+
+// HandleTreePut announces a batched small-file archive (see PROTOCOL.md).
+func (rc *Receiver) HandleTreePut(f *Frame) {
+	var meta struct {
+		Xfer  uint32 `json:"xfer"`
+		Size  int64  `json:"size"`
+		Count int    `json:"count"`
+	}
+	if err := json.Unmarshal(f.Payload, &meta); err != nil {
+		rc.nak(f.Seq, "bad TREE_PUT json", nil)
+		return
+	}
+	tr := &incomingTree{xfer: meta.Xfer, size: meta.Size}
+	rc.mu.Lock()
+	rc.trees[meta.Xfer] = tr
+	rc.mu.Unlock()
+	if meta.Size == 0 {
+		rc.finishTree(f.Seq, tr)
+	}
+	// no ready-ack: the host streams chunks immediately (TCP ordering)
+}
+
+func (rc *Receiver) handleTreeChunk(seq uint32, tr *incomingTree, offset int64, data []byte) {
+	if offset != tr.received {
+		rc.abortTree(seq, tr, fmt.Sprintf("out-of-order tree chunk: got %d want %d", offset, tr.received))
+		return
+	}
+	tr.received += int64(len(data))
+	tr.chunks++
+	if err := rc.unpack(tr, data); err != nil {
+		rc.abortTree(seq, tr, err.Error())
+		return
+	}
+	if tr.received >= tr.size {
+		rc.finishTree(seq, tr)
+	} else if tr.chunks%16 == 0 {
+		rc.ack(seq, map[string]any{"xfer": tr.xfer, "received": tr.received})
+	}
+}
+
+// unpack consumes archive bytes: per entry a u32le header length, a JSON
+// header, then exactly header.size raw bytes.
+func (rc *Receiver) unpack(tr *incomingTree, data []byte) error {
+	tr.buf = append(tr.buf, data...)
+	for {
+		if tr.cur == nil {
+			if len(tr.buf) < 4 {
+				return nil
+			}
+			hlen := int(binary.LittleEndian.Uint32(tr.buf[0:4]))
+			if hlen <= 0 || hlen > 64*1024 {
+				return fmt.Errorf("bad tree entry header length %d", hlen)
+			}
+			if len(tr.buf) < 4+hlen {
+				return nil
+			}
+			var meta PutMeta
+			if err := json.Unmarshal(tr.buf[4:4+hlen], &meta); err != nil {
+				return fmt.Errorf("bad tree entry header: %v", err)
+			}
+			tr.buf = tr.buf[4+hlen:]
+			tr.cur = &meta
+			tr.curLeft = meta.Size
+			tr.skipping = false
+			abs, ok := safeJoin(rc.root, meta.Path)
+			if !ok || ignoredRel(meta.Path) {
+				tr.skipping = true
+				tr.skipped = append(tr.skipped, meta.Path)
+			} else if winner, conflict := rc.sync.ResolveIncoming(meta, abs); conflict && winner == "local" {
+				tr.skipping = true
+				tr.skipped = append(tr.skipped, meta.Path)
+			} else {
+				if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+					return err
+				}
+				// direct write, no temp+rename: per-entry VFS ops on the
+				// emulated CPU are the cost floor (~4 ms each), and the
+				// workspace disk is not canonical — an aborted hydrate is
+				// simply re-run from the host on the next boot
+				f, err := os.OpenFile(abs, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(meta.Mode))
+				if err != nil {
+					return err
+				}
+				tr.curFile = f
+				tr.curPath = abs
+			}
+		}
+		// stream current entry's bytes
+		n := int64(len(tr.buf))
+		if n > tr.curLeft {
+			n = tr.curLeft
+		}
+		if n > 0 {
+			if !tr.skipping {
+				if _, err := tr.curFile.Write(tr.buf[:n]); err != nil {
+					return err
+				}
+			}
+			tr.buf = tr.buf[n:]
+			tr.curLeft -= n
+		}
+		if tr.curLeft > 0 {
+			return nil // need more data for this entry
+		}
+		// entry complete
+		if !tr.skipping {
+			meta := tr.cur
+			tr.curFile.Close()
+			mt := time.UnixMilli(meta.MtimeMs)
+			os.Chtimes(tr.curPath, mt, mt) // keep LWW mtime semantics
+			rc.sync.MarkSynced(meta.Path, meta.Hash)
+		}
+		tr.cur = nil
+		tr.curFile = nil
+	}
+}
+
+func (rc *Receiver) finishTree(seq uint32, tr *incomingTree) {
+	if len(tr.buf) > 0 || tr.cur != nil {
+		rc.abortTree(seq, tr, fmt.Sprintf("truncated archive: %d trailing bytes", len(tr.buf)))
+		return
+	}
+	rc.mu.Lock()
+	delete(rc.trees, tr.xfer)
+	rc.mu.Unlock()
+	rc.ack(seq, map[string]any{"xfer": tr.xfer, "done": true, "skipped": tr.skipped})
+}
+
+func (rc *Receiver) abortTree(seq uint32, tr *incomingTree, msg string) {
+	log.Printf("tree xfer %d aborted: %s", tr.xfer, msg)
+	if tr.curFile != nil {
+		tr.curFile.Close()
+		os.Remove(tr.curPath)
+	}
+	rc.mu.Lock()
+	delete(rc.trees, tr.xfer)
+	rc.mu.Unlock()
+	rc.nak(seq, msg, map[string]any{"xfer": tr.xfer})
 }
 
 func (rc *Receiver) HandleDel(f *Frame) {
@@ -189,12 +364,20 @@ type Sender struct {
 }
 
 func NewSender(root string, fw *FrameWriter, ss *SyncState) *Sender {
+	return NewSenderWithBase(root, fw, ss, 0)
+}
+
+// NewSenderWithBase sets the starting xfer id. Senders on different channels
+// need disjoint id ranges: console starts at 0, the data plane at 0x40000000,
+// and the host allocates its own ids from 0x80000000 up.
+func NewSenderWithBase(root string, fw *FrameWriter, ss *SyncState, base uint32) *Sender {
 	return &Sender{
-		root:   root,
-		fw:     fw,
-		window: make(chan struct{}, 32),
-		acks:   map[uint32]chan *Frame{},
-		sync:   ss,
+		root:     root,
+		fw:       fw,
+		nextXfer: base,
+		window:   make(chan struct{}, 32),
+		acks:     map[uint32]chan *Frame{},
+		sync:     ss,
 	}
 }
 

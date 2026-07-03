@@ -7,7 +7,7 @@ interface RStatus {
   bootMs?: number;
   restored?: boolean;
   sync?: RSyncStats;
-  net?: { relayUrl: string; policyHosts: string[] };
+  net?: { relayUrl: string; policyHosts: string[]; dataPlane?: boolean };
   error?: string;
 }
 interface RConflict { path: string; winner: string; at: number; }
@@ -70,7 +70,9 @@ function render(s: RStatus) {
     $("deleted").textContent = String(s.sync.deleted);
     $("conflicts-n").textContent = String(s.sync.conflicts);
   }
-  $("net").textContent = s.net ? `${s.net.policyHosts.length} hosts` : "off";
+  $("net").textContent = s.net
+    ? `${s.net.policyHosts.length} hosts${s.net.dataPlane ? " +dp" : ""}`
+    : "off";
   if (s.error) term.write(`\r\n\x1b[31m[error] ${s.error}\x1b[0m\r\n`);
 }
 

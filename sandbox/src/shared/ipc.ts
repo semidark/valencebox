@@ -4,7 +4,7 @@ export interface SandboxStatus {
   bootMs?: number;
   restored?: boolean;
   guest?: { root: string; version: number };
-  net?: { relayUrl: string; policyHosts: string[] };
+  net?: { relayUrl: string; policyHosts: string[]; dataPlane?: boolean };
   sync?: {
     pushed: number;
     pulled: number;

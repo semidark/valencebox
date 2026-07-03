@@ -7,6 +7,7 @@ import { HostBridge } from "./bridge";
 import { SyncManager } from "./sync-manager";
 import { SnapshotManager } from "./snapshot";
 import { WispServer, EgressPolicy, DEFAULT_POLICY } from "./wisp";
+import { DataPlane } from "./data-plane";
 import { DOH_GATE_HOST, installDohGate } from "./doh";
 import { SandboxStatus } from "../shared/ipc";
 
@@ -26,7 +27,9 @@ export class Sandbox extends EventEmitter {
   sync!: SyncManager;
   snapshots!: SnapshotManager;
   wisp?: WispServer;
+  dataPlane?: DataPlane;
   status: SandboxStatus = { phase: "boot" };
+  private stopping = false;
 
   constructor(private cfg: SandboxConfig) {
     super();
@@ -42,6 +45,9 @@ export class Sandbox extends EventEmitter {
 
     if (this.cfg.enableNetwork ?? true) {
       this.wisp = new WispServer(this.cfg.egress ?? DEFAULT_POLICY);
+      this.dataPlane = new DataPlane();
+      this.dataPlane.on("log", (m) => this.emit("log", m));
+      this.wisp.attachDataPlane(this.dataPlane);
       installDohGate({
         hostAllowed: (n) => this.wisp!.hostAllowed(n),
         onResolve: (_h, ip) => this.wisp!.pinIp(ip),
@@ -74,14 +80,28 @@ export class Sandbox extends EventEmitter {
     await this.vm.start();
 
     this.bridge = new HostBridge(this.vm);
+    if (this.dataPlane) {
+      this.bridge.helloExtra = { dataPlane: this.dataPlane.advert() };
+    }
     this.snapshots = new SnapshotManager(this.vm, this.cfg.snapshotFile);
     this.sync = new SyncManager(this.bridge, this.cfg.hostDir, {
       conflictLog: this.cfg.conflictLog,
+      expectDataChannel: !!this.dataPlane,
     });
     this.sync.on("conflict", (rec) => this.emit("conflict", rec));
     this.sync.on("pushed", () => this.snapshots.markActivity());
     this.sync.on("pulled", () => this.snapshots.markActivity());
     this.sync.on("hydrated", () => this.pushStatus());
+    this.dataPlane?.on("channel", (ch) => {
+      this.sync.attachDataChannel(ch);
+      this.emit("log", "data plane connected (bulk sync over virtio-net TCP)");
+      this.pushStatus();
+    });
+    this.dataPlane?.on("close", () => {
+      this.sync.detachDataChannel();
+      this.emit("log", "data plane disconnected — falling back to console");
+      this.pushStatus();
+    });
 
     if (initialState) {
       // Restored: guest agent + serial session are already live. Re-handshake
@@ -104,6 +124,7 @@ export class Sandbox extends EventEmitter {
       }
       this.setStatus({ phase: "hydrating", guest });
       await this.waitAgentReady();
+      await this.waitDataPlane();
       await this.sync.hydrate();
     }
 
@@ -151,7 +172,27 @@ export class Sandbox extends EventEmitter {
       this.sync.on("guest-manifest", onPart);
       settle = setTimeout(done, 5000); // guest silent → proceed
     });
+    await this.waitDataPlane();
     await this.sync.hydrate();
+  }
+
+  /**
+   * Give the guest a moment to dial the data plane so hydrate runs fast.
+   * The guest starts dialing as soon as it gets the advert (in the ACK to
+   * its own early console HELLO) — independent of, and roughly concurrent
+   * with, the login handshake this waits on beforehand. So by the time this
+   * runs, the two are typically neck-and-neck; on a loaded machine or a
+   * slow DHCP/WISP negotiation the data plane can lose that race by more
+   * than a few seconds. Falls back to the console if it still isn't there —
+   * but hydrate() itself keeps checking for a late connection (see there),
+   * so this timeout only controls how long we delay the *start* of hydrate,
+   * not whether the fast path gets used at all.
+   */
+  private async waitDataPlane(timeoutMs = 25000): Promise<void> {
+    if (!this.dataPlane || this.dataPlane.channel) return;
+    await this.dataPlane.waitChannel(timeoutMs).catch(() => {
+      this.emit("log", "data plane not connected yet — hydrating over console (will switch over if it connects mid-hydrate)");
+    });
   }
 
   /** forward raw keystrokes from the UI terminal to the guest serial line */
@@ -178,14 +219,30 @@ export class Sandbox extends EventEmitter {
         ? {
             relayUrl: this.wisp.relayUrl,
             policyHosts: (this.cfg.egress ?? DEFAULT_POLICY).allowHosts.map(String),
+            dataPlane: this.sync?.dataChannelActive ?? false,
           }
         : undefined,
     });
   }
 
   async stop(): Promise<void> {
+    if (this.stopping) return;
+    this.stopping = true;
     this.snapshots?.stop();
     await this.sync?.stop();
+    // Best-effort final checkpoint so a graceful quit doesn't lose ground to
+    // the periodic idle-gated snapshot (snapshot.ts). Safe once the guest
+    // handshake succeeded — "hydrating" and "ready" are both past that point
+    // ("boot"/"restore" precede vm.start(), and a restore replays hello()
+    // rather than the login flow, so a pre-handshake snapshot from those
+    // phases wouldn't restore correctly).
+    if (this.snapshots && (this.status.phase === "hydrating" || this.status.phase === "ready")) {
+      try {
+        await this.saveSnapshot();
+      } catch (e: any) {
+        this.emit("log", `final snapshot failed: ${e.message}`);
+      }
+    }
     this.vm?.stop();
     await this.wisp?.stop();
     this.setStatus({ phase: "stopped" });
