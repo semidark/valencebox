@@ -1,4 +1,21 @@
-# v86 MicroVM Coding Sandbox
+# ValenceBox
+
+> **Experimental Proof of Concept**
+>
+> ValenceBox is an experiment to explore how far a WebAssembly-based Linux
+> sandbox can be pushed inside an Electron app. It is **not production-ready**
+> and comes with significant limitations:
+>
+> - **Memory:** WASM does not support dynamic memory allocation, so despite v86
+>   supporting memory ballooning, the VM cannot resize its RAM at runtime.
+>   Memory management is suboptimal.
+> - **CPU:** v86 emulates a single-core 32-bit x86 CPU only. SMP (multi-core)
+>   is not implemented.
+> - **File sync:** The workspace sync engine was built from scratch and is
+>   alpha-quality at best. Conflicts, large trees, and edge cases are handled
+>   minimally.
+> - **Unknowns:** This was written as a personal exploration. There are likely
+>   undiscovered bugs, race conditions, and security gaps.
 
 A secure, high-performance coding sandbox for an AI agent, running an x86
 Alpine Linux microVM in WebAssembly (v86) inside an Electron app. The agent is
@@ -67,7 +84,7 @@ There is deliberately **no live host mount** (see HARDENING.md) — instead a
 host directory is continuously synced with the guest's `/workspace` disk
 (bidirectional, conflict-resolved). By default that directory is
 `<Electron userData>/workspace` (macOS:
-`~/Library/Application Support/v86-sandbox/workspace`). Override it:
+`~/Library/Application Support/valencebox/workspace`). Override it:
 
 ```sh
 WORKSPACE_DIR=~/src/myproject npm start
@@ -118,6 +135,12 @@ See [HARDENING.md](HARDENING.md). Key invariants: no live host mount (files
 cross only as protocol bytes over ext4 disks), path-escape rejection on every
 transfer, single allowlisted egress path (private/loopback IPs blocked),
 canonical store on the host so durability never depends on VM disk internals.
+
+## License
+
+AGPL-3.0-only — see [`../LICENSE`](../LICENSE). Third-party attributions
+(v86 assets, xterm.js, wisp-js) are listed in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 ## Notes & deviations from the original spec
 

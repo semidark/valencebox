@@ -1,9 +1,10 @@
 {
-  "name": "v86-sandbox",
+  "name": "valencebox",
   "version": "0.1.0",
   "description": "Secure v86 microVM coding sandbox for an AI agent (Electron)",
   "main": "dist/main/main.js",
   "private": true,
+  "license": "AGPL-3.0-only",
   "scripts": {
     "build": "tsc -p . && node scripts/copy-renderer.js",
     "start": "npm run build && electron .",
