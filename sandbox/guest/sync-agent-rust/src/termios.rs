@@ -37,10 +37,16 @@ const CS8: u32 = 0x30;
 const VTIME: usize = 5;
 const VMIN: usize = 6;
 
+#[cfg(target_pointer_width = "64")]
+fn ioctl_req(v: libc::c_int) -> u64 { v as u64 }
+
+#[cfg(not(target_pointer_width = "64"))]
+fn ioctl_req(v: libc::c_int) -> i32 { v }
+
 pub fn set_raw(fd: std::fs::File) -> std::io::Result<()> {
     let raw_fd = fd.as_raw_fd();
     let mut t: Termios = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::ioctl(raw_fd, TCGETS, &mut t as *mut Termios) };
+    let ret = unsafe { libc::ioctl(raw_fd, ioctl_req(TCGETS), &mut t as *mut Termios) };
     if ret == -1 {
         return Err(std::io::Error::last_os_error());
     }
@@ -51,7 +57,7 @@ pub fn set_raw(fd: std::fs::File) -> std::io::Result<()> {
     t.cflag |= CS8;
     t.cc[VTIME] = 0;
     t.cc[VMIN] = 1;
-    let ret = unsafe { libc::ioctl(raw_fd, TCSETS, &t as *const Termios) };
+    let ret = unsafe { libc::ioctl(raw_fd, ioctl_req(TCSETS), &t as *const Termios) };
     if ret == -1 {
         return Err(std::io::Error::last_os_error());
     }

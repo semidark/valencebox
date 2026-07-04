@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
@@ -6,7 +6,9 @@ use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-#[derive(Serialize, Clone, Debug)]
+use crate::state::SyncState;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileMeta {
     pub hash: String,
     pub size: i64,
@@ -14,7 +16,7 @@ pub struct FileMeta {
     pub mtime_ms: i64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Manifest {
     pub files: HashMap<String, FileMeta>,
 }
@@ -40,7 +42,7 @@ pub fn hash_file(path: &str) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub fn build_manifest(root: &str, state: &mut SyncState) -> io::Result<Manifest> {
+pub fn build_manifest(root: &str, state: &SyncState) -> io::Result<Manifest> {
     let mut m = Manifest {
         files: HashMap::new(),
     };
@@ -143,8 +145,6 @@ pub fn safe_join(root: &str, rel: &str) -> Option<String> {
         Some(root.to_string())
     }
 }
-
-use crate::state::SyncState;
 
 #[cfg(test)]
 mod tests {

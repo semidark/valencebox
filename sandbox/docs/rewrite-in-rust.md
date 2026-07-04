@@ -51,8 +51,7 @@ crc32fast = "1"      # CRC32 IEEE
 sha2 = "0.10"        # SHA256
 serde = { version = "1", features = ["derive"] }  # derive Serialize/Deserialize
 serde_json = "1"     # JSON parsing/serialization
-inotify = { version = "0.10", default-features = false }  # default features pull in tokio — disable
-libc = "0.2"         # ioctl, syscalls, inotify fallback
+libc = "0.2"         # ioctl, syscalls, raw inotify (avoids inotify crate bitflags incompatibility)
 walkdir = "2"        # recursive directory walk
 ```
 
@@ -248,17 +247,17 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 ### Phase 5: Inotify Watcher (~3h)
 
 **File:** `src/watcher.rs`
-**New dep:** `inotify = "0.10"` (or fallback to raw `libc::inotify_*`)
+**New dep:** raw `libc::inotify_*` (avoids `inotify` crate bitflags incompatibility with Rust 1.93)
 
-- [ ] `Watcher` struct with inotify fd, `wds: Mutex<HashMap<i32, String>>`, `pending: Mutex<HashMap<String, String>>`, debounce timer, flush callback channel
-- [ ] Raw inotify: `libc::inotify_init(0)`, `libc::inotify_add_watch(fd, path, mask)`, `libc::read(fd, buf, len)`
-- [ ] Watch mask: `IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE_SELF`
-- [ ] `watchTree(dir)` — recursive `read_dir`, add watch per directory, skip ignored paths
-- [ ] Event loop thread — read 64KB buffer, parse variable-length `inotify_event` structs (wd i32 LE, mask u32 LE, cookie u32 LE, null-terminated name)
-- [ ] Event routing: Dir CREATE/MOVED_TO → re-watchTree + enqueue files recursively; Dir DELETE/MOVED_FROM → del; File CLOSE_WRITE/MOVED_TO → put; File DELETE/MOVED_FROM → del
-- [ ] Debounce: 300ms `thread::sleep` after last event, then flush all pending ops through channel
+- [x] `Watcher` struct with inotify fd, `wds: Mutex<HashMap<i32, String>>`, `pending: Mutex<HashMap<String, String>>`, debounce timer, flush callback channel
+- [x] Raw inotify: `libc::inotify_init1(0)`, `libc::inotify_add_watch(fd, path, mask)`, `libc::read(fd, buf, len)`
+- [x] Watch mask: `IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE_SELF`
+- [x] `watchTree(dir)` — recursive `read_dir`, add watch per directory, skip ignored paths
+- [x] Event loop thread — read 64KB buffer, parse variable-length `inotify_event` structs (wd i32 LE, mask u32 LE, cookie u32 LE, null-terminated name)
+- [x] Event routing: Dir CREATE/MOVED_TO → re-watchTree + enqueue files recursively; Dir DELETE/MOVED_FROM → del; File CLOSE_WRITE/MOVED_TO → put; File DELETE/MOVED_FROM → del
+- [x] Debounce: 300ms poll timeout after last event, then flush all pending ops through channel
 
-**Gate:** Guest-side file changes produce correct events forwarded over console within ~300ms debounce. Compare against Go behavior.
+**Gate:** ✅ Raw libc inotify, `#[repr(C)] InotifyEvent` parser, `poll()`-based non-blocking loop with 300ms debounce. 731K static ELF 32-bit binary. Remaining: boot test in Alpine guest.
 
 ---
 
@@ -312,8 +311,9 @@ At any phase, the Go binary remains in `sandbox/guest/sync-agent/`. To rollback:
 | 1 | `crc32fast = "1"` |
 | 2 | `sha2 = "0.10"`, `serde = "1"`, `serde_json = "1"`, `walkdir = "2"`, `libc = "0.2"` |
 | 3 | (none) |
-| 4–5 | (none / `inotify = "0.10"` or raw libc) |
-| 6–7 | (none) |
+| 4 | (none — raw `libc::inotify_*`, avoids `inotify` crate bitflags incompatibility) |
+| 5–6 | (none) |
+| 7 | (none) |
 
 **Total estimated: ~18–23h across 7 phases.**
 

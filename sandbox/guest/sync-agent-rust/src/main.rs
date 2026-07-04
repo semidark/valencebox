@@ -2,8 +2,11 @@ mod frame;
 mod manifest;
 mod state;
 mod termios;
+mod transfer;
+mod watcher;
 
 use std::io::BufReader;
+use std::sync::mpsc;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -34,8 +37,6 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
         eprintln!("sync-agent: warning: could not set {} raw: {}", dev, e);
     }
 
-    let f = f;
-    let reader = BufReader::with_capacity(256 * 1024, &f);
     let fw = frame::FrameWriter::new(Box::new(f.try_clone()?));
     let hello = serde_json::to_vec(&serde_json::json!({
         "version": 1,
@@ -44,8 +45,24 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
     })).unwrap();
     fw.send(frame::TYPE_HELLO, &hello)?;
 
+    let (tx, rx) = mpsc::channel();
+    match watcher::new_watcher(root, tx) {
+        Ok(_handle) => {
+            eprintln!("sync-agent: inotify watcher started");
+        }
+        Err(e) => {
+            eprintln!("sync-agent: inotify unavailable: {}", e);
+        }
+    }
+
+    let reader = BufReader::with_capacity(256 * 1024, f);
     let mut r = reader;
     loop {
+        if let Ok(ops) = rx.try_recv() {
+            for (rel, op) in &ops {
+                eprintln!("sync-agent: watcher event: {} {}", rel, op);
+            }
+        }
         let frame = frame::read_frame(&mut r)?;
         eprintln!(
             "sync-agent: frame type={} seq={} payload_len={}",

@@ -96,7 +96,7 @@ impl SyncState {
         }
     }
 
-    fn hash_file(path: &str) -> io::Result<String> {
+    pub fn hash_file(path: &str) -> io::Result<String> {
         let mut f = File::open(path)?;
         let mut hasher = sha2::Sha256::new();
         let mut buf = [0u8; 65536];
@@ -108,5 +108,39 @@ impl SyncState {
             hasher.update(&buf[..n]);
         }
         Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    // ResolveIncoming: LWW conflict resolution.
+    // Returns ("remote", false) if no conflict, or ("local"/"remote", true) on conflict.
+    pub fn resolve_incoming(&self, rel: &str, abs: &str, remote_hash: &str, remote_mtime_ms: i64) -> (&'static str, bool) {
+        let meta = match fs::metadata(abs) {
+            Ok(m) => m,
+            Err(_) => return ("remote", false),
+        };
+        let local_hash = match Self::hash_file(abs) {
+            Ok(h) => h,
+            Err(_) => return ("remote", false),
+        };
+        if local_hash == remote_hash {
+            return ("remote", false);
+        }
+        let last = self.last_hash(rel);
+        if last.as_deref() == Some(&local_hash.as_str()) {
+            return ("remote", false);
+        }
+        let local_mtime_ms = meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let winner = if local_mtime_ms > remote_mtime_ms
+            || (local_mtime_ms == remote_mtime_ms && local_hash.as_str() > remote_hash)
+        {
+            "local"
+        } else {
+            "remote"
+        };
+        eprintln!("CONFLICT {}: local mtime={} remote mtime={} -> {} wins", rel, local_mtime_ms, remote_mtime_ms, winner);
+        (winner, true)
     }
 }
