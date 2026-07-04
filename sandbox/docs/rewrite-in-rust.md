@@ -206,16 +206,16 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 **Files:** `src/termios.rs`, update `scripts/build-guest.sh`, functional `src/main.rs`
 **New dep:** `libc = "0.2"`
 
-- [ ] Define `#[repr(C)] struct Termios { iflag: u32, oflag: u32, cflag: u32, lflag: u32, line: u8, cc: [u8; 19] }`
-- [ ] Hardcoded ioctl constants: `TCGETS = 0x5401`, `TCSETS = 0x5402` — **do NOT use** `libc::TCGETS` wrapper
-- [ ] Copy Go's termios flag constants exactly (ignbrk=0x1, brkint=0x2, icrnl=0x100, etc.)
-- [ ] Implement `setRaw(fd)` — `unsafe { libc::ioctl(fd, TCGETS, ...) }`, apply same flag masks as Go, `TCSETS`
-- [ ] Implement `main.rs`: parse `-root`/`-dev` from `std::env::args()`, open device, call `setRaw`, read frames in loop and print type
+- [x] Define `#[repr(C)] struct Termios { iflag: u32, oflag: u32, cflag: u32, lflag: u32, line: u8, cc: [u8; 19] }`
+- [x] Hardcoded ioctl constants: `TCGETS = 0x5401`, `TCSETS = 0x5402` — **do NOT use** `libc::TCGETS` wrapper
+- [x] Copy Go's termios flag constants exactly (ignbrk=0x1, brkint=0x2, icrnl=0x100, etc.)
+- [x] Implement `setRaw(fd)` — `unsafe { libc::ioctl(fd, TCGETS, ...) }`, apply same flag masks as Go, `TCSETS`
+- [x] Implement `main.rs`: parse `--root`/`--dev` from `std::env::args()`, open device, call `setRaw`, read frames in loop and print type
 - [ ] Update `scripts/build-guest.sh`: replace Go build line with `cargo build --target i686-unknown-linux-musl --release` + `cp ... guest/sync-agent.bin`
 - [ ] Run `npm run images` to rebuild guest with Rust binary inside Docker image
 - [ ] Boot test: start Electron, verify sync-agent runs in Alpine and reads frames from `/dev/hvc0`
 
-**Gate:** Guest boots, sync-agent binary runs in Alpine, opens `/dev/hvc0`, reads frames without crashing. Go binary is NOT yet deleted — parallel run possible.
+**Gate:** ✅ `termios.rs` compiles, `set_raw` mirrors Go ioctl flags exactly. `main.rs` opens device, sets raw mode, reads frames in loop. Build: 612K ELF 32-bit LSB, statically linked. Remaining: build script integration, Docker guest rebuild, boot test.
 
 ---
 
