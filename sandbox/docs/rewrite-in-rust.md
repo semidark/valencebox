@@ -149,16 +149,171 @@ Frame types:
 3. **`npm run test:sync`** — VM integration tests, validates end-to-end behavior.
 4. **Binary drop-in** — Replace Go binary in guest image, verify boot + sync.
 
-## Implementation Order
+## Phased Implementation Plan
 
-1. `frame.rs` — Protocol framing (foundation, everything else depends on it)
-2. `manifest.rs` + `state.rs` — Walk, hash, state management
-3. `termios.rs` — Raw mode setup
-4. `transfer.rs` — Send/receive, tree unpacker
-5. `watcher.rs` — inotify + debounce
-6. `dataplane.rs` — TCP client session
-7. `main.rs` — Orchestration, session loop
-8. Build integration + testing
+Each phase has a verification gate. Do not proceed to the next phase until the current gate passes. Go source remains as rollback at any point: revert `scripts/build-guest.sh` → `npm run images`.
+
+### Pre-flight
+
+- [ ] Confirm `musl-gcc` works for i686-musl linker (`rustc --target i686-unknown-linux-musl` already installed)
+- [ ] Skeleton `cargo check --target i686-unknown-linux-musl` to verify all crates resolve
+
+---
+
+### Phase 1: Frame Protocol (~2h)
+
+**Files:** `Cargo.toml`, `src/frame.rs`, stub `src/main.rs`
+
+- [ ] Create `sandbox/guest/sync-agent-rust/` with `Cargo.toml` (package `sync-agent`, edition 2021, dep: `crc32fast = "1"`)
+- [ ] Implement `Frame` struct `{typ: u8, seq: u32, payload: Vec<u8>}` + frame type constants (1–10)
+- [ ] Implement `ReadFrame` — byte-by-byte magic hunt state machine matching Go `frame.go:40-53` exactly (`matched++`, `b == magic[0] → 1`, `else → 0`)
+- [ ] Wire format: `[MAGIC 4B][type 1B][seq 4B LE][plen 4B LE][payload N B][crc32 4B LE]`
+- [ ] CRC covers header(9) + payload(N), NOT magic, NOT trailer — IEEE via `crc32fast`
+- [ ] Implement `FrameWriter` with `Mutex`-protected writer + auto-incrementing seq counter
+- [ ] Cross-check CRC against `protocol.ts` IEEE table (0xEDB88320 reversed)
+- [ ] Stub `src/main.rs`: `fn main() { println!("sync-agent-rust placeholder"); }`
+
+**Gate:** Binary compiles for i686-musl. Frame read/write round-trip produces identical bytes for a known payload.
+
+---
+
+### Phase 2: Manifest + State (~3h)
+
+**Files:** `src/manifest.rs`, `src/state.rs`
+**New deps:** `sha2 = "0.10"`, `serde_json = "1"`, optionally `walkdir = "2"`
+
+- [ ] `FileMeta` struct with serde derives — field names match Go JSON exactly (`hash`, `size`, `mode`, `mtimeMs`)
+- [ ] `Manifest { files: HashMap<String, FileMeta> }` with serde
+- [ ] `ignoredRel(rel: &str) -> bool` — split on `/`, check segments against `{".sync-tmp", ".git", "node_modules", "lost+found", ".DS_Store"}`
+- [ ] `hashFile(path: &str) -> Result<String>` — streaming SHA256 hex digest via `sha2::Sha256`
+- [ ] `buildManifest(root, ss)` — recursive walk, skip ignored/non-regular files, use `ss.hash_cached_stat()` for cache benefit
+- [ ] `marshalManifestBatches(m)` — 160*1024 byte soft limit, ~160B per entry estimate (`len(rel) + 160`)
+- [ ] `safeJoin(root, rel) -> Option<String>` — reject empty/absolute paths, detect `..` via path components
+- [ ] `SyncState` with `Mutex<{last_sync, stat_cache}>`, `fw: Arc<FrameWriter>`
+- [ ] `HashCached` / `hashCachedStat` — same (size, mtime) cache invalidation as Go
+- [ ] `MarkSynced`, `MarkDeleted`, `LastHash`, `IsEcho`
+- [ ] `ResolveIncoming` — LWW by mtime, tie-break greater hash string, emit `TypeEvent` JSON on conflict
+- [ ] Verify: serialize a `FileMeta` with serde_json and compare key names against Go's `json.Marshal` output
+
+**Gate:** All pure-logic functions work correctly. `safeJoin` rejects the same paths Go rejects.
+
+---
+
+### Phase 3: Termios + Build Integration (~1h)
+
+**Files:** `src/termios.rs`, update `scripts/build-guest.sh`, functional `src/main.rs`
+**New dep:** `libc = "0.2"`
+
+- [ ] Define `#[repr(C)] struct Termios { iflag: u32, oflag: u32, cflag: u32, lflag: u32, line: u8, cc: [u8; 19] }`
+- [ ] Hardcoded ioctl constants: `TCGETS = 0x5401`, `TCSETS = 0x5402` — **do NOT use** `libc::TCGETS` wrapper
+- [ ] Copy Go's termios flag constants exactly (ignbrk=0x1, brkint=0x2, icrnl=0x100, etc.)
+- [ ] Implement `setRaw(fd)` — `unsafe { libc::ioctl(fd, TCGETS, ...) }`, apply same flag masks as Go, `TCSETS`
+- [ ] Implement `main.rs`: parse `-root`/`-dev` from `std::env::args()`, open device, call `setRaw`, read frames in loop and print type
+- [ ] Update `scripts/build-guest.sh`: replace Go build line with `cargo build --target i686-unknown-linux-musl --release` + `cp ... guest/sync-agent.bin`
+- [ ] Run `npm run images` to rebuild guest with Rust binary inside Docker image
+- [ ] Boot test: start Electron, verify sync-agent runs in Alpine and reads frames from `/dev/hvc0`
+
+**Gate:** Guest boots, sync-agent binary runs in Alpine, opens `/dev/hvc0`, reads frames without crashing. Go binary is NOT yet deleted — parallel run possible.
+
+---
+
+### Phase 4: Transfer (~6h) — **Most Complex Component**
+
+**File:** `src/transfer.rs`
+
+- [ ] `PutMeta` struct with serde derives matching `{xfer, path, size, mode, mtimeMs, hash}`
+- [ ] `Receiver` struct: `root`, `fw: Arc<FrameWriter>`, `sync: Arc<SyncState>`, `xfers: Mutex<HashMap<u32, Incoming>>`, `trees: Mutex<HashMap<u32, IncomingTree>>`, `verify: bool`
+- [ ] `Incoming` struct `{meta, tmp: File, tmpPath, received, chunks}`
+- [ ] `HandlePut(frame)` — parse JSON, safeJoin, conflict check via `ResolveIncoming`, create temp in `.sync-tmp/put-*`, register xfer, zero-size → immediate finish, else ack `{xfer}`
+- [ ] `HandleChunk(frame)` — parse 12B header (4B xfer LE + 8B offset LE), route to tree or regular, `WriteAt(data, offset)`, progress ack every 16 chunks
+- [ ] `finish(seq, in)` — close temp, optional SHA256 verify, chmod+chtimes, atomic `std::fs::rename()`, `MarkSynced`, remove from xfers, ack `{xfer, done}`
+- [ ] `abort(seq, in, msg)` — close temp, remove file, remove from xfers, nak
+- [ ] `HandleTreePut(frame)` — parse `{xfer, size, count}`, register empty `IncomingTree`, zero-size → immediate finish
+- [ ] `handleTreeChunk(seq, tr, offset, data)` — verify sequential offset, call `unpack()`, completion → `finishTree()`, progress ack every 16
+- [ ] **`unpack(tr, data)`** — state machine: append to carry-over buf → read header len (4B LE) → parse JSON header → check safeJoin/conflict → open file → stream bytes until `curLeft == 0` → close + mtime + `MarkSynced` → reset. Carry-over buffer persists across chunk boundaries.
+- [ ] `finishTree(seq, tr)` — verify no trailing bytes, remove from trees, ack `{xfer, done, skipped}`
+- [ ] `abortTree(seq, tr, msg)` — close current file, remove from trees, nak
+- [ ] `HandleDel(frame)` — parse `{path}`, safeJoin, `RemoveAll`, `MarkDeleted`, ack
+- [ ] `Sender` struct: `nextXfer` starting at base (0 or 0x40000000), window channel (cap 32), `acks: Mutex<HashMap<u32, Sender<Frame>>>`
+- [ ] `HandleAck(frame)` — route ACK/NAK by xfer to waiting channel, release 16 window slots for progress acks
+- [ ] `PushFile(rel)` — stat+hash file, send PUT, wait ready-ack (30s timeout), stream chunks with windowing, wait final ack (60s timeout)
+- [ ] `PushDelete(rel)` — send `TypeFileDel` JSON, `MarkDeleted`
+
+**Gate:** Console I/O transfers work bidirectionally. TREE_PUT streaming with mid-chunk splits handles correctly. Disable data-plane for this phase. Run `npm run test:sync` with console-only.
+
+---
+
+### Phase 5: Inotify Watcher (~3h)
+
+**File:** `src/watcher.rs`
+**New dep:** `inotify = "0.10"` (or fallback to raw `libc::inotify_*`)
+
+- [ ] `Watcher` struct with inotify fd, `wds: Mutex<HashMap<i32, String>>`, `pending: Mutex<HashMap<String, String>>`, debounce timer, flush callback channel
+- [ ] Raw inotify: `libc::inotify_init(0)`, `libc::inotify_add_watch(fd, path, mask)`, `libc::read(fd, buf, len)`
+- [ ] Watch mask: `IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE_SELF`
+- [ ] `watchTree(dir)` — recursive `read_dir`, add watch per directory, skip ignored paths
+- [ ] Event loop thread — read 64KB buffer, parse variable-length `inotify_event` structs (wd i32 LE, mask u32 LE, cookie u32 LE, null-terminated name)
+- [ ] Event routing: Dir CREATE/MOVED_TO → re-watchTree + enqueue files recursively; Dir DELETE/MOVED_FROM → del; File CLOSE_WRITE/MOVED_TO → put; File DELETE/MOVED_FROM → del
+- [ ] Debounce: 300ms `thread::sleep` after last event, then flush all pending ops through channel
+
+**Gate:** Guest-side file changes produce correct events forwarded over console within ~300ms debounce. Compare against Go behavior.
+
+---
+
+### Phase 6: Data Plane + Full Orchestration (~3h)
+
+**Files:** `src/dataplane.rs`, complete `src/main.rs`
+
+- [ ] `DataPlane` struct with `Mutex<{cfg, gen, conn, sender}>`, generation-based invalidation
+- [ ] `Update(cfg)` — if cfg changed → `gen++`, close old conn, spawn new dial loop thread
+- [ ] Dial loop — retry connect every 2s, check `stale(gen)` before each attempt and after successful connect
+- [ ] TCP session — send HELLO with token+root, create `ReceiverNoVerify` + `Sender(base=0x40000000)`, register sender in data-plane
+- [ ] Liveness pings thread — every 15s send ping, if no traffic for 45s → close conn (handles snapshot restore dead-session detection)
+- [ ] Frame read loop on TCP — route transfers/pings/manifests to handlers
+- [ ] `Shutdown()` — `gen++`, close conn, invalidate all loops
+- [ ] Full `main.rs` session loop: open device, setRaw, create all components, send guest HELLO `{version: 1, role: "guest", root}`
+- [ ] Spawn push queue worker thread (channel-based) — iterate ops, safeJoin, check `IsEcho`, call `pushVia` (data-plane first, console fallback on failure)
+- [ ] Start inotify watcher with push queue channel as flush callback
+- [ ] Main console read loop dispatching all frame types to handlers
+
+**Gate:** Full VM integration. Run `npm run test:sync` — all tests pass with TCP data plane active. Compare sync throughput qualitatively against Go baseline.
+
+---
+
+### Phase 7: Final Verification (~1h)
+
+- [ ] `npm run test:unit` — protocol compatibility (CRC, frame format)
+- [ ] `npm run test:sync` — end-to-end file sync in VM
+- [ ] `npm run test:boot` — boot/hydrate/snapshot cycle
+- [ ] `npm run test:snapshot` — snapshot restore + data-plane reconnect
+- [ ] Verify binary size ~200KB static (`ls -lh target/.../sync-agent`)
+- [ ] Verify init script compatibility — runs with `-root /workspace -dev /dev/hvc0`
+- [ ] Decide: remove Go source or keep as reference alongside Rust
+- [ ] Update `AGENTS.md` — note Rust instead of Go for sync-agent
+- [ ] Mark this document as completed
+
+**Gate:** All tests pass, guest boots and syncs correctly.
+
+---
+
+### Rollback Strategy
+
+At any phase, the Go binary remains in `sandbox/guest/sync-agent/`. To rollback:
+1. Revert `scripts/build-guest.sh` to use Go build command
+2. Run `npm run images` to rebuild guest with Go binary
+3. Tests will pass as they did before (they test protocol behavior, not implementation language)
+
+### Dependency Timeline
+
+| Phase | Deps Added |
+|-------|-----------|
+| 1 | `crc32fast = "1"` |
+| 2 | `sha2 = "0.10"`, `serde_json = "1"`, optional `walkdir = "2"` |
+| 3 | `libc = "0.2"` |
+| 4–5 | (none / `inotify = "0.10"` or raw libc) |
+| 6–7 | (none) |
+
+**Total estimated: ~18–23h across 7 phases.**
 
 ## Relevant Files
 
