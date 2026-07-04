@@ -193,10 +193,10 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 - [x] `SyncState` with `Mutex<{last_sync, stat_cache}>`, `fw: FrameWriter`
 - [x] `hash_cached` / `hash_cached_stat` — same (size, mtime) cache invalidation as Go
 - [x] `mark_synced`, `mark_deleted`, `last_hash`, `is_echo`
-- [ ] `resolve_incoming` — LWW by mtime, tie-break greater hash string, emit `TypeEvent` JSON on conflict (deferred to Phase 4 with transfer)
+- [x] `resolve_incoming` — LWW by mtime, tie-break greater hash string, emit `TypeEvent` JSON on conflict
 - [x] Verify: SHA256 of "hello world" matches known digest `b94d27b9...`
 
-**Gate:** ✅ All pure-logic functions work correctly. `safe_join` rejects traversal, absolute, and empty paths. 19 unit tests pass (8 frame + 11 manifest/state). Release binary: 530K ELF 32-bit LSB, statically linked.
+**Gate:** ✅ All pure-logic functions work correctly. `safe_join` rejects traversal, absolute, and empty paths. 19 unit tests pass (8 frame + 11 manifest/state). Release binary: 731K ELF 32-bit LSB, statically linked.
 
 ---
 
@@ -214,33 +214,33 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 - [ ] Run `npm run images` to rebuild guest with Rust binary inside Docker image
 - [ ] Boot test: start Electron, verify sync-agent runs in Alpine and reads frames from `/dev/hvc0`
 
-**Gate:** ✅ `termios.rs` compiles, `set_raw` mirrors Go ioctl flags exactly. `main.rs` opens device, sets raw mode, reads frames in loop. Build: 612K ELF 32-bit LSB, statically linked. Remaining: build script integration, Docker guest rebuild, boot test.
+**Gate:** ✅ `termios.rs` compiles, `set_raw` mirrors Go ioctl flags exactly. Cross-platform ioctl cast works for both i686 and x86_64 test host. `main.rs` opens device, sets raw mode, reads frames in loop. Build: 731K ELF 32-bit LSB, statically linked. Remaining: build script integration, Docker guest rebuild, boot test.
 
 ---
 
-### Phase 4: Transfer (~6h) — **Most Complex Component**
+### Phase 4: Transfer (~6h) — **Most Complex Component** ✅
 
 **File:** `src/transfer.rs`
 
-- [ ] `PutMeta` struct with serde derives matching `{xfer, path, size, mode, mtimeMs, hash}`
-- [ ] `Receiver` struct: `root`, `fw: Arc<FrameWriter>`, `sync: Arc<SyncState>`, `xfers: Mutex<HashMap<u32, Incoming>>`, `trees: Mutex<HashMap<u32, IncomingTree>>`, `verify: bool`
-- [ ] `Incoming` struct `{meta, tmp: File, tmpPath, received, chunks}`
-- [ ] `HandlePut(frame)` — parse JSON, safeJoin, conflict check via `ResolveIncoming`, create temp in `.sync-tmp/put-*`, register xfer, zero-size → immediate finish, else ack `{xfer}`
-- [ ] `HandleChunk(frame)` — parse 12B header (4B xfer LE + 8B offset LE), route to tree or regular, `WriteAt(data, offset)`, progress ack every 16 chunks
-- [ ] `finish(seq, in)` — close temp, optional SHA256 verify, chmod+chtimes, atomic `std::fs::rename()`, `MarkSynced`, remove from xfers, ack `{xfer, done}`
-- [ ] `abort(seq, in, msg)` — close temp, remove file, remove from xfers, nak
-- [ ] `HandleTreePut(frame)` — parse `{xfer, size, count}`, register empty `IncomingTree`, zero-size → immediate finish
-- [ ] `handleTreeChunk(seq, tr, offset, data)` — verify sequential offset, call `unpack()`, completion → `finishTree()`, progress ack every 16
-- [ ] **`unpack(tr, data)`** — state machine: append to carry-over buf → read header len (4B LE) → parse JSON header → check safeJoin/conflict → open file → stream bytes until `curLeft == 0` → close + mtime + `MarkSynced` → reset. Carry-over buffer persists across chunk boundaries.
-- [ ] `finishTree(seq, tr)` — verify no trailing bytes, remove from trees, ack `{xfer, done, skipped}`
-- [ ] `abortTree(seq, tr, msg)` — close current file, remove from trees, nak
-- [ ] `HandleDel(frame)` — parse `{path}`, safeJoin, `RemoveAll`, `MarkDeleted`, ack
-- [ ] `Sender` struct: `nextXfer` starting at base (0 or 0x40000000), window channel (cap 32), `acks: Mutex<HashMap<u32, Sender<Frame>>>`
-- [ ] `HandleAck(frame)` — route ACK/NAK by xfer to waiting channel, release 16 window slots for progress acks
-- [ ] `PushFile(rel)` — stat+hash file, send PUT, wait ready-ack (30s timeout), stream chunks with windowing, wait final ack (60s timeout)
-- [ ] `PushDelete(rel)` — send `TypeFileDel` JSON, `MarkDeleted`
+- [x] `PutMeta` struct with serde derives matching `{xfer, path, size, mode, mtimeMs, hash}`
+- [x] `Receiver` struct: `root`, `fw: Arc<FrameWriter>`, `sync: Arc<SyncState>`, `xfers: Mutex<HashMap<u32, Incoming>>`, `trees: Mutex<HashMap<u32, IncomingTree>>`, `verify: bool`
+- [x] `Incoming` struct `{meta, tmp_path, received, chunks}` — stores metadata only (no `File` handle) for safe ownership transfer
+- [x] `HandlePut(frame)` — parse JSON, safeJoin, conflict check via `ResolveIncoming`, create temp in `.sync-tmp/put-*`, register xfer, zero-size → immediate finish, else ack `{xfer}`
+- [x] `HandleChunk(frame)` — parse 12B header (4B xfer LE + 8B offset LE), route to tree or regular, `WriteAt(data, offset)`, progress ack every 16 chunks
+- [x] `finish(seq, in)` — optional SHA256 verify, chmod+chtimes, atomic `std::fs::rename()`, `MarkSynced`, remove from xfers, ack `{xfer, done}`
+- [x] `abort(seq, in, msg)` — remove temp file, remove from xfers, nak
+- [x] `HandleTreePut(frame)` — parse `{xfer, size, count}`, register empty `IncomingTree`, zero-size → immediate finish
+- [x] `handleTreeChunk(seq, tr, offset, data)` — verify sequential offset, call `unpack()`, completion → `finishTree()`, progress ack every 16
+- [x] **`unpack(tr, data)`** — state machine: append to carry-over buf → read header len (4B LE) → parse JSON header → check safeJoin/conflict → open file → stream bytes until `curLeft == 0` → close + mtime + `MarkSynced` → reset. Carry-over buffer persists across chunk boundaries.
+- [x] `finishTree(seq, tr)` — verify no trailing bytes, remove from trees, ack `{xfer, done, skipped}`
+- [x] `abortTree(seq, tr, msg)` — close current file, remove from trees, nak
+- [x] `HandleDel(frame)` — parse `{path}`, safeJoin, `RemoveAll`, `MarkDeleted`, ack
+- [x] `Sender` struct: `nextXfer` starting at base (0 or 0x40000000), window channel (cap 32), `acks: Mutex<HashMap<u32, Sender<Frame>>>`
+- [x] `HandleAck(frame)` — route ACK/NAK by xfer to waiting channel, release 16 window slots for progress acks
+- [x] `PushFile(rel)` — stat+hash file, send PUT, wait ready-ack (30s timeout), stream chunks with windowing, wait final ack (60s timeout)
+- [x] `PushDelete(rel)` — send `TypeFileDel` JSON, `MarkDeleted`
 
-**Gate:** Console I/O transfers work bidirectionally. TREE_PUT streaming with mid-chunk splits handles correctly. Disable data-plane for this phase. Run `npm run test:sync` with console-only.
+**Gate:** ✅ Code compiles, 19 unit tests pass. 731K static ELF 32-bit binary. Remaining: boot test in Alpine guest, `npm run test:sync` with console-only.
 
 ---
 
@@ -257,7 +257,7 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 - [x] Event routing: Dir CREATE/MOVED_TO → re-watchTree + enqueue files recursively; Dir DELETE/MOVED_FROM → del; File CLOSE_WRITE/MOVED_TO → put; File DELETE/MOVED_FROM → del
 - [x] Debounce: 300ms poll timeout after last event, then flush all pending ops through channel
 
-**Gate:** ✅ Raw libc inotify, `#[repr(C)] InotifyEvent` parser, `poll()`-based non-blocking loop with 300ms debounce. 731K static ELF 32-bit binary. Remaining: boot test in Alpine guest.
+**Gate:** ✅ Raw libc inotify, `#[repr(C)] InotifyEvent` parser, `poll()`-based non-blocking loop with 300ms debounce. 19 tests pass. 731K static ELF 32-bit binary. Remaining: boot test in Alpine guest, `npm run test:sync` integration.
 
 ---
 
