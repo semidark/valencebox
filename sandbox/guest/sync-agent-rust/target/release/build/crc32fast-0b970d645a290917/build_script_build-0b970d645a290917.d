@@ -1,0 +1,5 @@
+/home/semidark/.local/share/opencode/worktree/d8dd0c8976560e59cb0ff7d169767b3944f1cf52/brave-lagoon/sandbox/guest/sync-agent-rust/target/release/build/crc32fast-0b970d645a290917/build_script_build-0b970d645a290917.d: /home/semidark/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.0/build.rs
+
+/home/semidark/.local/share/opencode/worktree/d8dd0c8976560e59cb0ff7d169767b3944f1cf52/brave-lagoon/sandbox/guest/sync-agent-rust/target/release/build/crc32fast-0b970d645a290917/build_script_build-0b970d645a290917: /home/semidark/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.0/build.rs
+
+/home/semidark/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.0/build.rs:

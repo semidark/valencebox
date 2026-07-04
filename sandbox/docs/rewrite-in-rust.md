@@ -161,20 +161,20 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 
 ---
 
-### Phase 1: Frame Protocol (~2h)
+### Phase 1: Frame Protocol ✅ (~2h)
 
 **Files:** `Cargo.toml`, `src/frame.rs`, stub `src/main.rs`
 
-- [ ] Create `sandbox/guest/sync-agent-rust/` with `Cargo.toml` (package `sync-agent`, edition 2021, dep: `crc32fast = "1"`)
-- [ ] Implement `Frame` struct `{typ: u8, seq: u32, payload: Vec<u8>}` + frame type constants (1–10)
-- [ ] Implement `ReadFrame` — byte-by-byte magic hunt state machine matching Go `frame.go:40-53` exactly (`matched++`, `b == magic[0] → 1`, `else → 0`)
-- [ ] Wire format: `[MAGIC 4B][type 1B][seq 4B LE][plen 4B LE][payload N B][crc32 4B LE]`
-- [ ] CRC covers header(9) + payload(N), NOT magic, NOT trailer — IEEE via `crc32fast`
-- [ ] Implement `FrameWriter` with `Mutex`-protected writer + auto-incrementing seq counter
-- [ ] Cross-check CRC against `protocol.ts` IEEE table (0xEDB88320 reversed)
-- [ ] Stub `src/main.rs`: `fn main() { println!("sync-agent-rust placeholder"); }`
+- [x] Create `sandbox/guest/sync-agent-rust/` with `Cargo.toml` (package `sync-agent`, edition 2021, dep: `crc32fast = "1"`)
+- [x] Implement `Frame` struct `{typ: u8, seq: u32, payload: Vec<u8>}` + frame type constants (1–10)
+- [x] Implement `ReadFrame` — byte-by-byte magic hunt state machine matching Go `frame.go:40-53` exactly (`matched++`, `b == magic[0] → 1`, `else → 0`)
+- [x] Wire format: `[MAGIC 4B][type 1B][seq 4B LE][plen 4B LE][payload N B][crc32 4B LE]`
+- [x] CRC covers header(9) + payload(N), NOT magic, NOT trailer — IEEE via `crc32fast`
+- [x] Implement `FrameWriter` with `Mutex`-protected writer + auto-incrementing seq counter
+- [x] Cross-check CRC against `protocol.ts` IEEE table (0xEDB88320 reversed) — manual bit-by-bit IEEE verification passes
+- [x] Stub `src/main.rs`: `fn main() { println!("sync-agent-rust placeholder"); }`
 
-**Gate:** Binary compiles for i686-musl. Frame read/write round-trip produces identical bytes for a known payload.
+**Gate:** ✅ Binary compiles for i686-musl (530K, ELF 32-bit LSB, statically linked). 8 unit tests pass: roundtrip empty/payload/large, seq increment, CRC IEEE match, resync garbage/partial-magic, payload-too-large.
 
 ---
 
