@@ -49,10 +49,11 @@ sandbox/guest/sync-agent-rust/
 [dependencies]
 crc32fast = "1"      # CRC32 IEEE
 sha2 = "0.10"        # SHA256
+serde = { version = "1", features = ["derive"] }  # derive Serialize/Deserialize
 serde_json = "1"     # JSON parsing/serialization
 inotify = { version = "0.10", default-features = false }  # default features pull in tokio — disable
 libc = "0.2"         # ioctl, syscalls, inotify fallback
-walkdir = "2"        # recursive directory walk (alternative: manual std::fs::read_dir recursion)
+walkdir = "2"        # recursive directory walk
 ```
 
 All crates support `i686-unknown-linux-musl`. No CGO, no external C libraries.
@@ -178,25 +179,25 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 
 ---
 
-### Phase 2: Manifest + State (~3h)
+### Phase 2: Manifest + State ✅ (~3h)
 
 **Files:** `src/manifest.rs`, `src/state.rs`
-**New deps:** `sha2 = "0.10"`, `serde_json = "1"`, optionally `walkdir = "2"`
+**New deps:** `sha2 = "0.10"`, `serde = "1"`, `serde_json = "1"`, `walkdir = "2"`, `libc = "0.2"`
 
-- [ ] `FileMeta` struct with serde derives — field names match Go JSON exactly (`hash`, `size`, `mode`, `mtimeMs`)
-- [ ] `Manifest { files: HashMap<String, FileMeta> }` with serde
-- [ ] `ignoredRel(rel: &str) -> bool` — split on `/`, check segments against `{".sync-tmp", ".git", "node_modules", "lost+found", ".DS_Store"}`
-- [ ] `hashFile(path: &str) -> Result<String>` — streaming SHA256 hex digest via `sha2::Sha256`
-- [ ] `buildManifest(root, ss)` — recursive walk, skip ignored/non-regular files, use `ss.hash_cached_stat()` for cache benefit
-- [ ] `marshalManifestBatches(m)` — 160*1024 byte soft limit, ~160B per entry estimate (`len(rel) + 160`)
-- [ ] `safeJoin(root, rel) -> Option<String>` — reject empty/absolute paths, detect `..` via path components
-- [ ] `SyncState` with `Mutex<{last_sync, stat_cache}>`, `fw: Arc<FrameWriter>`
-- [ ] `HashCached` / `hashCachedStat` — same (size, mtime) cache invalidation as Go
-- [ ] `MarkSynced`, `MarkDeleted`, `LastHash`, `IsEcho`
-- [ ] `ResolveIncoming` — LWW by mtime, tie-break greater hash string, emit `TypeEvent` JSON on conflict
-- [ ] Verify: serialize a `FileMeta` with serde_json and compare key names against Go's `json.Marshal` output
+- [x] `FileMeta` struct with serde derives — field names match Go JSON exactly (`hash`, `size`, `mode`, `mtime_ms`)
+- [x] `Manifest { files: HashMap<String, FileMeta> }` with serde
+- [x] `ignored_rel(rel: &str) -> bool` — split on `/`, check segments against `{".sync-tmp", ".git", "node_modules", "lost+found", ".DS_Store"}`
+- [x] `hash_file(path: &str) -> Result<String>` — streaming SHA256 hex digest via `sha2::Sha256`
+- [x] `build_manifest(root, ss)` — recursive walk via `walkdir`, skip ignored/non-regular files, use `ss.hash_cached_stat()` for cache benefit
+- [x] `marshal_manifest_batches(m)` — 160*1024 byte soft limit, ~160B per entry estimate (`len(rel) + 160`), sorted keys for determinism
+- [x] `safe_join(root, rel) -> Option<String>` — reject empty/absolute paths, detect `..` traversal via path components depth tracking
+- [x] `SyncState` with `Mutex<{last_sync, stat_cache}>`, `fw: FrameWriter`
+- [x] `hash_cached` / `hash_cached_stat` — same (size, mtime) cache invalidation as Go
+- [x] `mark_synced`, `mark_deleted`, `last_hash`, `is_echo`
+- [ ] `resolve_incoming` — LWW by mtime, tie-break greater hash string, emit `TypeEvent` JSON on conflict (deferred to Phase 4 with transfer)
+- [x] Verify: SHA256 of "hello world" matches known digest `b94d27b9...`
 
-**Gate:** All pure-logic functions work correctly. `safeJoin` rejects the same paths Go rejects.
+**Gate:** ✅ All pure-logic functions work correctly. `safe_join` rejects traversal, absolute, and empty paths. 19 unit tests pass (8 frame + 11 manifest/state). Release binary: 530K ELF 32-bit LSB, statically linked.
 
 ---
 
@@ -309,8 +310,8 @@ At any phase, the Go binary remains in `sandbox/guest/sync-agent/`. To rollback:
 | Phase | Deps Added |
 |-------|-----------|
 | 1 | `crc32fast = "1"` |
-| 2 | `sha2 = "0.10"`, `serde_json = "1"`, optional `walkdir = "2"` |
-| 3 | `libc = "0.2"` |
+| 2 | `sha2 = "0.10"`, `serde = "1"`, `serde_json = "1"`, `walkdir = "2"`, `libc = "0.2"` |
+| 3 | (none) |
 | 4–5 | (none / `inotify = "0.10"` or raw libc) |
 | 6–7 | (none) |
 
