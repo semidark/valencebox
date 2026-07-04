@@ -151,7 +151,7 @@ Frame types:
 
 ## Phased Implementation Plan
 
-Each phase has a verification gate. Do not proceed to the next phase until the current gate passes. Go source remains as rollback at any point: revert `scripts/build-guest.sh` → `npm run images`.
+Each phase has a verification gate. Do not proceed to the next phase until the current gate passes. Go source remains as rollback at any point: revert `scripts/build-guest.sh` → `npm run images`. After each phase commit the current status to the git repo.
 
 ### Pre-flight ✅
 
