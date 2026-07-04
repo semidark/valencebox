@@ -6,8 +6,6 @@ use std::sync::Mutex;
 
 use sha2::Digest;
 
-use crate::frame::FrameWriter;
-
 #[derive(Clone)]
 struct StatHash {
     hash: String,
@@ -17,7 +15,6 @@ struct StatHash {
 
 pub struct SyncState {
     inner: Mutex<SyncStateInner>,
-    fw: FrameWriter,
 }
 
 struct SyncStateInner {
@@ -26,13 +23,12 @@ struct SyncStateInner {
 }
 
 impl SyncState {
-    pub fn new(fw: FrameWriter) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Mutex::new(SyncStateInner {
                 last_sync: HashMap::new(),
                 stat_cache: HashMap::new(),
             }),
-            fw,
         }
     }
 

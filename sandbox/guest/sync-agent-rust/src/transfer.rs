@@ -42,7 +42,7 @@ struct IncomingTree {
 
 struct ReceiverInner {
     root: String,
-    fw: Arc<Mutex<FrameWriter>>,
+    fw: Arc<FrameWriter>,
     xfers: HashMap<u32, Incoming>,
     trees: HashMap<u32, IncomingTree>,
     sync: Arc<SyncState>,
@@ -53,7 +53,7 @@ pub struct Receiver {
     inner: Mutex<ReceiverInner>,
 }
 
-pub fn new_receiver(root: &str, fw: Arc<Mutex<FrameWriter>>, sync: Arc<SyncState>, verify: bool) -> Receiver {
+pub fn new_receiver(root: &str, fw: Arc<FrameWriter>, sync: Arc<SyncState>, verify: bool) -> Receiver {
     Receiver {
         inner: Mutex::new(ReceiverInner {
             root: root.to_string(),
@@ -78,8 +78,10 @@ impl Receiver {
             }
         }
         let payload = serde_json::to_vec(&serde_json::Value::Object(m)).unwrap();
-        let inner = self.inner.lock().unwrap();
-        let fw = inner.fw.lock().unwrap();
+        let fw = {
+            let inner = self.inner.lock().unwrap();
+            inner.fw.clone()
+        };
         let _ = fw.send(TYPE_ACK, &payload);
     }
 
@@ -95,8 +97,10 @@ impl Receiver {
             }
         }
         let payload = serde_json::to_vec(&serde_json::Value::Object(m)).unwrap();
-        let inner = self.inner.lock().unwrap();
-        let fw = inner.fw.lock().unwrap();
+        let fw = {
+            let inner = self.inner.lock().unwrap();
+            inner.fw.clone()
+        };
         let _ = fw.send(TYPE_NAK, &payload);
     }
 
@@ -560,8 +564,7 @@ impl Receiver {
         if let Ok(m) = build_manifest(&root, &sync) {
             let fw = self.inner.lock().unwrap().fw.clone();
             for b in marshal_manifest_batches(&m) {
-                let fw_lock = fw.lock().unwrap();
-                let _ = fw_lock.send(TYPE_MANIFEST, &b);
+                let _ = fw.send(TYPE_MANIFEST, &b);
             }
         }
     }
@@ -601,12 +604,12 @@ fn set_mtime(path: &str, mtime_ms: i64) {
 
 pub struct Sender {
     root: String,
-    fw: Arc<Mutex<FrameWriter>>,
+    fw: Arc<FrameWriter>,
     next_xfer: Arc<Mutex<u32>>,
     sync: Arc<SyncState>,
 }
 
-pub fn new_sender(root: &str, fw: Arc<Mutex<FrameWriter>>, sync: Arc<SyncState>, base: u32) -> Sender {
+pub fn new_sender(root: &str, fw: Arc<FrameWriter>, sync: Arc<SyncState>, base: u32) -> Sender {
     Sender {
         root: root.to_string(),
         fw,
@@ -649,10 +652,7 @@ impl Sender {
             hash: hash.clone(),
         };
         let payload = serde_json::to_vec(&meta).unwrap();
-        {
-            let fw = self.fw.lock().unwrap();
-            fw.send(TYPE_FILE_PUT, &payload)?;
-        }
+        self.fw.send(TYPE_FILE_PUT, &payload)?;
 
         if info.len() == 0 {
             self.sync.mark_synced(rel, &hash);
@@ -672,10 +672,7 @@ impl Sender {
             payload.extend_from_slice(&(offset as u64).to_le_bytes());
             payload.extend_from_slice(&buf[..n]);
 
-            {
-           let fw = self.fw.lock().unwrap();
-                fw.send(TYPE_FILE_CHUNK, &payload)?;
-            }
+         self.fw.send(TYPE_FILE_CHUNK, &payload)?;
             offset += n as i64;
             if offset >= info.len() as i64 {
                 break;
@@ -688,10 +685,7 @@ impl Sender {
 
     pub fn push_delete(&self, rel: &str) -> io::Result<()> {
         let payload = serde_json::to_vec(&serde_json::json!({"path": rel})).unwrap();
-        {
-            let fw = self.fw.lock().unwrap();
-            fw.send(TYPE_FILE_DEL, &payload)?;
-        }
+        self.fw.send(TYPE_FILE_DEL, &payload)?;
         self.sync.mark_deleted(rel);
         Ok(())
     }

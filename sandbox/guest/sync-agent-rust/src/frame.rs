@@ -75,12 +75,12 @@ pub struct FrameWriter {
 }
 
 struct FrameWriterInner {
-    w: Box<dyn Write>,
+    w: Box<dyn Write + Send>,
     seq: u32,
 }
 
 impl FrameWriter {
-    pub fn new(w: Box<dyn Write>) -> Self {
+    pub fn new(w: Box<dyn Write + Send>) -> Self {
         Self {
             inner: Mutex::new(FrameWriterInner { w, seq: 0 }),
         }

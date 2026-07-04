@@ -22,9 +22,9 @@ for f in libv86.js v86.wasm seabios.bin vgabios.bin; do
 	cp "$ENV86_ASSETS/$f" "assets/v86/$f"
 done
 
-echo "==> building sync-agent (linux/386, static)"
-(cd guest/sync-agent && GOOS=linux GOARCH=386 CGO_ENABLED=0 \
-	go build -trimpath -ldflags='-s -w' -o ../sync-agent.bin .)
+echo "==> building sync-agent (Rust, i686-unknown-linux-musl)"
+(cd guest/sync-agent-rust && cargo build --target i686-unknown-linux-musl --release)
+cp guest/sync-agent-rust/target/i686-unknown-linux-musl/release/sync-agent guest/sync-agent.bin
 
 echo "==> building guest docker image"
 docker build --platform=linux/386 -t sandbox-guest -f guest/Dockerfile guest
