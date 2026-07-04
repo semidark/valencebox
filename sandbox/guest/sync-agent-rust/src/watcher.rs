@@ -130,7 +130,7 @@ fn parse_events(buf: &[u8]) -> Vec<(i32, u32, String)> {
             String::new()
         };
         events.push((event.wd, event.mask, name));
-        off += (std::mem::size_of::<InotifyEvent>() + event.len as usize);
+        off += std::mem::size_of::<InotifyEvent>() + event.len as usize;
     }
     events
 }
@@ -220,7 +220,7 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
                 if let Ok(mut s) = state.lock() {
                     let _ = watch_tree(&abs, fd, &mut s);
                 }
-                if let Ok(entries) = std::fs::read_dir(&abs) {
+                if let Ok(_entries) = std::fs::read_dir(&abs) {
                     let root_str = state.lock().unwrap().root.clone();
                     let mut walk_stack = vec![abs.clone()];
                     while let Some(d) = walk_stack.pop() {

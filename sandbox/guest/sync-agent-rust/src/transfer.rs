@@ -171,7 +171,7 @@ impl Receiver {
             return;
         }
 
-        let in_meta = {
+        let _in_meta = {
             let inner = self.inner.lock().unwrap();
             match inner.xfers.get(&xfer) {
                 Some(i) => i.meta.clone(),
@@ -560,7 +560,7 @@ impl Receiver {
         if let Ok(m) = build_manifest(&root, &sync) {
             let fw = self.inner.lock().unwrap().fw.clone();
             for b in marshal_manifest_batches(&m) {
-                let mut fw_lock = fw.lock().unwrap();
+                let fw_lock = fw.lock().unwrap();
                 let _ = fw_lock.send(TYPE_MANIFEST, &b);
             }
         }
@@ -650,7 +650,7 @@ impl Sender {
         };
         let payload = serde_json::to_vec(&meta).unwrap();
         {
-            let mut fw = self.fw.lock().unwrap();
+            let fw = self.fw.lock().unwrap();
             fw.send(TYPE_FILE_PUT, &payload)?;
         }
 
@@ -673,7 +673,7 @@ impl Sender {
             payload.extend_from_slice(&buf[..n]);
 
             {
-                let mut fw = self.fw.lock().unwrap();
+           let fw = self.fw.lock().unwrap();
                 fw.send(TYPE_FILE_CHUNK, &payload)?;
             }
             offset += n as i64;
@@ -689,7 +689,7 @@ impl Sender {
     pub fn push_delete(&self, rel: &str) -> io::Result<()> {
         let payload = serde_json::to_vec(&serde_json::json!({"path": rel})).unwrap();
         {
-            let mut fw = self.fw.lock().unwrap();
+            let fw = self.fw.lock().unwrap();
             fw.send(TYPE_FILE_DEL, &payload)?;
         }
         self.sync.mark_deleted(rel);
