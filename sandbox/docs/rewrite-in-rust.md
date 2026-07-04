@@ -50,7 +50,7 @@ sandbox/guest/sync-agent-rust/
 crc32fast = "1"      # CRC32 IEEE
 sha2 = "0.10"        # SHA256
 serde_json = "1"     # JSON parsing/serialization
-inotify = "0.10"     # Linux inotify wrapper (fallback: raw libc::inotify_*)
+inotify = { version = "0.10", default-features = false }  # default features pull in tokio — disable
 libc = "0.2"         # ioctl, syscalls, inotify fallback
 walkdir = "2"        # recursive directory walk (alternative: manual std::fs::read_dir recursion)
 ```
@@ -71,7 +71,7 @@ cargo build --target i686-unknown-linux-musl --release
 cp target/i686-unknown-linux-musl/release/sync-agent guest/sync-agent.bin
 ```
 
-Requires `musl-gcc` for the i686 musl target, or `cargo-zigbuild`/`cross` as alternatives.
+No `musl-gcc` needed — Rust links musl natively for this target.
 
 ## Complexity by Component
 
@@ -153,10 +153,11 @@ Frame types:
 
 Each phase has a verification gate. Do not proceed to the next phase until the current gate passes. Go source remains as rollback at any point: revert `scripts/build-guest.sh` → `npm run images`.
 
-### Pre-flight
+### Pre-flight ✅
 
-- [ ] Confirm `musl-gcc` works for i686-musl linker (`rustc --target i686-unknown-linux-musl` already installed)
-- [ ] Skeleton `cargo check --target i686-unknown-linux-musl` to verify all crates resolve
+- [x] `musl-gcc` — **NOT needed.** The Rust toolchain links musl natively for `i686-unknown-linux-musl`. No external C compiler required.
+- [x] Skeleton `cargo check --target i686-unknown-linux-musl` — **all crates resolve.** `inotify` requires `default-features = false` to avoid pulling in `tokio`.
+- [x] Release binary: 530K unstripped, ELF 32-bit LSB, Intel 80386, statically linked. (Stripped ~200KB expected.)
 
 ---
 
