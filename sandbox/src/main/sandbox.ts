@@ -110,6 +110,7 @@ export class Sandbox extends EventEmitter {
       this.setStatus({ phase: "hydrating", restored: true });
       await this.bridge.hello().catch(() => {});
       await this.reconcileAfterRestore();
+      this.nudgeTerminalAfterRestore();
     } else {
       // Cold boot: wait for login + guest HELLO, then hydrate.
       const helloP = this.bridge.waitGuestHello(120000);
@@ -174,6 +175,16 @@ export class Sandbox extends EventEmitter {
     });
     await this.waitDataPlane();
     await this.sync.hydrate();
+  }
+
+  private nudgeTerminalAfterRestore(): void {
+    // Best-effort: force the guest shell to print a fresh prompt so the
+    // user sees the terminal is alive after a warm restore.
+    try {
+      this.vm.serialWrite("echo '[sandbox] restored' && reset\n");
+    } catch {
+      // ignore — restore still completed successfully
+    }
   }
 
   /**
