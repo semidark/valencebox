@@ -57,7 +57,6 @@ pub fn new_watcher(
     };
 
     watch_tree(root, fd, &mut state)?;
-    crate::slog!("sync-agent: watch_tree done, {} watches", state.wds.len());
 
     let state = Arc::new(Mutex::new(state));
     let tx = Arc::new(tx);
@@ -67,11 +66,8 @@ pub fn new_watcher(
 
     Ok(WatchHandle {
         _thread: thread::spawn(move || {
-            crate::slog!("sync-agent: watcher loop started");
-            crate::logging::diag("W: watcher loop started");
             watcher_loop(fd, &state_clone, &tx_clone);
             unsafe { libc::close(fd); }
-            crate::logging::diag("W: watcher loop exited");
         }),
     })
 }
@@ -90,15 +86,10 @@ fn watch_tree(
         }
     }
     let mut stack = vec![dir.to_string()];
-    let mut walked = 0;
     while let Some(current) = stack.pop() {
-        walked += 1;
         let entries = match std::fs::read_dir(&current) {
             Ok(e) => e,
-            Err(e) => {
-                crate::slog!("sync-agent: read_dir {} failed: {}", current, e);
-                continue;
-            }
+            Err(_) => continue,
         };
         for entry in entries {
             let entry = match entry {
@@ -128,7 +119,6 @@ fn watch_tree(
             stack.push(path_str);
         }
     }
-    crate::slog!("sync-agent: walk processed {} dirs", walked);
     Ok(())
 }
 
@@ -161,15 +151,6 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
     let mut pending: HashMap<String, String> = HashMap::new();
     let mut debounce_start: Option<Instant> = None;
 
-    // Clear diag file at start
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open("/tmp/watch.log") {
-            let _ = writeln!(f, "W: watcher_loop started");
-            let _ = f.flush();
-        }
-    }
-
     loop {
         // Calculate poll timeout: block until debounce fires or data arrives
         let timeout_ms = match debounce_start {
@@ -196,7 +177,6 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() != io::ErrorKind::Interrupted {
-                crate::logging::diag(&format!("W: poll error: {}", err));
                 break;
             }
             continue;
@@ -206,11 +186,7 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
         let should_flush = debounce_start.is_some() && debounce_start.unwrap().elapsed() >= Duration::from_millis(DEBOUNCE_MS) && !pending.is_empty();
         if should_flush {
             let ops = std::mem::take(&mut pending);
-            let op_list: Vec<String> = ops.keys().cloned().collect();
-            crate::logging::diag(&format!("W: FLUSH {} ops: {:?}", ops.len(), op_list));
-            crate::slog!("sync-agent: FLUSH {} ops", ops.len());
             if tx.send(ops).is_err() {
-                crate::logging::diag("W: tx.send failed, breaking");
                 break;
             }
             debounce_start = None;
@@ -227,12 +203,11 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            crate::slog!("sync-agent: inotify read error: {}", err);
+            eprintln!("sync-agent: inotify read error: {}", err);
             break;
         }
 
         let events = parse_events(&buf[..n as usize]);
-        crate::logging::diag(&format!("W: read {} events, {} bytes", events.len(), n));
         let mut st = state.lock().unwrap();
         for (wd, mask, name) in events {
             if name.is_empty() || name == ".sync-tmp" {
@@ -240,10 +215,7 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
             }
             let dir = match st.wds.get(&wd) {
                 Some(d) => d.clone(),
-                None => {
-                    crate::slog!("sync-agent: unknown wd {}", wd);
-                    continue;
-                }
+                None => continue,
             };
             let abs = format!("{}/{}", dir, name);
             let rel = match Path::new(&abs).strip_prefix(&st.root) {
@@ -255,14 +227,8 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
             }
 
             let is_dir = mask & IN_ISDIR != 0;
-            crate::logging::diag(&format!("W: event wd={} mask=0x{:x} name={} rel={} is_dir={}", wd, mask, name, rel, is_dir));
-            if name == "from-guest.txt" {
-                crate::logging::diag(&format!("W: *** TARGET HIT *** wd={} mask=0x{:x} dir={} rel={}", wd, mask, dir, rel));
-            }
 
             if is_dir && (mask & (IN_CREATE | IN_MOVED_TO) != 0) {
-                crate::logging::diag(&format!("W: new dir {}, calling watch_tree", abs));
-                crate::slog!("sync-agent: new dir {}, calling watch_tree", abs);
                 drop(st);
                 if let Ok(mut s) = state.lock() {
                     let _ = watch_tree(&abs, fd, &mut s);
@@ -297,7 +263,6 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
                 pending.insert(rel, "del".to_string());
                 debounce_start = Some(Instant::now());
             } else if mask & (IN_CLOSE_WRITE | IN_MOVED_TO) != 0 {
-                crate::logging::diag(&format!("W: PUT {} (dir={}, wd={})", rel, dir, wd));
                 pending.insert(rel, "put".to_string());
                 debounce_start = Some(Instant::now());
             } else if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {

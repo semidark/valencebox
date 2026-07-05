@@ -10,7 +10,6 @@ pub const TYPE_FILE_CHUNK: u8 = 4;
 pub const TYPE_FILE_DEL: u8 = 5;
 pub const TYPE_ACK: u8 = 6;
 pub const TYPE_NAK: u8 = 7;
-pub const TYPE_EVENT: u8 = 8;
 pub const TYPE_PING: u8 = 9;
 pub const TYPE_TREE_PUT: u8 = 10;
 
@@ -125,25 +124,6 @@ impl FrameWriter {
         Ok(seq)
     }
 
-    /// Send a frame and wait for a matching ACK/NAK by seq number.
-    /// Returns (frame_type, payload) of the response.
-    pub fn request(&self, typ: u8, payload: &[u8], timeout_s: u64) -> io::Result<(u8, Vec<u8>)> {
-        let seq = self.send(typ, payload)?;
-        let (tx, rx) = mpsc::channel();
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.pending.insert(seq, tx);
-        }
-        match rx.recv_timeout(std::time::Duration::from_secs(timeout_s)) {
-            Ok(resp) => Ok(resp),
-            Err(_) => {
-                let mut inner = self.inner.lock().unwrap();
-                inner.pending.remove(&seq);
-                Err(io::Error::new(io::ErrorKind::TimedOut, "timeout waiting for response"))
-            }
-        }
-    }
-
     /// Deliver an incoming ACK/NAK to a waiting request(). Returns true if consumed.
     pub fn complete_request(&self, seq: u32, resp_typ: u8, resp_payload: &[u8]) -> bool {
         let tx = {
@@ -155,23 +135,6 @@ impl FrameWriter {
             true
         } else {
             false
-        }
-    }
-
-    /// Register a waiter for ACK/NAK frames routed by xfer id.
-    pub fn wait_xfer(&self, xfer: u32, timeout_s: u64) -> io::Result<(u8, Vec<u8>)> {
-        let (tx, rx) = mpsc::channel();
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.xfer_waiters.insert(xfer, tx);
-        }
-        match rx.recv_timeout(std::time::Duration::from_secs(timeout_s)) {
-            Ok(resp) => Ok(resp),
-            Err(_) => {
-                let mut inner = self.inner.lock().unwrap();
-                inner.xfer_waiters.remove(&xfer);
-                Err(io::Error::new(io::ErrorKind::TimedOut, "timeout waiting for xfer response"))
-            }
         }
     }
 
@@ -309,12 +272,12 @@ mod tests {
 
     #[test]
     fn resync_partial_magic_overlap() {
-        let (_, out) = write_frame(TYPE_EVENT, b"data");
+        let (_, out) = write_frame(TYPE_PING, b"data");
         let mut stream = Vec::new();
         stream.extend_from_slice(b"V86V");
         stream.extend_from_slice(&out);
         let frame = read_frame(&mut &stream[..]).unwrap();
-        assert_eq!(frame.typ, TYPE_EVENT);
+        assert_eq!(frame.typ, TYPE_PING);
         assert_eq!(frame.payload, b"data");
     }
 

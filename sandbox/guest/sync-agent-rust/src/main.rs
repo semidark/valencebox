@@ -12,8 +12,6 @@ use std::io::BufReader;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut root = "/workspace".to_string();
@@ -75,8 +73,6 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
     let push_via_clone = push_via.clone();
     let _push_handle = std::thread::spawn(move || {
         while let Ok(ops) = push_rx.recv() {
-            crate::slog!("sync-agent: push queue received {} ops", ops.len());
-            crate::logging::diag(&format!("P: push queue received {} ops", ops.len()));
             for (rel, op_str) in &ops {
                 if manifest::safe_join(&push_root, rel).is_none() {
                     continue;
@@ -84,12 +80,7 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
                 let abs = manifest::safe_join(&push_root, rel).unwrap();
                 match op_str.as_str() {
                     "put" => {
-                        let is_echo = push_sync.is_echo(rel, &abs);
-                        crate::slog!("sync-agent: push queue PUT {} is_echo={}", rel, is_echo);
-                        if rel == "from-guest.txt" {
-                            crate::logging::diag(&format!("P: *** TARGET from-guest.txt PUT is_echo={}", is_echo));
-                        }
-                        if is_echo {
+                        if push_sync.is_echo(rel, &abs) {
                             continue;
                         }
                         let rel_copy = rel.clone();
@@ -109,7 +100,7 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
         }
     });
 
-     // Wait for workspace to be mounted (up to 5s)
+    // Wait for workspace to be mounted (up to 5s)
     for _ in 0..50 {
         if std::path::Path::new(root).is_dir() {
             break;

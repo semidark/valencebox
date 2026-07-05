@@ -80,7 +80,6 @@ impl Receiver {
             }
         }
         let payload = serde_json::to_vec(&serde_json::Value::Object(m)).unwrap();
-        crate::slog!("GUEST TX: ACK seq={} payload={}", seq, String::from_utf8_lossy(&payload));
         let fw = {
             let inner = self.inner.lock().unwrap();
             inner.fw.clone()
@@ -115,7 +114,6 @@ impl Receiver {
                 return;
             }
         };
-        crate::slog!("handle_put: path={} size={} xfer={}", meta.path, meta.size, meta.xfer);
         let root = self.inner.lock().unwrap().root.clone();
         let abs = match safe_join(&root, &meta.path) {
             Some(a) => a,
@@ -149,10 +147,8 @@ impl Receiver {
             });
         }
         if meta.size == 0 {
-            crate::slog!("handle_put: zero-size file, finishing immediately");
             self.finish(f.seq, meta.xfer);
         } else {
-            crate::slog!("handle_put: sending ready-ack for non-zero file");
             self.ack(f.seq, Some(serde_json::json!({"xfer": meta.xfer})));
         }
     }
@@ -245,7 +241,6 @@ impl Receiver {
     }
 
     fn finish(&self, seq: u32, xfer: u32) {
-        crate::slog!("finish: seq={} xfer={}", seq, xfer);
         let (tmp_path, meta, verify, root, sync) = {
             let mut inner = self.inner.lock().unwrap();
             let in_entry = match inner.xfers.remove(&xfer) {
@@ -300,7 +295,6 @@ impl Receiver {
     }
 
     fn abort(&self, seq: u32, xfer: u32, msg: &str) {
-        crate::slog!("sync-agent: xfer {} aborted: {}", xfer, msg);
         let tmp_path = {
             let mut inner = self.inner.lock().unwrap();
             match inner.xfers.remove(&xfer) {
@@ -520,7 +514,6 @@ impl Receiver {
     }
 
     fn abort_tree(&self, seq: u32, tr: IncomingTree, msg: &str) {
-        crate::slog!("sync-agent: tree xfer {} aborted: {}", tr.xfer, msg);
         if let Some(ref _f) = tr.cur_file {
             let _ = std::fs::remove_file(&tr.cur_path);
         }
@@ -564,7 +557,7 @@ impl Receiver {
     pub fn handle_hello(&self, f: &Frame, data_plane: &Option<serde_json::Value>) {
         self.ack(f.seq, Some(serde_json::json!({"role": "guest"})));
         if let Some(dp) = data_plane {
-            crate::slog!("sync-agent: data plane config: {}", dp);
+            eprintln!("sync-agent: data plane config: {}", dp);
         }
         let root = self.inner.lock().unwrap().root.clone();
         let sync = self.inner.lock().unwrap().sync.clone();
@@ -627,8 +620,6 @@ pub fn new_sender(root: &str, fw: Arc<FrameWriter>, sync: Arc<SyncState>, base: 
 
 impl Sender {
     pub fn push_file(&self, rel: &str) -> io::Result<()> {
-        crate::slog!("sync-agent: push_file({})", rel);
-        crate::logging::diag(&format!("TX: push_file({}) start", rel));
         let abs = match safe_join(&self.root, rel) {
             Some(a) => a,
             None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "illegal path")),
@@ -641,7 +632,6 @@ impl Sender {
             return Ok(());
         }
         let hash = crate::manifest::hash_file(&abs).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        crate::slog!("sync-agent: push_file({}) size={} hash={}", rel, info.len(), &hash[..8]);
 
         let xfer;
         {
@@ -662,13 +652,10 @@ impl Sender {
             hash: hash.clone(),
         };
         let payload = serde_json::to_vec(&meta).unwrap();
-        crate::slog!("sync-agent: push_file({}) sending FILE_PUT xfer={}", rel, xfer);
-        crate::logging::diag(&format!("TX: FILE_PUT xfer={} size={}", xfer, meta.size));
 
         if info.len() == 0 {
             self.fw.send(TYPE_FILE_PUT, &payload)?;
             self.sync.mark_synced(rel, &hash);
-            crate::logging::diag(&format!("TX: push_file({}) zero-size done", rel));
             return Ok(());
         }
 
@@ -686,14 +673,12 @@ impl Sender {
                     let err = body.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
                     let conflict = body.get("conflict").and_then(|c| c.as_bool()).unwrap_or(false);
                     crate::slog!("sync-agent: push_file({}) NAK: {} conflict={}", rel, err, conflict);
-                    crate::logging::diag(&format!("TX: push_file({}) NAK: {} conflict={}", rel, err, conflict));
                     return Err(io::Error::new(io::ErrorKind::Other, format!("NAK: {} conflict={}", err, conflict)));
                 }
-                crate::logging::diag(&format!("TX: push_file({}) ready-ack received", rel));
+                  crate::slog!("sync-agent: push_file({}) ready-ack received", rel);
             }
             Err(e) => {
                 crate::slog!("sync-agent: push_file({}) ready-ack timeout: {}", rel, e);
-                crate::logging::diag(&format!("TX: push_file({}) ready-ack TIMEOUT", rel));
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!("ready-ack timeout: {}", e)));
             }
         }
@@ -713,13 +698,12 @@ impl Sender {
             chunk_payload.extend_from_slice(&buf[..n]);
 
             self.fw.send(TYPE_FILE_CHUNK, &chunk_payload)?;
-            crate::slog!("sync-agent: push_file({}) sent chunk offset={} len={}", rel, offset, n);
             offset += n as i64;
             if offset >= info.len() as i64 {
                 break;
             }
         }
-        crate::logging::diag(&format!("TX: push_file({}) all {} bytes sent", rel, offset));
+  
 
         // Wait for done-ack from host (comes as ACK with xfer=xfer, done=true)
         // Re-register waiter for the done-ack
@@ -732,13 +716,12 @@ impl Sender {
                     let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
                     let err = body.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
                     crate::slog!("sync-agent: push_file({}) done-NAK: {}", rel, err);
-                    crate::logging::diag(&format!("TX: push_file({}) done-NAK: {}", rel, err));
                     return Err(io::Error::new(io::ErrorKind::Other, format!("done-NAK: {}", err)));
                 }
                 let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
                 let done = body.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
                 if !done {
-                    crate::logging::diag(&format!("TX: push_file({}) progress ack (not done), continuing", rel));
+  
                     // Progress ack without done — host still processing. Re-register and wait again.
                     let (retry_tx, retry_rx) = std::sync::mpsc::channel();
                     self.fw.register_xfer_waiter(xfer, retry_tx);
@@ -749,27 +732,21 @@ impl Sender {
                                 let err = body2.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
                                 return Err(io::Error::new(io::ErrorKind::Other, format!("done-NAK: {}", err)));
                             }
-                            let body2: serde_json::Value = serde_json::from_slice(&resp_payload2).unwrap_or_default();
-                            let done2 = body2.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-                            crate::logging::diag(&format!("TX: push_file({}) final ack done={}", rel, done2));
-                        }
+                           }
                         Err(e) => {
-                            crate::logging::diag(&format!("TX: push_file({}) done-ack TIMEOUT: {}", rel, e));
+  
                             return Err(io::Error::new(io::ErrorKind::TimedOut, format!("done-ack timeout: {}", e)));
                         }
                     }
                 }
-                crate::logging::diag(&format!("TX: push_file({}) done-ack received", rel));
-            }
+           }
             Err(e) => {
-                crate::logging::diag(&format!("TX: push_file({}) done-ack TIMEOUT: {}", rel, e));
+                crate::slog!("sync-agent: push_file({}) done-ack timeout: {}", rel, e);
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!("done-ack timeout: {}", e)));
             }
         }
 
         self.sync.mark_synced(rel, &hash);
-        crate::slog!("sync-agent: push_file({}) done", rel);
-        crate::logging::diag(&format!("TX: push_file({}) COMPLETE", rel));
         Ok(())
     }
 
