@@ -438,5 +438,57 @@ All 14 architecture-review fixes implemented in a single batch (Phases 8.1-8.5).
 
 All three VM tests (`test:boot`, `test:sync`, `test:snapshot`) pass with the Rust binary. `test:unit` covers 39 tests.
 
+---
+
+### Phase 9: Code Review Fixes
+
+Post-merge code review identified 6 issues (2 critical, 1 medium, 3 low/observational).
+
+#### Phase 9.1 — Critical: Xfer waiter overwrite
+
+**Files:** `frame.rs:157`, `transfer.rs:664-751`
+
+`register_xfer_waiter` silently replaces the existing waiter for the same xfer ID. `push_file` registers 3 different waiters for one xfer (ready-ack, done-ack, retry-ack). If a done-ACK arrives between registrations, the old sender is dropped and the ACK is lost.
+
+**Fix:** Mirror Go's approach — use a single buffered channel (cap 4) registered once for the entire push_file lifetime. Go's `HandleAck` filters out progress ACKs (window drain only, returns early), so only ready-ack and done-ack reach the channel.
+
+Changes:
+- `handle_ack` in `transfer.rs`: On progress ACK (`received > 0 && !done`), drain window and return `true` WITHOUT calling `complete_xfer`. Only non-progress ACKs/NAKs go to `complete_xfer`.
+- `push_file` in `transfer.rs`: Single `(tx, rx)` with buffer 4, registered once. Loop: recv with timeout → NAK → error; `done: true` → break; ready-ack (no `received`, no `done`) → continue to streaming; progress-ack (shouldn't arrive but handle gracefully) → continue.
+
+#### Phase 9.2 — Critical: Panic on unreadable mtime
+
+**File:** `transfer.rs:650`
+
+`info.modified().unwrap()` panics if mtime is unavailable (unsupported filesystem, permissions). Every other mtime read in the codebase uses the safe pattern.
+
+**Fix:** Replace with `info.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0)`.
+
+#### Phase 9.3 — Medium: Busy-spin window acquire
+
+**File:** `transfer.rs:706-715`
+
+10ms polling loop when send window is full. Go uses a buffered channel as a semaphore (blocks efficiently).
+
+**Fix:** Replace busy-spin with `Condvar` + `Mutex`. `acquire_window()` waits on condvar until `window > 0`, then decrements. `drain_window(n)` increments and notifies.
+
+#### Phase 9.4 — Low: `set_mtime` drops errors silently
+
+**File:** `transfer.rs:603-607`
+
+`set_mtime` uses `let _ = ...` to silently drop errors.
+
+**Fix:** Add `crate::slog!` on error path.
+
+#### Phase 9.5 — Observational: Deterministic manifest sort
+
+**File:** `manifest.rs:100-101`
+
+Rust sorts manifest entries alphabetically; Go uses filesystem order. This is a behavioral change but the host processes entries by key, so correctness is unaffected. Noted for awareness — no fix needed.
+
+#### Phase 9.6 — Observational: Manifest before data-plane
+
+Manifest is sent in `handle_hello` before the data-plane session is established. This matches Go behavior exactly — the host processes manifest asynchronously and the data-plane connects later for bulk transfer. Noted for awareness — no fix needed.
+
 
 

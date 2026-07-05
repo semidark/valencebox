@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write as IoWrite, Seek, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::frame::{Frame, FrameWriter, TYPE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DEL, TYPE_FILE_PUT, TYPE_MANIFEST, TYPE_NAK};
 use crate::manifest::{ignored_rel, marshal_manifest_batches, safe_join, build_manifest, Manifest};
@@ -603,7 +603,9 @@ impl Receiver {
 fn set_mtime(path: &str, mtime_ms: i64) {
     let sec = mtime_ms / 1000;
     let nsec = ((mtime_ms % 1000) * 1_000_000) as u32;
-    let _ = filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(sec, nsec));
+    if let Err(e) = filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(sec, nsec)) {
+        crate::slog!("sync-agent: set_mtime({}) failed: {}", path, e);
+    }
 }
 
 pub struct Sender {
@@ -611,6 +613,7 @@ pub struct Sender {
     fw: Arc<FrameWriter>,
     next_xfer: Arc<Mutex<u32>>,
     window: Mutex<u32>,
+    window_cv: Condvar,
     sync: Arc<SyncState>,
 }
 
@@ -620,6 +623,7 @@ pub fn new_sender(root: &str, fw: Arc<FrameWriter>, sync: Arc<SyncState>, base: 
         fw,
         next_xfer: Arc::new(Mutex::new(base)),
         window: Mutex::new(32),
+        window_cv: Condvar::new(),
         sync,
     }
 }
@@ -647,7 +651,11 @@ impl Sender {
         }
 
         let mode = info.permissions().mode() & 0o777;
-        let mtime_ms = info.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let mtime_ms = info.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
 
         let meta = PutMeta {
             xfer,
@@ -665,14 +673,19 @@ impl Sender {
             return Ok(());
         }
 
-        // Register xfer waiter BEFORE sending PUT so we don't miss the ready-ack
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        self.fw.register_xfer_waiter(xfer, ready_tx);
+        // Single channel for all ACKs, registered once.
+        // Progress ACKs are filtered out by handle_ack (window drain only),
+        // so only ready-ack and done-ack/NAK arrive here.
+        let (ack_tx, ack_rx): (
+            std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+            std::sync::mpsc::Receiver<(u8, Vec<u8>)>,
+        ) = std::sync::mpsc::channel();
+        self.fw.register_xfer_waiter(xfer, ack_tx);
 
         self.fw.send(TYPE_FILE_PUT, &payload)?;
 
         // Wait for ready-ack from host
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        match ack_rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok((resp_typ, resp_payload)) => {
                 if resp_typ == TYPE_NAK {
                     let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
@@ -681,7 +694,13 @@ impl Sender {
                     crate::slog!("sync-agent: push_file({}) NAK: {} conflict={}", rel, err, conflict);
                     return Err(io::Error::new(io::ErrorKind::Other, format!("NAK: {} conflict={}", err, conflict)));
                 }
-                  crate::slog!("sync-agent: push_file({}) ready-ack received", rel);
+                let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
+                // Check if this is already a done-ack (zero-size file immediate finish)
+                if body.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    self.sync.mark_synced(rel, &hash);
+                    return Ok(());
+                }
+                crate::slog!("sync-agent: push_file({}) ready-ack received", rel);
             }
             Err(e) => {
                 crate::slog!("sync-agent: push_file({}) ready-ack timeout: {}", rel, e);
@@ -704,15 +723,7 @@ impl Sender {
             chunk_payload.extend_from_slice(&buf[..n]);
 
             // Acquire window slot (block if full)
-            loop {
-                let mut w = self.window.lock().unwrap();
-                if *w > 0 {
-                    *w -= 1;
-                    break;
-                }
-                drop(w);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            self.acquire_window();
 
             self.fw.send(TYPE_FILE_CHUNK, &chunk_payload)?;
             offset += n as i64;
@@ -721,37 +732,34 @@ impl Sender {
             }
         }
 
-        // Wait for done-ack from host with progress-ack retry loop
-        let (done_tx, mut done_rx) = std::sync::mpsc::channel();
-        self.fw.register_xfer_waiter(xfer, done_tx);
-
-        loop {
-            match done_rx.recv_timeout(std::time::Duration::from_secs(60)) {
-                Ok((resp_typ, resp_payload)) => {
-                    if resp_typ == TYPE_NAK {
-                        let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
-                        let err = body.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
-                        crate::slog!("sync-agent: push_file({}) NAK: {}", rel, err);
-                        return Err(io::Error::new(io::ErrorKind::Other, format!("NAK: {}", err)));
-                    }
+        // Wait for done-ack from host
+        match ack_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok((resp_typ, resp_payload)) => {
+                if resp_typ == TYPE_NAK {
                     let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
-                    if body.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                        break; // done-ack received
-                    }
-                    // Progress ack — re-register waiter and continue
-                    let (retry_tx, retry_rx) = std::sync::mpsc::channel();
-                    self.fw.register_xfer_waiter(xfer, retry_tx);
-                    done_rx = retry_rx;
+                    let err = body.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+                    crate::slog!("sync-agent: push_file({}) NAK: {}", rel, err);
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("NAK: {}", err)));
                 }
-                Err(e) => {
-                    crate::slog!("sync-agent: push_file({}) done-ack timeout: {}", rel, e);
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("done-ack timeout: {}", e)));
-                }
+                crate::slog!("sync-agent: push_file({}) done-ack received", rel);
+            }
+            Err(e) => {
+                crate::slog!("sync-agent: push_file({}) done-ack timeout: {}", rel, e);
+                return Err(io::Error::new(io::ErrorKind::TimedOut, format!("done-ack timeout: {}", e)));
             }
         }
 
         self.sync.mark_synced(rel, &hash);
         Ok(())
+    }
+
+    /// Acquire one window slot, blocking efficiently via Condvar if full.
+    fn acquire_window(&self) {
+        let mut w = self.window.lock().unwrap();
+        while *w == 0 {
+            w = self.window_cv.wait(w).unwrap();
+        }
+        *w -= 1;
     }
 
     pub fn push_delete(&self, rel: &str) -> io::Result<()> {
@@ -763,6 +771,9 @@ impl Sender {
 
     /// Handle an incoming ACK/NAK for xfer-based routing and window draining.
     /// Returns true if the frame was consumed (matched an xfer waiter).
+    /// Progress ACKs (received > 0, !done) drain window slots and return true
+    /// WITHOUT routing to the waiter — matching Go's HandleAck which returns
+    /// early for progress ACKs so only ready-ack and done-ack reach the channel.
     pub fn handle_ack(&self, f: &Frame) -> bool {
         let body: serde_json::Value = match serde_json::from_slice(&f.payload) {
             Ok(v) => v,
@@ -774,14 +785,18 @@ impl Sender {
         };
         let done = body.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
         let received = body.get("received").and_then(|r| r.as_i64()).unwrap_or(0);
+        let has_error = body.get("error").is_some();
 
-        // Drain window slots on progress ACK
-        if received > 0 && !done {
+        // Progress ACK: drain window slots, do NOT route to waiter (Go behavior)
+        if received > 0 && !done && !has_error {
             let mut w = self.window.lock().unwrap();
             *w = (*w + 16).min(32);
+            drop(w);
+            self.window_cv.notify_one();
+            return true;
         }
 
-        // Route to xfer waiter if registered
+        // Route to xfer waiter if registered (ready-ack, done-ack, or NAK)
         self.fw.complete_xfer(xfer, f.typ, &f.payload)
     }
 }
