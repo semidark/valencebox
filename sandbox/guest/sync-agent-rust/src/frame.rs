@@ -140,10 +140,13 @@ impl FrameWriter {
     }
 
     /// Deliver an incoming ACK/NAK to a waiting xfer waiter. Returns true if consumed.
+    /// Does NOT remove the waiter — the entry stays registered so subsequent
+    /// ACKs (e.g. done-ack after ready-ack) also reach the same channel.
+    /// The waiter is replaced when a new xfer reuses the same ID.
     pub fn complete_xfer(&self, xfer: u32, resp_typ: u8, resp_payload: &[u8]) -> bool {
         let tx = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.xfer_waiters.remove(&xfer)
+            let inner = self.inner.lock().unwrap();
+            inner.xfer_waiters.get(&xfer).cloned()
         };
         if let Some(tx) = tx {
             let _ = tx.send((resp_typ, resp_payload.to_vec()));

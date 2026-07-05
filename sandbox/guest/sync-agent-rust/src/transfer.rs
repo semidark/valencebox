@@ -694,12 +694,6 @@ impl Sender {
                     crate::slog!("sync-agent: push_file({}) NAK: {} conflict={}", rel, err, conflict);
                     return Err(io::Error::new(io::ErrorKind::Other, format!("NAK: {} conflict={}", err, conflict)));
                 }
-                let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
-                // Check if this is already a done-ack (zero-size file immediate finish)
-                if body.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                    self.sync.mark_synced(rel, &hash);
-                    return Ok(());
-                }
                 crate::slog!("sync-agent: push_file({}) ready-ack received", rel);
             }
             Err(e) => {
