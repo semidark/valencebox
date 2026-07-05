@@ -295,6 +295,7 @@ export class SyncManager extends EventEmitter {
       const timer = setTimeout(() => finish(new Error(`timeout pushing ${rel}`)), 120000);
       const maxWindow = ch.bufferedBytes ? DATA_WINDOW : WINDOW;
       const onDrain = () => pump();
+      console.log(`[pushFile] ${rel} (${meta.size}B) xfer=${xfer} ch=${ch === this.bridge ? 'console' : 'dataplane'}`);
 
       const finish = (err: Error | null, frame?: Frame) => {
         clearTimeout(timer);
@@ -334,6 +335,7 @@ export class SyncManager extends EventEmitter {
         } catch {
           /* ignore */
         }
+        console.log(`[pushFile] ${rel} xfer=${xfer} cb: type=${FrameType[f.type]} body=${JSON.stringify(body)}`);
         if (f.type === FrameType.NAK) {
           if (body.conflict) {
             // guest's local edit won LWW — it will push its version to us
@@ -361,6 +363,7 @@ export class SyncManager extends EventEmitter {
       });
 
       ch.send(FrameType.FILE_PUT, Buffer.from(JSON.stringify(meta)));
+      console.log(`[pushFile] ${rel} FILE_PUT sent, waiting for ACK`);
       // Data plane: TCP delivery order guarantees the guest sees FILE_PUT
       // before any chunk, so skip the ready-ack round trip (it dominates
       // small-file cost — RTT through the emulated netstack is tens of ms).

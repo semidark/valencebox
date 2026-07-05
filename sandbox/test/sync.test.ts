@@ -63,6 +63,26 @@ async function waitFor(desc: string, cond: () => boolean, timeoutMs = 30000): Pr
   }
 }
 
+async function waitForWithDebug(desc: string, cond: () => boolean, run: any, vm: any, timeoutMs = 30000): Promise<void> {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > timeoutMs) {
+      // Read guest log for debugging
+      const mark = vm.serialLog.length;
+       vm.serialWrite("cat /tmp/watch.log 2>/dev/null || echo NOWATCHLOG; echo DONELOG\n");
+      await vm.waitSerial(/DONELOG/, 10000, mark);
+      const captured = vm.serialLog.substring(mark);
+      const lines = captured.split('\n');
+      console.log(`[AGENT LOG DEBUG]`);
+      for (const line of lines) {
+        console.log(`  ${line.substring(0, 200)}`);
+      }
+      throw new Error(`timeout waiting for ${desc}`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 async function main() {
   const tree = makeTree();
   console.log(`host tree: ${tree.files} files, ${(tree.bytes / 1e6).toFixed(1)} MB`);
@@ -106,11 +126,13 @@ async function main() {
 
   // ---- live guest → host ----
   await run("echo 'from-guest-content-xyz' > /workspace/from-guest.txt && echo WROTE", /WROTE/);
-  await waitFor(
+  await waitForWithDebug(
     "guest push",
     () =>
       fs.existsSync(path.join(HOST_WS, "from-guest.txt")) &&
       fs.readFileSync(path.join(HOST_WS, "from-guest.txt"), "utf8").includes("from-guest-content-xyz"),
+    run,
+    vm,
     30000
   );
   console.log("✓ guest-created file synced to host");

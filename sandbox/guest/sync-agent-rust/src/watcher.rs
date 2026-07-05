@@ -1,3 +1,4 @@
+
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -11,19 +12,18 @@ use crate::manifest::ignored_rel;
 const IN_CLOSE_WRITE: u32 = 0x00000008;
 const IN_CREATE: u32 = 0x00000100;
 const IN_DELETE: u32 = 0x00000200;
-const IN_MOVED_TO: u32 = 0x00000400;
-const IN_MOVED_FROM: u32 = 0x00000800;
-const IN_DELETE_SELF: u32 = 0x00001000;
-const IN_ISDIR: u32 = 0x00010000;
+const IN_MOVED_TO: u32 = 0x00000080;
+const IN_MOVED_FROM: u32 = 0x00000040;
+const IN_ISDIR: u32 = 0x40000000;
 
+// IN_DELETE_SELF not supported on v86 kernel – omit to avoid EINVAL
 const WATCH_MASK: u32 = IN_CLOSE_WRITE
     | IN_CREATE
     | IN_DELETE
     | IN_MOVED_TO
-    | IN_MOVED_FROM
-    | IN_DELETE_SELF;
+    | IN_MOVED_FROM;
 
-const DEBOUNCE_MS: u64 = 300;
+const DEBOUNCE_MS: u64 = 100;
 
 #[repr(C)]
 struct InotifyEvent {
@@ -57,6 +57,7 @@ pub fn new_watcher(
     };
 
     watch_tree(root, fd, &mut state)?;
+    crate::slog!("sync-agent: watch_tree done, {} watches", state.wds.len());
 
     let state = Arc::new(Mutex::new(state));
     let tx = Arc::new(tx);
@@ -66,8 +67,11 @@ pub fn new_watcher(
 
     Ok(WatchHandle {
         _thread: thread::spawn(move || {
+            crate::slog!("sync-agent: watcher loop started");
+            crate::logging::diag("W: watcher loop started");
             watcher_loop(fd, &state_clone, &tx_clone);
             unsafe { libc::close(fd); }
+            crate::logging::diag("W: watcher loop exited");
         }),
     })
 }
@@ -77,11 +81,24 @@ fn watch_tree(
     fd: i32,
     state: &mut WatcherState,
 ) -> io::Result<()> {
+    // Watch the root directory itself so events on files directly in root are caught
+    {
+        let c_dir = std::ffi::CString::new(dir).unwrap();
+        let wd = unsafe { libc::inotify_add_watch(fd, c_dir.as_ptr(), WATCH_MASK) };
+        if wd >= 0 {
+            state.wds.insert(wd, dir.to_string());
+        }
+    }
     let mut stack = vec![dir.to_string()];
+    let mut walked = 0;
     while let Some(current) = stack.pop() {
+        walked += 1;
         let entries = match std::fs::read_dir(&current) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                crate::slog!("sync-agent: read_dir {} failed: {}", current, e);
+                continue;
+            }
         };
         for entry in entries {
             let entry = match entry {
@@ -106,10 +123,12 @@ fn watch_tree(
             };
             let wd = unsafe { libc::inotify_add_watch(fd, c_path.as_ptr(), WATCH_MASK) };
             if wd >= 0 {
-                state.wds.insert(wd, path_str);
+                state.wds.insert(wd, path_str.clone());
             }
+            stack.push(path_str);
         }
     }
+    crate::slog!("sync-agent: walk processed {} dirs", walked);
     Ok(())
 }
 
@@ -120,11 +139,13 @@ fn parse_events(buf: &[u8]) -> Vec<(i32, u32, String)> {
         let event = unsafe {
             &*(buf.as_ptr().add(off) as *const InotifyEvent)
         };
-        let name = if event.len > std::mem::size_of::<InotifyEvent>() as u32 {
+        let name = if event.len > 0 {
             let name_start = off + std::mem::size_of::<InotifyEvent>();
-            let name_len = (event.len - std::mem::size_of::<InotifyEvent>() as u32) as usize;
+            let name_len = event.len as usize;
             std::str::from_utf8(&buf[name_start..name_start + name_len])
                 .unwrap_or("")
+                .to_string()
+                .trim_end_matches('\0')
                 .to_string()
         } else {
             String::new()
@@ -138,23 +159,34 @@ fn parse_events(buf: &[u8]) -> Vec<(i32, u32, String)> {
 fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender<HashMap<String, String>>>) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut pending: HashMap<String, String> = HashMap::new();
-    let mut last_event = Instant::now();
-    let mut flushing = false;
+    let mut debounce_start: Option<Instant> = None;
+
+    // Clear diag file at start
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open("/tmp/watch.log") {
+            let _ = writeln!(f, "W: watcher_loop started");
+            let _ = f.flush();
+        }
+    }
 
     loop {
-        let timeout_ms = if flushing {
-            1
-        } else {
-            let elapsed = last_event.elapsed().as_millis() as u64;
-            if elapsed >= DEBOUNCE_MS {
-                flushing = true;
-                1
-            } else {
-                (DEBOUNCE_MS - elapsed) as i32
+        // Calculate poll timeout: block until debounce fires or data arrives
+        let timeout_ms = match debounce_start {
+            Some(start) => {
+                let elapsed = start.elapsed().as_millis() as u64;
+                if elapsed >= DEBOUNCE_MS {
+                    // Debounce expired — poll with 1ms to check for data, then flush
+                    1
+                } else {
+                    // Wait until debounce expires, but not more than 100ms per poll
+                    let remaining = (DEBOUNCE_MS - elapsed) as i32;
+                    if remaining > 100 { 100 } else { remaining }
+                }
             }
+            None => -1, // Block indefinitely until data arrives
         };
 
-        // Non-blocking read via poll
         let mut pollfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -164,25 +196,30 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() != io::ErrorKind::Interrupted {
-                eprintln!("sync-agent: poll error: {}", err);
+                crate::logging::diag(&format!("W: poll error: {}", err));
                 break;
             }
             continue;
         }
 
-        if ret == 0 {
-            // Timeout — check if we should flush
-            if flushing && !pending.is_empty() {
-                let ops = std::mem::take(&mut pending);
-                if tx.send(ops).is_err() {
-                    break;
-                }
-                flushing = false;
+       // Check if we should flush (debounce expired and we have pending ops)
+        let should_flush = debounce_start.is_some() && debounce_start.unwrap().elapsed() >= Duration::from_millis(DEBOUNCE_MS) && !pending.is_empty();
+        if should_flush {
+            let ops = std::mem::take(&mut pending);
+            let op_list: Vec<String> = ops.keys().cloned().collect();
+            crate::logging::diag(&format!("W: FLUSH {} ops: {:?}", ops.len(), op_list));
+            crate::slog!("sync-agent: FLUSH {} ops", ops.len());
+            if tx.send(ops).is_err() {
+                crate::logging::diag("W: tx.send failed, breaking");
+                break;
             }
+            debounce_start = None;
+        }
+
+        if ret == 0 {
             continue;
         }
 
-        flushing = false;
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let err = io::Error::last_os_error();
@@ -190,11 +227,12 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            eprintln!("sync-agent: inotify read error: {}", err);
+            crate::slog!("sync-agent: inotify read error: {}", err);
             break;
         }
 
         let events = parse_events(&buf[..n as usize]);
+        crate::logging::diag(&format!("W: read {} events, {} bytes", events.len(), n));
         let mut st = state.lock().unwrap();
         for (wd, mask, name) in events {
             if name.is_empty() || name == ".sync-tmp" {
@@ -202,7 +240,10 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
             }
             let dir = match st.wds.get(&wd) {
                 Some(d) => d.clone(),
-                None => continue,
+                None => {
+                    crate::slog!("sync-agent: unknown wd {}", wd);
+                    continue;
+                }
             };
             let abs = format!("{}/{}", dir, name);
             let rel = match Path::new(&abs).strip_prefix(&st.root) {
@@ -214,8 +255,14 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
             }
 
             let is_dir = mask & IN_ISDIR != 0;
+            crate::logging::diag(&format!("W: event wd={} mask=0x{:x} name={} rel={} is_dir={}", wd, mask, name, rel, is_dir));
+            if name == "from-guest.txt" {
+                crate::logging::diag(&format!("W: *** TARGET HIT *** wd={} mask=0x{:x} dir={} rel={}", wd, mask, dir, rel));
+            }
 
             if is_dir && (mask & (IN_CREATE | IN_MOVED_TO) != 0) {
+                crate::logging::diag(&format!("W: new dir {}, calling watch_tree", abs));
+                crate::slog!("sync-agent: new dir {}, calling watch_tree", abs);
                 drop(st);
                 if let Ok(mut s) = state.lock() {
                     let _ = watch_tree(&abs, fd, &mut s);
@@ -244,22 +291,20 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
                     }
                 }
                 st = state.lock().unwrap();
+                debounce_start = Some(Instant::now());
             } else if is_dir && (mask & (IN_DELETE | IN_MOVED_FROM) != 0) {
+                // crate::slog!("sync-agent: watcher event DEL dir {}", rel);
                 pending.insert(rel, "del".to_string());
+                debounce_start = Some(Instant::now());
             } else if mask & (IN_CLOSE_WRITE | IN_MOVED_TO) != 0 {
+                crate::logging::diag(&format!("W: PUT {} (dir={}, wd={})", rel, dir, wd));
                 pending.insert(rel, "put".to_string());
+                debounce_start = Some(Instant::now());
             } else if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
+                // crate::slog!("sync-agent: watcher event DEL {}", rel);
                 pending.insert(rel, "del".to_string());
+                debounce_start = Some(Instant::now());
             }
-        }
-        last_event = Instant::now();
-
-        if flushing && !pending.is_empty() {
-            let ops = std::mem::take(&mut pending);
-            if tx.send(ops).is_err() {
-                break;
-            }
-            flushing = false;
         }
     }
 }

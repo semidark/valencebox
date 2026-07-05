@@ -1,3 +1,4 @@
+
 use std::io::BufReader;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -51,7 +52,7 @@ impl DataPlane {
         let gen = inner.gen;
         drop(inner);
 
-        eprintln!("data plane: advert {}:{} (gen {})", cfg.ip, cfg.port, gen);
+        crate::slog!("data plane: advert {}:{} (gen {})", cfg.ip, cfg.port, gen);
 
         let inner_clone = self.inner.clone();
         thread::spawn(move || {
@@ -90,7 +91,7 @@ fn dp_dial_loop(cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<DataPlaneInner>>) 
         let conn = match TcpStream::connect_timeout(&addr.parse().unwrap(), std::time::Duration::from_secs(5)) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("data plane: dial {} failed: {}", addr, e);
+                crate::slog!("data plane: dial {} failed: {}", addr, e);
                 thread::sleep(std::time::Duration::from_secs(2));
                 continue;
             }
@@ -140,7 +141,7 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
         inn.sender = Some(send.clone());
     }
 
-    eprintln!("data plane: connected to {}:{:?}", cfg.ip, cfg.port);
+    crate::slog!("data plane: connected to {}:{:?}", cfg.ip, cfg.port);
 
     let last_rx_ts = Arc::new(AtomicI64::new(Instant::now().elapsed().as_millis() as i64));
     let last_rx_clone = last_rx_ts.clone();
@@ -155,7 +156,7 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
             let elapsed = start.elapsed().as_millis() as i64;
             let last = last_rx_clone.load(Ordering::SeqCst);
             if elapsed - last > 45000 {
-                eprintln!("data plane: no traffic for 45s — reconnecting");
+                crate::slog!("data plane: no traffic for 45s — reconnecting");
                 conn_for_close.shutdown(std::net::Shutdown::Both).ok();
                 return;
             }
@@ -173,7 +174,7 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
         let f = match frame::read_frame(&mut reader) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("data plane: session ended: {}", e);
+                crate::slog!("data plane: session ended: {}", e);
                 return;
             }
         };
@@ -204,7 +205,7 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
                 let _ = fw.send(TYPE_ACK, &ack_payload);
             }
             _ => {
-                eprintln!("data plane: unknown frame type {}", f.typ);
+                crate::slog!("data plane: unknown frame type {}", f.typ);
             }
         }
     }

@@ -329,3 +329,75 @@ At any phase, the Go binary remains in `sandbox/guest/sync-agent/`. To rollback:
 - `sandbox/README.md` — Architecture overview, timings
 - `sandbox/src/main/manifest.ts` — TS `splitManifest` / batch limit calculation
 
+---
+
+## Phase 7 Blocker: Guest→Host Push Not Working
+
+### The Bug
+
+`test:sync` fails at one specific step: **live guest→host sync**. Steps 1-3 all pass:
+- ✓ Hydration (353 files, host→guest) works
+- ✓ Guest file count / ignored trees / big-file hash all verify
+- ✓ Live host→guest edit works
+
+Fails at `test/sync.test.ts:128-137`: file created in guest (`/workspace/from-guest.txt`) never appears on host → `timeout waiting for guest push`.
+
+### Diagnostics So Far
+
+Watcher thread emits only startup lines, then goes quiet:
+```
+sync-agent: watch_tree done, 1 watches
+sync-agent: inotify watcher started
+sync-agent: watcher loop started
+sync-agent: new dir /workspace/src, calling watch_tree
+sync-agent: walk processed 1 dirs
+```
+No `FLUSH` line, no `HB` heartbeat line ever appears.
+
+The `/var/log/sync-agent.log` file is unreliable for reading back: `test -f` returns EXISTS, but `wc -l`/`tail`/`grep` return no output over serial console. One run reported 3220 lines; later runs show nothing. The file is dominated by per-chunk protocol RX logs (`GUEST RX: FILE_PUT` at main.rs:144), drowning out the ~6 watcher-prefixed lines.
+
+The heartbeat (`HB` every 50 iterations) was a red herring — with a 64 KiB inotify buffer, all ~700 hydration events fit in a handful of `read()` calls, so the loop legitimately iterates only a few times and never reaches 50.
+
+### Open Questions (Currently Unanswerable Due to Broken Observability)
+
+1. Does the inotify event for `from-guest.txt` (`IN_CLOSE_WRITE` on root `/workspace` wd) arrive and hit watcher.rs:289?
+2. Does `should_flush` (watcher.rs:200) ever evaluate true, and does `tx.send` reach the push thread (main.rs:77)?
+3. If it reaches the push thread, does `is_echo` (state.rs:85) wrongly return true, or does `push_file` fail?
+
+### Fix Plan
+
+**Phase 7.1 — Fix Observability (Before Any Logic Changes)**
+
+Do both A and B:
+- **A:** Watcher writes diagnostics to a dedicated small file (`/tmp/watch.log`) separate from the protocol-noise log. Small reads over serial have been reliable.
+- **B:** Silence the per-chunk `GUEST RX: FILE_PUT` log (main.rs:144) so `/var/log/sync-agent.log` stays tiny and readable.
+
+**Phase 7.2 — Localize the Failure**
+
+Add targeted diagnostic lines and run once:
+1. In the event loop, log raw `(wd, mask, name)` specifically when `name == "from-guest.txt"`
+2. Log when `should_flush` becomes true and the op count
+3. Log push-thread receipt + `is_echo` result for `from-guest.txt`
+
+This tells us exactly which of the three open questions is the culprit.
+
+**Phase 7.3 — Fix the Identified Root Cause**
+
+Candidates depending on Phase 7.2:
+- Root-dir events not detected → watch/mask issue on the `/workspace` wd
+- Flush never triggering → debounce/poll timeout logic (watcher.rs:164-208)
+- Echo false-positive → `is_echo`/manifest logic
+- Send/receive gap → channel or push-thread path
+
+**Phase 7.4 — Clean Up**
+
+Remove all temporary diagnostics (`HB`, dedicated diag file, extra logs), revert test's debug command in `sync.test.ts:72`, rebuild, confirm full suite passes.
+
+### Execution Notes
+
+- Batch all Phase 7.2 probes into a **single rebuild** to minimize cycles (each iteration = `cargo build` + `npm run images` + boot-flaky test, ~2-3 min)
+- Modify `test/sync.test.ts` temporarily for diagnostics, revert in Phase 7.4
+- `DEBOUNCE_MS = 100` in watcher.rs
+- Poll timeout logic: `debounce_start = None` → `timeout_ms = -1` (block indefinitely)
+- Flush condition: `debounce_start.is_some() && debounce_start.unwrap().elapsed() >= Duration::from_millis(DEBOUNCE_MS) && !pending.is_empty()`
+

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::sync::mpsc;
 use std::sync::Mutex;
 
 pub const TYPE_HELLO: u8 = 1;
@@ -77,12 +79,19 @@ pub struct FrameWriter {
 struct FrameWriterInner {
     w: Box<dyn Write + Send>,
     seq: u32,
+    pending: HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>,
+    xfer_waiters: HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>,
 }
 
 impl FrameWriter {
     pub fn new(w: Box<dyn Write + Send>) -> Self {
         Self {
-            inner: Mutex::new(FrameWriterInner { w, seq: 0 }),
+            inner: Mutex::new(FrameWriterInner {
+                w,
+                seq: 0,
+                pending: HashMap::new(),
+                xfer_waiters: HashMap::new(),
+            }),
         }
     }
 
@@ -114,6 +123,76 @@ impl FrameWriter {
         buf.extend_from_slice(&crc_val.to_le_bytes());
         inner.w.write_all(&buf)?;
         Ok(seq)
+    }
+
+    /// Send a frame and wait for a matching ACK/NAK by seq number.
+    /// Returns (frame_type, payload) of the response.
+    pub fn request(&self, typ: u8, payload: &[u8], timeout_s: u64) -> io::Result<(u8, Vec<u8>)> {
+        let seq = self.send(typ, payload)?;
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.pending.insert(seq, tx);
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(timeout_s)) {
+            Ok(resp) => Ok(resp),
+            Err(_) => {
+                let mut inner = self.inner.lock().unwrap();
+                inner.pending.remove(&seq);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timeout waiting for response"))
+            }
+        }
+    }
+
+    /// Deliver an incoming ACK/NAK to a waiting request(). Returns true if consumed.
+    pub fn complete_request(&self, seq: u32, resp_typ: u8, resp_payload: &[u8]) -> bool {
+        let tx = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.pending.remove(&seq)
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send((resp_typ, resp_payload.to_vec()));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Register a waiter for ACK/NAK frames routed by xfer id.
+    pub fn wait_xfer(&self, xfer: u32, timeout_s: u64) -> io::Result<(u8, Vec<u8>)> {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.xfer_waiters.insert(xfer, tx);
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(timeout_s)) {
+            Ok(resp) => Ok(resp),
+            Err(_) => {
+                let mut inner = self.inner.lock().unwrap();
+                inner.xfer_waiters.remove(&xfer);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timeout waiting for xfer response"))
+            }
+        }
+    }
+
+    /// Deliver an incoming ACK/NAK to a waiting xfer waiter. Returns true if consumed.
+    pub fn complete_xfer(&self, xfer: u32, resp_typ: u8, resp_payload: &[u8]) -> bool {
+        let tx = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.xfer_waiters.remove(&xfer)
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send((resp_typ, resp_payload.to_vec()));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Register an external xfer waiter (for push_file ready-ack).
+    pub fn register_xfer_waiter(&self, xfer: u32, tx: mpsc::Sender<(u8, Vec<u8>)>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.xfer_waiters.insert(xfer, tx);
     }
 }
 

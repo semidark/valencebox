@@ -32,10 +32,14 @@ export class FrameChannel extends EventEmitter {
 
   /** feed raw bytes received from the peer into the frame parser */
   feed(data: Uint8Array): void {
-    for (const frame of this.parser.push(data)) this.dispatch(frame);
+    const frames = this.parser.push(data);
+    if (frames.length > 0) console.log(`[bridge] feed: ${data.length}B → ${frames.length} frames`);
+    for (const frame of frames) this.dispatch(frame);
   }
 
   private dispatch(frame: Frame): void {
+    const payloadStr = frame.payload.length < 200 ? frame.payload.toString('utf8') : `${frame.payload.length}B...`;
+    console.log(`[bridge] dispatch: type=${FrameType[frame.type]} seq=${frame.seq} payload=${frame.payload.length}B "${payloadStr}"`);
     if (frame.type === FrameType.PING) {
       // liveness probe from the guest (data-plane keepalive) — always answer
       this.send(FrameType.ACK, Buffer.from(JSON.stringify({ ack: frame.seq })));

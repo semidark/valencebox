@@ -1,3 +1,4 @@
+
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -136,7 +137,7 @@ impl SyncState {
         } else {
             "remote"
         };
-        eprintln!("CONFLICT {}: local mtime={} remote mtime={} -> {} wins", rel, local_mtime_ms, remote_mtime_ms, winner);
+        crate::slog!("CONFLICT {}: local mtime={} remote mtime={} -> {} wins", rel, local_mtime_ms, remote_mtime_ms, winner);
         (winner, true)
     }
 }
