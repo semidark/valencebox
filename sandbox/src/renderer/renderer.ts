@@ -46,7 +46,8 @@ fitAddon.fit();
 
 // guest serial output → terminal; keystrokes → guest serial line
 api.onSerial((chunk) => term.write(chunk));
-term.onData((data: string) => api.sendInput(data));
+let isReady = false;
+term.onData((data: string) => { if (isReady) api.sendInput(data); });
 term.focus();
 
 const refit = () => {
@@ -59,10 +60,33 @@ const refit = () => {
 window.addEventListener("resize", refit);
 
 // ---- status bar ----
+let debugMode = false;
+const OVERLAY_MSG: Record<string, string> = {
+  boot: "Booting…",
+  restore: "Restoring snapshot…",
+  hydrating: "Syncing files…",
+  error: "Error",
+  ready: "",
+  stopped: "Stopped",
+};
+
 function render(s: RStatus) {
   const phase = $("phase");
   phase.textContent = s.phase + (s.restored ? " (restored)" : "");
   phase.className = "badge" + (s.phase === "ready" ? " ready" : s.phase === "error" ? " error" : "");
+  const wasReady = isReady;
+  isReady = s.phase === "ready";
+  const overlay = $("overlay");
+  if (isReady) {
+    overlay.classList.add("hidden");
+  } else {
+    overlay.classList.remove("hidden");
+    $("overlay-text").textContent = OVERLAY_MSG[s.phase] || "Waiting…";
+  }
+  if (wasReady && !isReady) {
+    debugMode = false;
+    $("debug-btn").textContent = "Debug";
+  }
   if (s.bootMs) $("boot").textContent = (s.bootMs / 1000).toFixed(1) + "s";
   if (s.sync) {
     $("pushed").textContent = String(s.sync.pushed);
@@ -83,8 +107,25 @@ api.onConflict((c) => {
 });
 
 $("snap").addEventListener("click", () => {
-  api.saveSnapshot();
+  if (isReady) api.saveSnapshot();
   term.focus();
+});
+
+$("debug-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  debugMode = !debugMode;
+  const overlay = $("overlay");
+  if (debugMode) {
+    overlay.style.backdropFilter = "none";
+    (overlay.style as any).webkitBackdropFilter = "none";
+    overlay.style.background = "transparent";
+    $("debug-btn").textContent = "Hide";
+  } else {
+    overlay.style.backdropFilter = "";
+    (overlay.style as any).webkitBackdropFilter = "";
+    overlay.style.background = "";
+    $("debug-btn").textContent = "Debug";
+  }
 });
 
 api.getStatus().then((s) => s && render(s));

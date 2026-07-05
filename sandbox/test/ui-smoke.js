@@ -51,6 +51,7 @@ app.whenReady().then(async () => {
         conflictShown: document.getElementById("conflicts").textContent.includes("src/app.ts"),
         lastInput: globalThis.__lastInput,
         noCmdBox: document.getElementById("cmd") === null && document.getElementById("send") === null,
+        overlayHidden: document.getElementById("overlay").classList.contains("hidden"),
       };
     })()
   `);
@@ -68,6 +69,7 @@ app.whenReady().then(async () => {
     // xterm normalizes the pasted \n to \r (Enter = carriage return)
     ["keystroke → sendInput IPC", result.lastInput === "whoami\r"],
     ["old command box removed", result.noCmdBox === true],
+    ["overlay hidden when ready", result.overlayHidden === true],
   ];
   let ok = true;
   for (const [name, pass] of checks) {
