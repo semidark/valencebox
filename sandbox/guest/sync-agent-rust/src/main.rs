@@ -12,17 +12,31 @@ use std::io::BufReader;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+fn parse_args(args: &[String]) -> (String, String) {
     let mut root = "/workspace".to_string();
     let mut dev = "/dev/hvc0".to_string();
-    for arg in &args[1..] {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         if arg.starts_with("--root=") {
             root = arg[7..].to_string();
+        } else if arg == "-root" && i + 1 < args.len() {
+            root = args[i + 1].clone();
+            i += 1;
         } else if arg.starts_with("--dev=") {
             dev = arg[6..].to_string();
+        } else if arg == "-dev" && i + 1 < args.len() {
+            dev = args[i + 1].clone();
+            i += 1;
         }
+        i += 1;
     }
+    (root, dev)
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let (root, dev) = parse_args(&args[1..]);
 
     loop {
         if let Err(e) = run(&root, &dev) {
@@ -43,6 +57,7 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
 
     let fw = Arc::new(frame::FrameWriter::new(Box::new(f.try_clone()?)));
     let sync = Arc::new(state::SyncState::new());
+    sync.set_fw(fw.clone());
     let recv = Arc::new(transfer::new_receiver(root, fw.clone(), sync.clone(), true));
     let send = Arc::new(transfer::new_sender(root, fw.clone(), sync.clone(), 0));
     let dplane = Arc::new(dataplane::DataPlane::new(root, sync.clone()));
@@ -52,7 +67,49 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
         "role": "guest",
         "root": root,
     })).unwrap();
-    fw.send(frame::TYPE_HELLO, &hello)?;
+    let hello_seq = fw.send(frame::TYPE_HELLO, &hello)?;
+
+    // Retransmit HELLO until host ACKs (up to 30 tries × 2s = 60s)
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = f.as_raw_fd();
+        let mut pollfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut reader = BufReader::new(f.try_clone()?);
+        let mut acked = false;
+        for _ in 0..30 {
+            let rc = unsafe { libc::poll(&mut pollfd, 1, 2000) };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if rc == 0 {
+                // Timeout — resend HELLO
+                fw.send(frame::TYPE_HELLO, &hello)?;
+                continue;
+            }
+            // Read frames until we find our HELLO ACK or run out of data
+            loop {
+                let fr = match frame::read_frame(&mut reader) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                };
+                if fr.typ == frame::TYPE_ACK {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&fr.payload) {
+                        if let Some(ack) = v.get("ack").and_then(|a| a.as_u64()) {
+                            if ack as u32 == hello_seq {
+                                acked = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if acked { break; }
+        }
+        if !acked {
+            crate::slog!("sync-agent: HELLO handshake timeout");
+        }
+    }
 
     let push_dplane = dplane.clone();
     let push_send = send.clone();
@@ -89,6 +146,7 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
                         }
                     }
                     "del" => {
+                        // forwarded even if never synced — the host no-ops on unknown paths
                         let rel_copy = rel.clone();
                         if let Err(e) = push_via_clone(&|s| s.push_delete(&rel_copy)) {
                             crate::slog!("sync-agent: push del {}: {}", rel, e);
@@ -166,6 +224,9 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
                     }
                 }
             }
+            frame::TYPE_EVENT => {
+                crate::slog!("sync-agent: host event: {:?}", frame_data.payload);
+            }
             _ => {
                 crate::slog!("sync-agent: unknown frame type {}", frame_data.typ);
             }
@@ -185,6 +246,51 @@ fn parse_dp_cfg(payload: &[u8]) -> Option<dataplane::DataPlaneCfg> {
     Some(dataplane::DataPlaneCfg { ip, port, token })
 }
 
-fn handle_ack_transfer(_f: &frame::Frame, _send: &transfer::Sender) -> bool {
-    false
+fn handle_ack_transfer(f: &frame::Frame, send: &transfer::Sender) -> bool {
+    send.handle_ack(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_parsing_long_form() {
+        let args = vec!["--root=/custom".to_string(), "--dev=/dev/tty0".to_string()];
+        let (root, dev) = parse_args(&args);
+        assert_eq!(root, "/custom");
+        assert_eq!(dev, "/dev/tty0");
+    }
+
+    #[test]
+    fn flag_parsing_short_form() {
+        let args = vec!["-root".to_string(), "/alt".to_string(), "-dev".to_string(), "/dev/tty1".to_string()];
+        let (root, dev) = parse_args(&args);
+        assert_eq!(root, "/alt");
+        assert_eq!(dev, "/dev/tty1");
+    }
+
+    #[test]
+    fn flag_parsing_defaults() {
+        let args: Vec<String> = vec![];
+        let (root, dev) = parse_args(&args);
+        assert_eq!(root, "/workspace");
+        assert_eq!(dev, "/dev/hvc0");
+    }
+
+    #[test]
+    fn flag_parsing_short_form_missing_value() {
+        let args = vec!["-root".to_string()];
+        let (root, dev) = parse_args(&args);
+        assert_eq!(root, "/workspace"); // defaults preserved when -root has no value
+        assert_eq!(dev, "/dev/hvc0");
+    }
+
+    #[test]
+    fn flag_parsing_mixed() {
+        let args = vec!["--root=/custom".to_string(), "-dev".to_string(), "/dev/tty2".to_string()];
+        let (root, dev) = parse_args(&args);
+        assert_eq!(root, "/custom");
+        assert_eq!(dev, "/dev/tty2");
+    }
 }

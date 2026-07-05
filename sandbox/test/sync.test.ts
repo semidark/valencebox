@@ -121,8 +121,9 @@ async function main() {
   console.log("✓ guest deletion synced to host");
 
   // ---- delete host → guest ----
+  const delBefore = sync.stats.deleted;
   fs.rmSync(path.join(HOST_WS, "README.md"));
-  await waitFor("host delete", () => sync.stats.deleted >= 2, 20000);
+  await waitFor("host delete", () => sync.stats.deleted > delBefore, 20000);
   await run("ls /workspace/README.md 2>&1 || echo GONE_OK", /GONE_OK|No such file/);
   console.log("✓ host deletion synced to guest");
 

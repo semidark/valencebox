@@ -182,7 +182,7 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
 
         match f.typ {
             TYPE_ACK | TYPE_NAK => {
-                // non-xfer acks need nothing
+                send.handle_ack(&f);
             }
             crate::frame::TYPE_FILE_PUT => {
                 recv.handle_put(&f);
@@ -208,5 +208,24 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
                 crate::slog!("data plane: unknown frame type {}", f.typ);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cfg_equality() {
+        let a = DataPlaneCfg { ip: "1.2.3.4".to_string(), port: 8080, token: "abc".to_string() };
+        let b = DataPlaneCfg { ip: "1.2.3.4".to_string(), port: 8080, token: "abc".to_string() };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cfg_inequality() {
+        let a = DataPlaneCfg { ip: "1.2.3.4".to_string(), port: 8080, token: "abc".to_string() };
+        let b = DataPlaneCfg { ip: "5.6.7.8".to_string(), port: 9090, token: "xyz".to_string() };
+        assert_ne!(a, b);
     }
 }

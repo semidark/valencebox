@@ -135,6 +135,9 @@ pub fn safe_join(root: &str, rel: &str) -> Option<String> {
                     return None;
                 }
             }
+            std::path::Component::CurDir => {
+                // skip — normalized away
+            }
             _ => {}
         }
     }

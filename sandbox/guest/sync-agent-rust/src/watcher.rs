@@ -23,7 +23,7 @@ const WATCH_MASK: u32 = IN_CLOSE_WRITE
     | IN_MOVED_TO
     | IN_MOVED_FROM;
 
-const DEBOUNCE_MS: u64 = 100;
+const DEBOUNCE_MS: u64 = 300;
 
 #[repr(C)]
 struct InotifyEvent {
@@ -182,72 +182,60 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
             continue;
         }
 
-       // Check if we should flush (debounce expired and we have pending ops)
-        let should_flush = debounce_start.is_some() && debounce_start.unwrap().elapsed() >= Duration::from_millis(DEBOUNCE_MS) && !pending.is_empty();
-        if should_flush {
-            let ops = std::mem::take(&mut pending);
-            if tx.send(ops).is_err() {
+        if ret > 0 {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                eprintln!("sync-agent: inotify read error: {}", err);
                 break;
             }
-            debounce_start = None;
-        }
 
-        if ret == 0 {
-            continue;
-        }
-
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            eprintln!("sync-agent: inotify read error: {}", err);
-            break;
-        }
-
-        let events = parse_events(&buf[..n as usize]);
-        let mut st = state.lock().unwrap();
-        for (wd, mask, name) in events {
-            if name.is_empty() || name == ".sync-tmp" {
-                continue;
-            }
-            let dir = match st.wds.get(&wd) {
-                Some(d) => d.clone(),
-                None => continue,
-            };
-            let abs = format!("{}/{}", dir, name);
-            let rel = match Path::new(&abs).strip_prefix(&st.root) {
-                Ok(r) => r.to_string_lossy().to_string(),
-                Err(_) => continue,
-            };
-            if ignored_rel(&rel) {
-                continue;
-            }
-
-            let is_dir = mask & IN_ISDIR != 0;
-
-            if is_dir && (mask & (IN_CREATE | IN_MOVED_TO) != 0) {
-                drop(st);
-                if let Ok(mut s) = state.lock() {
-                    let _ = watch_tree(&abs, fd, &mut s);
+            let events = parse_events(&buf[..n as usize]);
+            let mut st = state.lock().unwrap();
+            for (wd, mask, name) in events {
+                if name.is_empty() || name == ".sync-tmp" {
+                    continue;
                 }
-                if let Ok(_entries) = std::fs::read_dir(&abs) {
-                    let root_str = state.lock().unwrap().root.clone();
-                    let mut walk_stack = vec![abs.clone()];
-                    while let Some(d) = walk_stack.pop() {
-                        if let Ok(sub) = std::fs::read_dir(&d) {
-                            for e in sub {
-                                if let Ok(e) = e {
-                                    let p = e.path();
-                                    if p.is_dir() {
-                                        walk_stack.push(p.to_string_lossy().to_string());
-                                    } else if p.is_file() {
-                                        if let Ok(r) = p.strip_prefix(&root_str) {
-                                            let rel_str = r.to_string_lossy().to_string();
-                                            if !ignored_rel(&rel_str) {
-                                                pending.insert(rel_str, "put".to_string());
+                let dir = match st.wds.get(&wd) {
+                    Some(d) => d.clone(),
+                    None => continue,
+                };
+                let abs = format!("{}/{}", dir, name);
+                let rel = match Path::new(&abs).strip_prefix(&st.root) {
+                    Ok(r) => r.to_string_lossy().to_string(),
+                    Err(_) => continue,
+                };
+                if ignored_rel(&rel) {
+                    continue;
+                }
+
+                let is_dir = mask & IN_ISDIR != 0;
+
+                if is_dir && (mask & (IN_CREATE | IN_MOVED_TO) != 0) {
+                    drop(st);
+                    if let Ok(mut s) = state.lock() {
+                        let _ = watch_tree(&abs, fd, &mut s);
+                    }
+                    if let Ok(_entries) = std::fs::read_dir(&abs) {
+                        let root_str = state.lock().unwrap().root.clone();
+                        let mut walk_stack = vec![abs.clone()];
+                        while let Some(d) = walk_stack.pop() {
+                            if let Ok(sub) = std::fs::read_dir(&d) {
+                                for e in sub {
+                                    if let Ok(e) = e {
+                                        let p = e.path();
+                                        if p.is_dir() {
+                                            walk_stack.push(p.to_string_lossy().to_string());
+                                        } else if p.is_file() {
+                                            if let Ok(r) = p.strip_prefix(&root_str) {
+                                                let rel_str = r.to_string_lossy().to_string();
+                                                if !ignored_rel(&rel_str) {
+                                                    pending.insert(rel_str, "put".to_string());
+                                                }
                                             }
                                         }
                                     }
@@ -255,21 +243,57 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
                             }
                         }
                     }
+                    st = state.lock().unwrap();
+                    debounce_start = Some(Instant::now());
+                } else if is_dir && (mask & (IN_DELETE | IN_MOVED_FROM) != 0) {
+                    pending.insert(rel, "del".to_string());
+                    debounce_start = Some(Instant::now());
+                } else if mask & (IN_CLOSE_WRITE | IN_MOVED_TO) != 0 {
+                    pending.insert(rel, "put".to_string());
+                    debounce_start = Some(Instant::now());
+                } else if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
+                    pending.insert(rel, "del".to_string());
+                    debounce_start = Some(Instant::now());
                 }
-                st = state.lock().unwrap();
-                debounce_start = Some(Instant::now());
-            } else if is_dir && (mask & (IN_DELETE | IN_MOVED_FROM) != 0) {
-                // crate::slog!("sync-agent: watcher event DEL dir {}", rel);
-                pending.insert(rel, "del".to_string());
-                debounce_start = Some(Instant::now());
-            } else if mask & (IN_CLOSE_WRITE | IN_MOVED_TO) != 0 {
-                pending.insert(rel, "put".to_string());
-                debounce_start = Some(Instant::now());
-            } else if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
-                // crate::slog!("sync-agent: watcher event DEL {}", rel);
-                pending.insert(rel, "del".to_string());
-                debounce_start = Some(Instant::now());
             }
         }
+
+        // Flush if debounce expired and we have pending ops
+        if debounce_start.is_some() && debounce_start.unwrap().elapsed() >= Duration::from_millis(DEBOUNCE_MS) && !pending.is_empty() {
+            let ops = std::mem::take(&mut pending);
+            if tx.send(ops).is_err() {
+                break;
+            }
+            debounce_start = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_events_empty() {
+        let events = parse_events(&[]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_events_short_buffer() {
+        let buf = [0u8; 3]; // smaller than InotifyEvent
+        let events = parse_events(&buf);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn ignored_rel_filter() {
+        assert!(ignored_rel(".git/config"));
+        assert!(ignored_rel("node_modules/foo"));
+        assert!(ignored_rel(".sync-tmp/bar"));
+        assert!(ignored_rel("lost+found"));
+        assert!(ignored_rel(".DS_Store"));
+        assert!(!ignored_rel("src/index.js"));
+        assert!(!ignored_rel("valid/path.txt"));
     }
 }

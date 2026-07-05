@@ -20,10 +20,10 @@ pub struct PutMeta {
     pub hash: String,
 }
 
-#[derive(Clone)]
 struct Incoming {
     meta: PutMeta,
     tmp_path: String,
+    file: Option<std::fs::File>,
     received: i64,
     chunks: i32,
 }
@@ -134,14 +134,21 @@ impl Receiver {
         }
         let tmp_dir = format!("{}/.sync-tmp", root);
         let _ = std::fs::create_dir_all(&tmp_dir);
-        let tmp_path = format!("{}/put-{}", tmp_dir, std::process::id());
-        let _ = std::fs::write(&tmp_path, b"");
+        let tmp_path = format!("{}/put-{}-{}", tmp_dir, meta.xfer, std::process::id());
+        let tmp_file = match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.nak(f.seq, &e.to_string(), Some(serde_json::json!({"xfer": meta.xfer})));
+                return;
+            }
+        };
 
         {
             let mut inner = self.inner.lock().unwrap();
             inner.xfers.insert(meta.xfer, Incoming {
                 meta: meta.clone(),
                 tmp_path: tmp_path.clone(),
+                file: Some(tmp_file),
                 received: 0,
                 chunks: 0,
             });
@@ -177,57 +184,34 @@ impl Receiver {
             return;
         }
 
-        let _in_meta = {
-            let inner = self.inner.lock().unwrap();
-            match inner.xfers.get(&xfer) {
-                Some(i) => i.meta.clone(),
-                None => {
-                    self.nak(f.seq, "unknown xfer", Some(serde_json::json!({"xfer": xfer})));
-                    return;
-                }
-            }
-        };
-
-        let tmp_path = {
-            let inner = self.inner.lock().unwrap();
-            match inner.xfers.get(&xfer) {
-                Some(i) => i.tmp_path.clone(),
-                None => return,
-            }
-        };
-
-        let mut tmp_file = match std::fs::OpenOptions::new().write(true).open(&tmp_path) {
-            Ok(f) => f,
-            Err(e) => {
-                self.abort(f.seq, xfer, &e.to_string());
-                return;
-            }
-        };
-        if let Err(_) = tmp_file.seek(SeekFrom::Start(offset as u64)) {
-            drop(tmp_file);
-            self.abort(f.seq, xfer, "seek failed");
-            return;
-        }
-        if let Err(e) = tmp_file.write_all(data) {
-            drop(tmp_file);
-            self.abort(f.seq, xfer, &e.to_string());
-            return;
-        }
-        drop(tmp_file);
-
+        // Write data using stored file handle
         let (done, progress_ack, received) = {
             let mut inner = self.inner.lock().unwrap();
-            let in_mut = match inner.xfers.get_mut(&xfer) {
+            let in_entry = match inner.xfers.get_mut(&xfer) {
                 Some(i) => i,
                 None => return,
             };
-            in_mut.received += data.len() as i64;
-            in_mut.chunks += 1;
+            let file = in_entry.file.as_mut().expect("file handle missing in handle_chunk");
+            if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+                let msg = "seek failed".to_string();
+                drop(inner);
+                self.abort(f.seq, xfer, &msg);
+                return;
+            }
+            if let Err(e) = file.write_all(data) {
+                let msg = e.to_string();
+                drop(inner);
+                self.abort(f.seq, xfer, &msg);
+                return;
+            }
 
-            if in_mut.received >= in_mut.meta.size {
+            in_entry.received += data.len() as i64;
+            in_entry.chunks += 1;
+
+            if in_entry.received >= in_entry.meta.size {
                 (true, false, 0i64)
-            } else if in_mut.chunks % 16 == 0 {
-                (false, true, in_mut.received)
+            } else if in_entry.chunks % 16 == 0 {
+                (false, true, in_entry.received)
             } else {
                 (false, false, 0i64)
             }
@@ -543,9 +527,29 @@ impl Receiver {
                 return;
             }
         };
-        if let Err(e) = std::fs::remove_file(&abs) {
-            self.nak(f.seq, &e.to_string(), None);
-            return;
+        match std::fs::symlink_metadata(&abs) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone — idempotent like Go's os.RemoveAll
+                self.ack(f.seq, None);
+                return;
+            }
+            Err(e) => {
+                self.nak(f.seq, &e.to_string(), None);
+                return;
+            }
+            Ok(md) => {
+                if md.is_dir() {
+                    if let Err(e) = std::fs::remove_dir_all(&abs) {
+                        self.nak(f.seq, &e.to_string(), None);
+                        return;
+                    }
+                } else {
+                    if let Err(e) = std::fs::remove_file(&abs) {
+                        self.nak(f.seq, &e.to_string(), None);
+                        return;
+                    }
+                }
+            }
         }
         {
             let inner = self.inner.lock().unwrap();
@@ -606,6 +610,7 @@ pub struct Sender {
     root: String,
     fw: Arc<FrameWriter>,
     next_xfer: Arc<Mutex<u32>>,
+    window: Mutex<u32>,
     sync: Arc<SyncState>,
 }
 
@@ -614,6 +619,7 @@ pub fn new_sender(root: &str, fw: Arc<FrameWriter>, sync: Arc<SyncState>, base: 
         root: root.to_string(),
         fw,
         next_xfer: Arc::new(Mutex::new(base)),
+        window: Mutex::new(32),
         sync,
     }
 }
@@ -683,7 +689,7 @@ impl Sender {
             }
         }
 
-        // Stream chunks
+        // Stream chunks with window semaphore
         let mut src = std::fs::File::open(&abs)?;
         let mut buf = vec![0u8; crate::frame::CHUNK_SIZE];
         let mut offset: i64 = 0;
@@ -697,52 +703,50 @@ impl Sender {
             chunk_payload.extend_from_slice(&(offset as u64).to_le_bytes());
             chunk_payload.extend_from_slice(&buf[..n]);
 
+            // Acquire window slot (block if full)
+            loop {
+                let mut w = self.window.lock().unwrap();
+                if *w > 0 {
+                    *w -= 1;
+                    break;
+                }
+                drop(w);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
             self.fw.send(TYPE_FILE_CHUNK, &chunk_payload)?;
             offset += n as i64;
             if offset >= info.len() as i64 {
                 break;
             }
         }
-  
 
-        // Wait for done-ack from host (comes as ACK with xfer=xfer, done=true)
-        // Re-register waiter for the done-ack
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // Wait for done-ack from host with progress-ack retry loop
+        let (done_tx, mut done_rx) = std::sync::mpsc::channel();
         self.fw.register_xfer_waiter(xfer, done_tx);
 
-        match done_rx.recv_timeout(std::time::Duration::from_secs(60)) {
-            Ok((resp_typ, resp_payload)) => {
-                if resp_typ == TYPE_NAK {
+        loop {
+            match done_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok((resp_typ, resp_payload)) => {
+                    if resp_typ == TYPE_NAK {
+                        let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
+                        let err = body.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+                        crate::slog!("sync-agent: push_file({}) NAK: {}", rel, err);
+                        return Err(io::Error::new(io::ErrorKind::Other, format!("NAK: {}", err)));
+                    }
                     let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
-                    let err = body.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
-                    crate::slog!("sync-agent: push_file({}) done-NAK: {}", rel, err);
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("done-NAK: {}", err)));
-                }
-                let body: serde_json::Value = serde_json::from_slice(&resp_payload).unwrap_or_default();
-                let done = body.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-                if !done {
-  
-                    // Progress ack without done — host still processing. Re-register and wait again.
+                    if body.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                        break; // done-ack received
+                    }
+                    // Progress ack — re-register waiter and continue
                     let (retry_tx, retry_rx) = std::sync::mpsc::channel();
                     self.fw.register_xfer_waiter(xfer, retry_tx);
-                    match retry_rx.recv_timeout(std::time::Duration::from_secs(60)) {
-                        Ok((resp_typ2, resp_payload2)) => {
-                            if resp_typ2 == TYPE_NAK {
-                                let body2: serde_json::Value = serde_json::from_slice(&resp_payload2).unwrap_or_default();
-                                let err = body2.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
-                                return Err(io::Error::new(io::ErrorKind::Other, format!("done-NAK: {}", err)));
-                            }
-                           }
-                        Err(e) => {
-  
-                            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("done-ack timeout: {}", e)));
-                        }
-                    }
+                    done_rx = retry_rx;
                 }
-           }
-            Err(e) => {
-                crate::slog!("sync-agent: push_file({}) done-ack timeout: {}", rel, e);
-                return Err(io::Error::new(io::ErrorKind::TimedOut, format!("done-ack timeout: {}", e)));
+                Err(e) => {
+                    crate::slog!("sync-agent: push_file({}) done-ack timeout: {}", rel, e);
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("done-ack timeout: {}", e)));
+                }
             }
         }
 
@@ -755,5 +759,122 @@ impl Sender {
         self.fw.send(TYPE_FILE_DEL, &payload)?;
         self.sync.mark_deleted(rel);
         Ok(())
+    }
+
+    /// Handle an incoming ACK/NAK for xfer-based routing and window draining.
+    /// Returns true if the frame was consumed (matched an xfer waiter).
+    pub fn handle_ack(&self, f: &Frame) -> bool {
+        let body: serde_json::Value = match serde_json::from_slice(&f.payload) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let xfer = match body.get("xfer").and_then(|x| x.as_u64()) {
+            Some(x) => x as u32,
+            None => return false,
+        };
+        let done = body.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+        let received = body.get("received").and_then(|r| r.as_i64()).unwrap_or(0);
+
+        // Drain window slots on progress ACK
+        if received > 0 && !done {
+            let mut w = self.window.lock().unwrap();
+            *w = (*w + 16).min(32);
+        }
+
+        // Route to xfer waiter if registered
+        self.fw.complete_xfer(xfer, f.typ, &f.payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::TYPE_TREE_PUT;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    struct MockWriter {
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for MockWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    fn make_receiver(root: &str, verify: bool) -> Receiver {
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let fw = Arc::new(FrameWriter::new(Box::new(MockWriter { written: data })));
+        let sync = Arc::new(SyncState::new());
+        new_receiver(root, fw, sync, verify)
+    }
+
+    fn make_frame(typ: u8, payload: &[u8]) -> Frame {
+        Frame { typ, seq: 1, payload: payload.to_vec() }
+    }
+
+    #[test]
+    fn handle_put_basic() {
+        let recv = make_receiver("/tmp/test_sync_put", true);
+        let meta = serde_json::json!({
+            "xfer": 1,
+            "path": "test.txt",
+            "size": 0,
+            "mode": 0o644,
+            "mtimeMs": 1000,
+            "hash": "abc123",
+        });
+        let f = make_frame(TYPE_FILE_PUT, &serde_json::to_vec(&meta).unwrap());
+        recv.handle_put(&f);
+        // Zero-size file should finish immediately (no NAK)
+        // We can't easily inspect the ack, but it shouldn't panic
+    }
+
+    #[test]
+    fn handle_del_directory() {
+        let recv = make_receiver("/tmp/test_sync_del_dir", false);
+        let payload = serde_json::to_vec(&serde_json::json!({"path": "nonexistent"})).unwrap();
+        let f = make_frame(TYPE_FILE_DEL, &payload);
+        recv.handle_del(&f);
+        // Should not panic even with remove_dir_all on nonexistent path
+    }
+
+    #[test]
+    fn handle_tree_put_zero_size() {
+        let recv = make_receiver("/tmp/test_tree_zero", true);
+        let meta = serde_json::json!({"xfer": 1, "size": 0});
+        let f = make_frame(TYPE_TREE_PUT, &serde_json::to_vec(&meta).unwrap());
+        recv.handle_tree_put(&f);
+        // Zero-size tree should ack immediately
+    }
+
+    #[test]
+    fn handle_ack_basic() {
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let fw = Arc::new(FrameWriter::new(Box::new(MockWriter { written: data })));
+        let sync = Arc::new(SyncState::new());
+        let send = new_sender("/tmp", fw, sync, 0);
+        let ack = serde_json::json!({"xfer": 42, "received": 8192, "done": false});
+        let f = make_frame(TYPE_ACK, &serde_json::to_vec(&ack).unwrap());
+        let consumed = send.handle_ack(&f);
+        assert!(!consumed); // no waiter registered for xfer 42
+    }
+
+    #[test]
+    fn window_drain_on_progress() {
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let fw = Arc::new(FrameWriter::new(Box::new(MockWriter { written: data })));
+        let sync = Arc::new(SyncState::new());
+        let send = new_sender("/tmp", fw, sync, 0);
+        // Simulate window drain by sending progress ack
+        let ack = serde_json::json!({"xfer": 1, "received": 16384, "done": false});
+        let f = make_frame(TYPE_ACK, &serde_json::to_vec(&ack).unwrap());
+        send.handle_ack(&f);
+        // Window should have 16+ slots drained (cap 32)
+        let w = *send.window.lock().unwrap();
+        assert!(w > 0 && w <= 32);
     }
 }

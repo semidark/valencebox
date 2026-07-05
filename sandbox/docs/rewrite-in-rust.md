@@ -281,19 +281,110 @@ Each phase has a verification gate. Do not proceed to the next phase until the c
 
 ---
 
-### Phase 7: Final Verification (~1h) ✅
+### Phase 7: Final Verification (completed)
 
-- [x] `npm run test:unit` — protocol compatibility (CRC, frame format) — 19 tests pass
+- [x] `npm run test:unit` — protocol compatibility (CRC, frame format) — 39 tests pass
 - [x] `npm run test:sync` — end-to-end file sync in VM, including guest→host push
-- [ ] `npm run test:boot` — boot/hydrate/snapshot cycle
-- [ ] `npm run test:snapshot` — snapshot restore + data-plane reconnect
-- [ ] Verify binary size ~200KB static (`ls -lh target/.../sync-agent`)
-- [ ] Verify init script compatibility — runs with `-root /workspace -dev /dev/hvc0`
-- [ ] Decide: remove Go source or keep as reference alongside Rust
-- [ ] Update `AGENTS.md` — note Rust instead of Go for sync-agent
-- [ ] Mark this document as completed
+- [x] `npm run test:boot` — boot/hydrate/snapshot cycle
+- [x] `npm run test:snapshot` — snapshot restore + data-plane reconnect
+- [x] Binary size ~200KB static (`ls -lh target/i686-unknown-linux-musl/release/sync-agent`)
+- [x] Init script compatibility — runs with `-root /workspace -dev /dev/hvc0`
+- [x] Go source kept as reference alongside Rust
+- [x] `AGENTS.md` updated — notes Rust instead of Go for sync-agent
+- [x] Document completed
 
-**Gate:** ✅ Sync tests pass. Guest→host push fixed via xfer-based ACK routing (commit `e15ea95`). Debug logging cleaned up. Remaining: boot/snapshot tests, final housekeeping.
+**Result:** ✅ All VM tests pass. Guest→host push fixed via xfer-based ACK routing (commit `e15ea95`). All 14 Phase 8 architecture-review fixes applied. Handshake reliability fixed (guest retransmits HELLO; host caches last HELLO). Host-delete semantics match Go (file/dir/idempotent).
+
+### Phase 8: Post-Review Fixes
+
+A comprehensive architecture review identified 14 issues in the Rust rewrite. This phase fixes all of them, ordered by severity.
+
+#### Phase 8.1 — Critical: Flag Parsing & Data-Plane ACK Routing
+
+- [x] **8.1.1 Flag format: accept `-root` / `-dev` short form** — `src/main.rs:19-24`. The init script passes `-root /workspace -dev /dev/hvc0` (Go's `flag.String` style). Rust only parses `--root=` / `--dev=`. Add short-form parsing:
+
+    ```rust
+    for i in 1..args.len() {
+        let arg = &args[i];
+        if arg.starts_with("--root=") {
+            root = arg[7..].to_string();
+        } else if arg == "-root" && i + 1 < args.len() {
+            root = args[i + 1].clone();
+        } else if arg.starts_with("--dev=") {
+            dev = arg[6..].to_string();
+        } else if arg == "-dev" && i + 1 < args.len() {
+            dev = args[i + 1].clone();
+        }
+    }
+    ```
+
+- [x] **8.1.2 Data-plane ACK routing: wire `sender.handle_ack()`** — `src/dataplane.rs:183-186`. Go's `dataplane.go:176` calls `send.HandleAck(f)` on every `TYPE_ACK | TYPE_NAK` frame. Rust currently has a no-op comment. Replace with:
+
+    ```rust
+    TYPE_ACK | TYPE_NAK => {
+        if let Some(ref sender) = inner.sender {
+            sender.handle_ack(&f);
+        }
+    }
+    ```
+    Requires: `Sender` gains a `handle_ack(&self, f: &Frame)` method (8.2.1).
+
+#### Phase 8.2 — High: Transfer Correctness
+
+- [x] **8.2.1 Window semaphore + `handle_ack()` in Sender** — `src/transfer.rs`. Add `window: Mutex<u32>` (capacity 32) to `Sender`. Before each chunk send, acquire a slot — block if `window == 0`, then `window -= 1`. Add `handle_ack` method matching Go `transfer.go:386-414`: parse `{xfer, done, error, received}`, drain 16 window slots on progress ack, forward to waiter. Wire into data-plane loop (8.1.2) and console main loop.
+
+- [x] **8.2.2 Temp file naming: unique suffix per xfer** — `src/transfer.rs:137`. Change from `put-{pid}` to `put-{xfer}-{pid}`. Console sender xfer IDs are 0..0x3FFFFFFF, data-plane 0x40000000..0x7FFFFFFF — no collisions across channels.
+
+- [x] **8.2.3 Directory deletion: use `remove_dir_all`** — `src/transfer.rs:546`. Replace `std::fs::remove_file(&abs)` with `std::fs::remove_dir_all(&abs)` (works for both files and directories on Linux).
+
+- [x] **8.2.4 Conflict event emission: add `fw` to SyncState** — `src/state.rs:17-24`, `src/state.rs:112-142`. Add `fw: Option<Arc<FrameWriter>>` to `SyncStateInner`. Pass `fw.clone()` from callers. In `resolve_incoming`, emit `TYPE_EVENT` with JSON `{"events":[{"op":"conflict","path":rel,"winner":winner}]}` matching Go `state.go:122-126`.
+
+#### Phase 8.3 — Medium: Protocol Completeness
+
+- [x] **8.3.1 Add `TYPE_EVENT = 8` constant + handler** — `src/frame.rs:6-14`, `src/main.rs:169-171`. Define `pub const TYPE_EVENT: u8 = 8`. In main dispatch loop, add `frame::TYPE_EVENT => { crate::slog!(...); }` before the `_ =>` default.
+
+- [x] **8.3.2 Align debounce to 300ms** — `src/watcher.rs:26`. Change `DEBOUNCE_MS` from 100 to 300 to match Go behavior.
+
+- [x] **8.3.3 Fix poll-then-flush ordering** — `src/watcher.rs:185-193`. Move flush check **after** reading events from inotify.
+
+- [x] **8.3.4 Skip ignored dirs in `watch_tree`** — `src/watcher.rs:75-123`. Check `ignored_rel` before calling `inotify_add_watch` for subdirectories. Root dir must always be watched.
+
+- [x] **8.3.5 Fix done-ack retry loop** — `src/transfer.rs:708-747`. Replace fragile retry loop with a single loop handling both progress and done ACKs:
+
+    ```rust
+    loop {
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok((typ, payload)) => {
+                if typ == TYPE_NAK { ... return Err(...) }
+                let body = serde_json::from_slice(&payload).unwrap_or_default();
+                if body.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    break;
+                }
+                let (retry_tx, retry_rx) = channel();
+                self.fw.register_xfer_waiter(xfer, retry_tx);
+                done_rx = retry_rx;
+            }
+            Err(e) => return Err(TimedOut)
+        }
+    }
+    ```
+
+#### Phase 8.4 — Low + Tests
+
+- [x] **8.4.1 Keep temp file handle open across chunks** — `src/transfer.rs:199-215`. Store `Option<File>` in `Incoming` struct. Open once in `handle_put`, close in `finish`/`abort`.
+
+- [x] **8.4.2 Normalize `.` in `safe_join`** — `src/manifest.rs:123-147`. After joining, strip `.` path components.
+
+- [x] **8.4.3 Add Rust unit tests** — `#[cfg(test)]` in `src/transfer.rs`, `src/state.rs`, `src/watcher.rs`, `src/dataplane.rs`, `src/main.rs`. Coverage targets: transfer (push_file, handle_put, handle_chunk, handle_del, handle_tree_put), state (resolve_incoming, is_echo, hash_cached), watcher (parse_events, ignored_rel), dataplane (cfg update, staleness), main (flag parsing).
+
+#### Phase 8.5 — Clean Up
+
+- [x] Remove any temporary diagnostics or unused imports introduced during Phase 8
+- [x] Run `cargo check --target i686-unknown-linux-musl` — zero warnings
+- [x] Run `cargo test --target i686-unknown-linux-musl` — all tests pass
+- [x] Rebuild guest image, run `npm run test:sync`, `npm run test:boot`, `npm run test:snapshot`
+
+**Estimated effort:** ~4–6 hours total 
 
 ---
 
@@ -335,200 +426,17 @@ At any phase, the Go binary remains in `sandbox/guest/sync-agent/`. To rollback:
 
 **Guest→host push fix** (commit `e15ea95`): Root cause was `push_file` fire-and-forget with stub `handle_ack_transfer`. Fixed by implementing xfer-based ACK routing (`register_xfer_waiter`/`complete_xfer`) in `FrameWriter`, rewriting `push_file` to use xfer waiters (register → PUT → ready-ack → stream → done-ack), and wiring ACK routing into the main dispatch loop. Debug logging and temporary test helpers cleaned up.
 
----
+## Phase 8 Notes (Resolved)
 
-## Post-Phase-7 Fix Plan: Complete Rewrite Review Gaps
+All 14 architecture-review fixes implemented in a single batch (Phases 8.1-8.5). Three additional fixes applied after test failures:
 
-### Summary
+1. **Host-delete semantics** (`transfer.rs:530`): `handle_del` now matches Go's `os.RemoveAll` — uses `symlink_metadata` to check path type, calls `remove_file` for files and `remove_dir_all` for dirs, ACKs on missing paths (idempotent). Fixes `ENOTDIR` / `ENOENT` NAK errors.
 
-A comprehensive architecture review (Jul 2026) identified **14 issues** in the Rust rewrite compared to the Go original. Two critical, four high, six medium, two low. Below is the ordered fix plan, structured as continuation phases after Phase 7.
+2. **Delete echo suppression removed** (`main.rs:107-110`): Rust-only `last_hash(rel).is_none()` guard deleted. Deletes are now forwarded unconditionally per Go behavior; host receiver is idempotent.
 
-### Severity Key
-| Label | Meaning |
-|-------|---------|
-| 🔴 CRITICAL | Breaks production deployment |
-| 🟠 HIGH | Functional gap vs Go — data loss or incorrect behavior |
-| 🟡 MEDIUM | Behavioral difference or missing feature |
-| 🟢 LOW | Minor performance or normalization issue |
+3. **Handshake reliability** (`main.rs:72-109`, `bridge.ts:127-144`): Guest retransmits HELLO every 2s until ACKed (up to 60s). Host `waitGuestHello` caches the last guest HELLO frame, making the listener sticky — resolves even if HELLO arrives before the listener is armed.
 
----
+All three VM tests (`test:boot`, `test:sync`, `test:snapshot`) pass with the Rust binary. `test:unit` covers 39 tests.
 
-### Phase 8: Critical Fixes
 
-#### 8.1 Flag parsing: accept `-root` / `-dev` short form
-**🔴 CRITICAL** — `main.rs:19-24`
-
-The init script (`guest/rootfs/etc/init.d/sync-agent:5`) passes `-root /workspace -dev /dev/hvc0` (Go's `flag.String` style). The Rust code only parses `--root=` and `--dev=` (long opt style). The binary will use default `/workspace` and `/dev/hvc0` by luck in dev, but will fail on any non-default configuration.
-
-**Fix:** Add `-root` and `-dev` short-flag parsing alongside the long forms:
-```rust
-for i in 1..args.len() {
-    let arg = &args[i];
-    if arg.starts_with("--root=") {
-        root = arg[7..].to_string();
-    } else if arg == "-root" && i + 1 < args.len() {
-        root = args[i + 1].clone();
-    } else if arg.starts_with("--dev=") {
-        dev = arg[6..].to_string();
-    } else if arg == "-dev" && i + 1 < args.len() {
-        dev = args[i + 1].clone();
-    }
-}
-```
-
-#### 8.2 Data-plane ACK routing: wire `Sender.handle_ack()`
-**🔴 CRITICAL** — `dataplane.rs:183-186`
-
-The Go data-plane loop (`dataplane.go:176`) calls `send.HandleAck(f)` for every `TypeAck | TypeNak` frame, routing xfer ACKs to waiting senders and draining window slots. The Rust data-plane loop has a no-op comment `// non-xfer acks need nothing`. Guest→host pushes over the TCP data plane will never receive their ready-ack or done-ack, causing timeouts.
-
-**Fix:** Replace the no-op with `send.handle_ack(&f)` (requires Phase 9.1 to add `handle_ack` on `Sender`).
-
----
-
-### Phase 9: High-Severity Fixes
-
-#### 9.1 Add `handle_ack()` to Sender + window semaphore
-**🟠 HIGH** — `transfer.rs:686-705`
-
-**Window semaphore missing:** Go uses a counting semaphore (`window chan struct{}`, capacity 32) to limit in-flight chunks. Each chunk does `s.window <- struct{}{}` before sending, and progress ACKs drain up to 16 slots. The Rust sender streams all chunks in a tight loop with no backpressure — on virtio-console this can fill the ring and drop frames.
-
-**`handle_ack` missing:** Go's `Sender.HandleAck(f)` (transfer.go:386-414) parses `xfer` from the payload, routes to a waiting channel, and drains 16 window slots on progress ACKs. The Rust `Sender` has no `handle_ack` method.
-
-**Fix:**
-- Add `window: Mutex<u32>` (capacity 32) to `Sender` struct.
-- In `push_file`, before each `TYPE_FILE_CHUNK` send: acquire slot (`window -= 1` if `window > 0`).
-- Add `handle_ack(&self, f: &Frame) -> bool`:
-  - Parse `xfer`, `done`, `error`, `received` from payload.
-  - If `received` present and not done: drain 16 slots (`window += 16`, cap 32).
-  - If `xfer` matches a waiter: forward to waiter.
-- Wire `handle_ack` into the data-plane loop (Phase 8.2) and the console main loop, replacing the current `handle_ack_transfer` stub.
-
-#### 9.2 Temp file naming: use unique suffix per xfer
-**🟠 HIGH** — `transfer.rs:137`
-
-Go uses `os.CreateTemp(tmpDir, "put-*")` which generates unique random suffixes. Rust uses `format!("{}/put-{}", tmp_dir, std::process::id())`. Two concurrent transfers (console + data plane) will share the same PID and overwrite each other's temp files.
-
-**Fix:** Change to `format!("{}/put-{}-{}", tmp_dir, xfer, std::process::id())`. Since xfer IDs are disjoint per channel (console 0..0x3FFFFFFF, data-plane 0x40000000..0x7FFFFFFF), this guarantees uniqueness.
-
-#### 9.3 Directory deletion: use `remove_dir_all`
-**🟠 HIGH** — `transfer.rs:546`
-
-Go's `HandleDel` calls `os.RemoveAll(abs)` which recursively removes directories. Rust uses `std::fs::remove_file` which only removes files. Guest deleting a directory will fail with "no such file or directory" (if it's a directory) and send a NAK.
-
-**Fix:** Replace `std::fs::remove_file(&abs)` with a helper that checks `abs` is a directory and calls `std::fs::remove_dir_all` vs `std::fs::remove_file` accordingly. Or simply call `remove_dir_all` unconditionally (it also works for files on Linux).
-
-#### 9.4 Conflict event emission: add `fw` to SyncState
-**🟠 HIGH** — `state.rs:17-24`, `state.rs:112-142`
-
-Go's `SyncState` holds a `fw *FrameWriter` pointer and emits `TypeEvent` frames on conflict (`state.go:122-126`). The Rust `SyncState` lacks the `fw` reference, so its `resolve_incoming` only `slog!`s — the host never receives conflict events. Breaks the conflict-detection feedback loop in `sync-manager.ts`.
-
-**Fix:**
-- Add `fw: Option<Arc<FrameWriter>>` field to `SyncStateInner`.
-- Pass `fw.clone()` in all `new_sender`/`new_receiver` callers (`main.rs:46-47`, `dataplane.rs:136-137`).
-- In `resolve_incoming`, emit `TYPE_EVENT` with JSON `{"events": [{"op": "conflict", "path": rel, "winner": winner, "localMtimeMs": ..., "remoteMtimeMs": ...}]}` matching Go.
-
----
-
-### Phase 10: Medium-Severity Fixes
-
-#### 10.1 Add `TYPE_EVENT = 8` constant + handler
-**🟡 MEDIUM** — `frame.rs:6-14`, `main.rs:169-171`
-
-The protocol defines `TYPE_EVENT = 8` (used for conflict events and host logging). The Rust code defines types 1-10 but skips 8. Host event frames are silently dropped in the `_ =>` default branch.
-
-**Fix:** Add `pub const TYPE_EVENT: u8 = 8;` in `frame.rs`. In `main.rs` dispatch, add `frame::TYPE_EVENT => { crate::slog!(...); }` before the `_ =>` default.
-
-#### 10.2 Align debounce to 300ms
-**🟡 MEDIUM** — `watcher.rs:26`
-
-Go debounce is 300ms (`time.AfterFunc(300ms)`). Rust uses `DEBOUNCE_MS = 100`. This causes the Rust watcher to flush events 3× faster than Go, potentially triggering more frequent push operations for bursty writes.
-
-**Fix:** Change `DEBOUNCE_MS` from 100 to 300 to match Go behavior.
-
-#### 10.3 Fix poll-then-flush ordering
-**🟡 MEDIUM** — `watcher.rs:185-193`
-
-The Rust watcher checks `should_flush` **before** reading events. If events arrive at the poll boundary, the pending ops are flushed before the new events are processed — those events are lost until the next poll cycle. Go's `AfterFunc` avoids this by design.
-
-**Fix:** Move the flush check **after** the `libc::read` call. Only flush after processing newly read events.
-
-#### 10.4 Skip ignored dirs in `watch_tree`
-**🟡 MEDIUM** — `watcher.rs:75-123`
-
-The Rust watcher adds `inotify_add_watch` for every directory including `.git`, `node_modules`, etc., then filters at event-handling time. This wastes inotify descriptor slots (limited on 32-bit Alpine). Go skips ignored directories during the walk.
-
-**Fix:** Add `ignored_rel` check before calling `inotify_add_watch` for subdirectories. The root directory must always be watched.
-
-#### 10.5 Fix done-ack retry loop
-**🟡 MEDIUM** — `transfer.rs:708-747`
-
-The done-ack retry loop re-registers a waiter and waits again if `done` is false. If a progress ACK arrives at the retry waiter (not the done-ACK), the code checks `body.done` (false), falls through, and returns `TimedOut` erroneously.
-
-**Fix:** Replace with a proper loop that handles both progress and done ACKs:
-```rust
-loop {
-    match done_rx.recv_timeout(Duration::from_secs(60)) {
-        Ok((typ, payload)) => {
-            if typ == TYPE_NAK { ... return Err(...) }
-            let body: serde_json::Value = serde_json::from_slice(&payload).unwrap_or_default();
-            if body.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                break; // done-ack received
-            }
-            // progress ack — re-register waiter and continue
-            let (retry_tx, retry_rx) = mpsc::channel();
-            self.fw.register_xfer_waiter(xfer, retry_tx);
-            done_rx = retry_rx;
-        }
-        Err(e) => return Err(io::Error::new(io::ErrorKind::TimedOut, ...))
-    }
-}
-```
-
-#### 10.6 Add Rust unit tests for critical components
-**🟡 MEDIUM** — (all)
-
-No unit tests exist for `transfer.rs`, `state.rs`, `watcher.rs`, `dataplane.rs`, or `main.rs`. Only `frame.rs` and `manifest.rs` have tests (19 total). The Go code had no unit tests either, but the Rust rewrite is new code and needs coverage.
-
-**Test targets:**
-- `transfer.rs`: `push_file` (mock FrameWriter), `Receiver.handle_put`, `Receiver.handle_chunk`, `Receiver.handle_del` (directory case), `Receiver.handle_tree_put`, `Receiver.finish`, tree `unpack` state machine
-- `state.rs`: `resolve_incoming` (no conflict, LWW local wins, LWW remote wins), `is_echo`, `hash_cached` cache hit/miss
-- `watcher.rs`: `parse_events`, `ignored_rel` filtering, debounce timing
-- `dataplane.rs`: `DataPlaneCfg` update, `stale` checks, sender lifecycle
-- `main.rs`: flag parsing (`-root`, `--root=`, `-dev`, `--dev=`)
-
----
-
-### Phase 11: Low-Severity Fixes
-
-#### 11.1 Keep temp file handle open across chunks
-**🟢 LOW** — `transfer.rs:199-215`
-
-The Rust `Receiver.handle_chunk` opens the temp file, seeks, writes, and drops the handle for every chunk. Go keeps the file handle open for the lifetime of the transfer (`in.tmp` in the `incoming` struct). Opening/closing per chunk is wasteful but not a correctness issue.
-
-**Fix:** Store `Option<File>` in `Incoming` struct. Open once in `handle_put`. Close in `finish`/`abort`. Eliminates open/seek/write/close per chunk.
-
-#### 11.2 Normalize `.` in `safe_join`
-**🟢 LOW** — `manifest.rs:123-147`
-
-Go's `filepath.Join` normalizes `.` components (e.g., `foo/./bar` → `foo/bar`). The Rust `safe_join` preserves `.` as-is, resulting in paths like `/workspace/foo/./bar`. This is harmless on ext4 but inconsistent.
-
-**Fix:** After joining, strip `.` path components by canonicalizing or manually filtering them.
-
----
-
-### Phase Order & Dependencies
-
-```
-Phase 8 (critical) ──────────────────┐
-                                     ├── Phase 10 (medium) ──┐
-Phase 9 (high) ──────────────────────┤                        ├── Phase 11 (low + tests)
-                                     │                        │
-                                     └────────────────────────┘
-```
-
-- Phases 8-9 can run in parallel (no overlapping file edits).
-- Phase 10 depends on Phase 9 (window semaphore + handle_ack needed for done-ack retry fix).
-- Phase 11 depends on Phases 8-10 (tests validate the fixes).
-
-**Estimated effort:** ~4-6 hours total across all phases.
 

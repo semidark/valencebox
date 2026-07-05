@@ -3,9 +3,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use sha2::Digest;
+
+use crate::frame::{FrameWriter, TYPE_EVENT};
 
 #[derive(Clone)]
 struct StatHash {
@@ -21,6 +23,7 @@ pub struct SyncState {
 struct SyncStateInner {
     last_sync: HashMap<String, String>,
     stat_cache: HashMap<String, StatHash>,
+    fw: Option<Arc<FrameWriter>>,
 }
 
 impl SyncState {
@@ -29,8 +32,14 @@ impl SyncState {
             inner: Mutex::new(SyncStateInner {
                 last_sync: HashMap::new(),
                 stat_cache: HashMap::new(),
+                fw: None,
             }),
         }
+    }
+
+    pub fn set_fw(&self, fw: Arc<FrameWriter>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.fw = Some(fw);
     }
 
     pub fn mark_synced(&self, rel: &str, hash: &str) {
@@ -137,7 +146,64 @@ impl SyncState {
         } else {
             "remote"
         };
+        let fw = self.inner.lock().unwrap().fw.clone();
+        if let Some(ref fw) = fw {
+            let event = serde_json::json!({
+                "events": [{
+                    "op": "conflict",
+                    "path": rel,
+                    "winner": winner,
+                    "localMtimeMs": local_mtime_ms,
+                    "remoteMtimeMs": remote_mtime_ms,
+                }]
+            });
+            let _ = fw.send(TYPE_EVENT, &serde_json::to_vec(&event).unwrap());
+        }
         crate::slog!("CONFLICT {}: local mtime={} remote mtime={} -> {} wins", rel, local_mtime_ms, remote_mtime_ms, winner);
         (winner, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_incoming_no_conflict() {
+        let ss = SyncState::new();
+        // File doesn't exist locally → remote wins, no conflict
+        let (winner, conflict) = ss.resolve_incoming("nonexistent.txt", "/tmp/nonexistent.txt", "abc", 1000);
+        assert_eq!(winner, "remote");
+        assert!(!conflict);
+    }
+
+    #[test]
+    fn is_echo_no_last_sync() {
+        let ss = SyncState::new();
+        assert!(!ss.is_echo("foo.txt", "/tmp/foo.txt"));
+    }
+
+    #[test]
+    fn hash_cached_miss() {
+        let ss = SyncState::new();
+        // Non-existent file returns error
+        let r = ss.hash_cached("foo.txt", "/tmp/nonexistent_hash");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn mark_synced_and_last_hash() {
+        let ss = SyncState::new();
+        ss.mark_synced("test.txt", "deadbeef");
+        assert_eq!(ss.last_hash("test.txt").unwrap(), "deadbeef");
+        assert!(ss.last_hash("other.txt").is_none());
+    }
+
+    #[test]
+    fn mark_deleted_clears_cache() {
+        let ss = SyncState::new();
+        ss.mark_synced("test.txt", "deadbeef");
+        ss.mark_deleted("test.txt");
+        assert!(ss.last_hash("test.txt").is_none());
     }
 }

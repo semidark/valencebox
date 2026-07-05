@@ -10,6 +10,7 @@ pub const TYPE_FILE_CHUNK: u8 = 4;
 pub const TYPE_FILE_DEL: u8 = 5;
 pub const TYPE_ACK: u8 = 6;
 pub const TYPE_NAK: u8 = 7;
+pub const TYPE_EVENT: u8 = 8;
 pub const TYPE_PING: u8 = 9;
 pub const TYPE_TREE_PUT: u8 = 10;
 
