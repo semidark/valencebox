@@ -155,8 +155,8 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
             let _ = fw_ping.send(TYPE_PING, &[]);
             let elapsed = start.elapsed().as_millis() as i64;
             let last = last_rx_clone.load(Ordering::SeqCst);
-            if elapsed - last > 45000 {
-                crate::slog!("data plane: no traffic for 45s — reconnecting");
+            if elapsed - last > 300000 {
+                crate::slog!("data plane: no traffic for 300s — reconnecting");
                 conn_for_close.shutdown(std::net::Shutdown::Both).ok();
                 return;
             }
@@ -168,14 +168,14 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
         {
             let inn = inner.lock().unwrap();
             if inn.gen != gen {
-                return;
+                break;
             }
         }
         let f = match frame::read_frame(&mut reader) {
             Ok(f) => f,
             Err(e) => {
                 crate::slog!("data plane: session ended: {}", e);
-                return;
+                break;
             }
         };
         last_rx_ts.store(Instant::now().elapsed().as_millis() as i64, Ordering::SeqCst);
@@ -209,6 +209,9 @@ fn dp_session(conn: TcpStream, cfg: DataPlaneCfg, gen: i32, inner: Arc<Mutex<Dat
             }
         }
     }
+
+    // Session ended — clear sender so dplane.sender() returns None
+    inner.lock().unwrap().sender = None;
 }
 
 #[cfg(test)]
