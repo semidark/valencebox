@@ -97,6 +97,9 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&fr.payload) {
                         if let Some(ack) = v.get("ack").and_then(|a| a.as_u64()) {
                             if ack as u32 == hello_seq {
+                                if let Some(cfg) = parse_dp_cfg(&fr.payload) {
+                                    dplane.update(cfg);
+                                }
                                 acked = true;
                                 break;
                             }

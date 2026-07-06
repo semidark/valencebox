@@ -432,7 +432,7 @@ export class SyncManager extends EventEmitter {
       } catch {
         continue; // raced deletion
       }
-      const hash = crypto.createHash("sha256").update(data).digest("hex");
+      const hash = crypto.createHash("blake2s256").update(data).digest("hex");
       parts.push(
         encodeTreeEntry(
           {

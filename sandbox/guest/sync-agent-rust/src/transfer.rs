@@ -12,7 +12,7 @@ use crate::state::SyncState;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PutMeta {
-    pub xfer: u32,
+    pub xfer: Option<u32>,
     pub path: String,
     pub size: i64,
     pub mode: u32,
@@ -114,38 +114,39 @@ impl Receiver {
                 return;
             }
         };
+        let xfer = meta.xfer.unwrap_or(0);
         let root = self.inner.lock().unwrap().root.clone();
         let abs = match safe_join(&root, &meta.path) {
             Some(a) => a,
             None => {
-                self.nak(f.seq, "illegal path", Some(serde_json::json!({"xfer": meta.xfer})));
+                self.nak(f.seq, "illegal path", Some(serde_json::json!({"xfer": xfer})));
                 return;
             }
         };
         let sync = self.inner.lock().unwrap().sync.clone();
         let (winner, conflict) = sync.resolve_incoming(&meta.path, &abs, &meta.hash, meta.mtime_ms);
         if conflict && winner == "local" {
-            self.nak(f.seq, "conflict: local wins", Some(serde_json::json!({"xfer": meta.xfer, "conflict": true})));
+            self.nak(f.seq, "conflict: local wins", Some(serde_json::json!({"xfer": xfer, "conflict": true})));
             return;
         }
         if let Err(e) = std::fs::create_dir_all(Path::new(&abs).parent().unwrap()) {
-            self.nak(f.seq, &e.to_string(), Some(serde_json::json!({"xfer": meta.xfer})));
+            self.nak(f.seq, &e.to_string(), Some(serde_json::json!({"xfer": xfer})));
             return;
         }
         let tmp_dir = format!("{}/.sync-tmp", root);
         let _ = std::fs::create_dir_all(&tmp_dir);
-        let tmp_path = format!("{}/put-{}-{}", tmp_dir, meta.xfer, std::process::id());
+        let tmp_path = format!("{}/put-{}-{}", tmp_dir, xfer, std::process::id());
         let tmp_file = match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path) {
             Ok(f) => f,
             Err(e) => {
-                self.nak(f.seq, &e.to_string(), Some(serde_json::json!({"xfer": meta.xfer})));
+                self.nak(f.seq, &e.to_string(), Some(serde_json::json!({"xfer": xfer})));
                 return;
             }
         };
 
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.xfers.insert(meta.xfer, Incoming {
+            inner.xfers.insert(xfer, Incoming {
                 meta: meta.clone(),
                 tmp_path: tmp_path.clone(),
                 file: Some(tmp_file),
@@ -154,9 +155,9 @@ impl Receiver {
             });
         }
         if meta.size == 0 {
-            self.finish(f.seq, meta.xfer);
+            self.finish(f.seq, xfer);
         } else {
-            self.ack(f.seq, Some(serde_json::json!({"xfer": meta.xfer})));
+            self.ack(f.seq, Some(serde_json::json!({"xfer": xfer})));
         }
     }
 
@@ -658,7 +659,7 @@ impl Sender {
             .unwrap_or(0);
 
         let meta = PutMeta {
-            xfer,
+            xfer: Some(xfer),
             path: rel.to_string(),
             size: info.len() as i64,
             mode,

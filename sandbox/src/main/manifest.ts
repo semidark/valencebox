@@ -22,7 +22,7 @@ export function isIgnored(rel: string): boolean {
 }
 
 export function hashFileSync(p: string): string {
-  const h = crypto.createHash("sha256");
+  const h = crypto.createHash("blake2s256");
   const fd = fs.openSync(p, "r");
   try {
     const buf = Buffer.alloc(256 * 1024);

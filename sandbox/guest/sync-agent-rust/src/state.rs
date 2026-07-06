@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 
-use sha2::Digest;
+use blake2::Digest;
 
 use crate::frame::{FrameWriter, TYPE_EVENT};
 
@@ -104,7 +104,7 @@ impl SyncState {
 
     pub fn hash_file(path: &str) -> io::Result<String> {
         let mut f = File::open(path)?;
-        let mut hasher = sha2::Sha256::new();
+        let mut hasher = blake2::Blake2s256::new();
         let mut buf = [0u8; 65536];
         loop {
             let n = f.read(&mut buf)?;

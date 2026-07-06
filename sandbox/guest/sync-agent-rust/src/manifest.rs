@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use blake2::{Blake2s256, Digest};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
@@ -30,7 +30,7 @@ pub fn ignored_rel(rel: &str) -> bool {
 
 pub fn hash_file(path: &str) -> io::Result<String> {
     let mut f = File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Blake2s256::new();
     let mut buf = [0u8; 65536];
     loop {
         let n = f.read(&mut buf)?;
@@ -217,7 +217,7 @@ mod tests {
         f.write_all(b"hello world").unwrap();
         drop(f);
         let h = hash_file(path.to_string_lossy().as_ref()).unwrap();
-        assert_eq!(h, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(h, "9aec6806794561107e594b1f6a8a6b0c92a0cba9acf5e5e93cca06f781813b0b");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
