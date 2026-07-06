@@ -48,6 +48,11 @@ export interface SyncStats {
   bytesIn: number;
 }
 
+export interface SyncThroughput {
+  out: number; // bytes/sec host→guest
+  in: number;  // bytes/sec guest→host
+}
+
 const WINDOW = 32;
 const ACK_EVERY = 16;
 // data-plane flow control is byte-based (transport queue depth), so its
@@ -71,6 +76,10 @@ export class SyncManager extends EventEmitter {
   private guestManifest?: ManifestPayload;
   stats: SyncStats = { pushed: 0, pulled: 0, deleted: 0, conflicts: 0, bytesOut: 0, bytesIn: 0 };
   conflicts: ConflictRecord[] = [];
+  syncThroughput: SyncThroughput = { out: 0, in: 0 };
+  private lastBytesOut = 0;
+  private lastBytesIn = 0;
+  private throughputTimer?: NodeJS.Timeout;
 
   private dataCh?: FrameChannel;
 
@@ -143,7 +152,21 @@ export class SyncManager extends EventEmitter {
    * Initial hydrate: host is canonical. Pushes files whose content differs,
    * deletes guest-only files, then starts the host watcher.
    */
+  private startThroughputTimer(): void {
+    this.lastBytesOut = this.stats.bytesOut;
+    this.lastBytesIn = this.stats.bytesIn;
+    this.throughputTimer = setInterval(() => {
+      const deltaOut = this.stats.bytesOut - this.lastBytesOut;
+      const deltaIn = this.stats.bytesIn - this.lastBytesIn;
+      this.syncThroughput = { out: deltaOut, in: deltaIn };
+      this.lastBytesOut = this.stats.bytesOut;
+      this.lastBytesIn = this.stats.bytesIn;
+      this.emit("throughput", this.syncThroughput);
+    }, 1000);
+  }
+
   async hydrate(): Promise<void> {
+    this.startThroughputTimer();
     const guest = this.guestManifest ?? { files: {} };
     const host = buildManifest(this.hostDir);
     const toPush: string[] = [];
@@ -228,6 +251,7 @@ export class SyncManager extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    if (this.throughputTimer) clearInterval(this.throughputTimer);
     await this.watcher?.close();
     if (this.flushTimer) clearTimeout(this.flushTimer);
   }
