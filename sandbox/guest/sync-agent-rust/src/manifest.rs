@@ -46,7 +46,14 @@ pub fn build_manifest(root: &str, state: &SyncState) -> io::Result<Manifest> {
     let mut m = Manifest {
         files: HashMap::new(),
     };
-    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            let rel = e.path().strip_prefix(root).unwrap();
+            !ignored_rel(&rel.to_string_lossy().replace('\\', "/"))
+        })
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
         let rel = path.strip_prefix(root).unwrap();
         if rel.as_os_str().is_empty() {
@@ -54,10 +61,6 @@ pub fn build_manifest(root: &str, state: &SyncState) -> io::Result<Manifest> {
         }
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if ignored_rel(&rel_str) {
-            if entry.file_type().is_dir() {
-                // walkdir doesn't have SkipDir equivalent, but ignored paths won't recurse into node_modules/.git etc.
-                // We just skip entries; walkdir still walks subdirs but we filter them out.
-            }
             continue;
         }
         if entry.file_type().is_dir() {

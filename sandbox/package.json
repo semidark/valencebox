@@ -17,6 +17,7 @@
     "test:dataplane": "tsx test/dataplane.test.ts",
     "test:e2e": "tsx test/e2e.test.ts",
     "test:ui": "electron test/ui-smoke.js",
+    "test:agent": "cargo test --manifest-path guest/sync-agent-rust/Cargo.toml",
     "images": "./scripts/build-guest.sh"
   },
   "dependencies": {

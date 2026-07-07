@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -9,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::manifest::ignored_rel;
 
+const COOKIE_WINDOW_MS: u64 = 500;
+
 const IN_CLOSE_WRITE: u32 = 0x00000008;
 const IN_CREATE: u32 = 0x00000100;
 const IN_DELETE: u32 = 0x00000200;
@@ -16,7 +17,6 @@ const IN_MOVED_TO: u32 = 0x00000080;
 const IN_MOVED_FROM: u32 = 0x00000040;
 const IN_ISDIR: u32 = 0x40000000;
 
-// IN_DELETE_SELF not supported on v86 kernel – omit to avoid EINVAL
 const WATCH_MASK: u32 = IN_CLOSE_WRITE
     | IN_CREATE
     | IN_DELETE
@@ -33,6 +33,14 @@ struct InotifyEvent {
     len: u32,
 }
 
+/// Typed watcher operation — replaces stringly-typed HashMap.
+#[derive(Debug, Clone)]
+pub enum WatchOp {
+    Put(String),
+    Del(String),
+    Rename { old: String, new: String },
+}
+
 struct WatcherState {
     root: String,
     wds: HashMap<i32, String>,
@@ -44,7 +52,7 @@ pub struct WatchHandle {
 
 pub fn new_watcher(
     root: &str,
-    tx: mpsc::Sender<HashMap<String, String>>,
+    tx: mpsc::Sender<Vec<WatchOp>>,
 ) -> io::Result<WatchHandle> {
     let fd = unsafe { libc::inotify_init1(0) };
     if fd < 0 {
@@ -77,7 +85,6 @@ fn watch_tree(
     fd: i32,
     state: &mut WatcherState,
 ) -> io::Result<()> {
-    // Watch the root directory itself so events on files directly in root are caught
     {
         let c_dir = std::ffi::CString::new(dir).unwrap();
         let wd = unsafe { libc::inotify_add_watch(fd, c_dir.as_ptr(), WATCH_MASK) };
@@ -122,7 +129,7 @@ fn watch_tree(
     Ok(())
 }
 
-fn parse_events(buf: &[u8]) -> Vec<(i32, u32, String)> {
+fn parse_events(buf: &[u8]) -> Vec<(i32, u32, u32, String)> {
     let mut events = Vec::new();
     let mut off = 0;
     while off + std::mem::size_of::<InotifyEvent>() <= buf.len() {
@@ -140,33 +147,78 @@ fn parse_events(buf: &[u8]) -> Vec<(i32, u32, String)> {
         } else {
             String::new()
         };
-        events.push((event.wd, event.mask, name));
+        events.push((event.wd, event.mask, event.cookie, name));
         off += std::mem::size_of::<InotifyEvent>() + event.len as usize;
     }
     events
 }
 
-fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender<HashMap<String, String>>>) {
+/// Remap wd→path entries under old_abs prefix to new_abs prefix.
+fn remap_wds(state: &Arc<Mutex<WatcherState>>, old_abs: &str, new_abs: &str) {
+    let mut st = state.lock().unwrap();
+    let mut remapped: Vec<(i32, String)> = Vec::new();
+    for (&wd, path) in &st.wds {
+        if path == old_abs {
+            remapped.push((wd, new_abs.to_string()));
+        } else if path.starts_with(&format!("{}/", old_abs)) {
+            let rest = &path[old_abs.len()..];
+            remapped.push((wd, format!("{}{}", new_abs, rest)));
+        }
+    }
+    for (wd, new_path) in remapped {
+        st.wds.insert(wd, new_path);
+    }
+}
+
+fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender<Vec<WatchOp>>>) {
     let mut buf = vec![0u8; 64 * 1024];
-    let mut pending: HashMap<String, String> = HashMap::new();
+    let mut pending: Vec<WatchOp> = Vec::new();
+    // pending_renames: cookie → (old_rel, is_dir, old_abs, start_time)
+    let mut pending_renames: HashMap<u32, (String, bool, String, Instant)> = HashMap::new();
     let mut debounce_start: Option<Instant> = None;
 
+    macro_rules! flush_pending {
+        () => {
+            let ops = std::mem::take(&mut pending);
+            if !ops.is_empty() {
+                let _ = tx.send(ops);
+            }
+            debounce_start = None;
+        };
+    }
+
     loop {
-        // Calculate poll timeout: block until debounce fires or data arrives
-        let timeout_ms = match debounce_start {
-            Some(start) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                if elapsed >= DEBOUNCE_MS {
-                    // Debounce expired — poll with 1ms to check for data, then flush
-                    1
-                } else {
-                    // Wait until debounce expires, but not more than 100ms per poll
-                    let remaining = (DEBOUNCE_MS - elapsed) as i32;
-                    if remaining > 100 { 100 } else { remaining }
+        let mut timeout_ms: i32 = -1;
+        if let Some(start) = debounce_start {
+            let elapsed = start.elapsed().as_millis() as u64;
+            if elapsed >= DEBOUNCE_MS {
+                timeout_ms = 1;
+            } else {
+                timeout_ms = (DEBOUNCE_MS - elapsed) as i32;
+                if timeout_ms > 100 { timeout_ms = 100; }
+            }
+        }
+        {
+            let now = Instant::now();
+            let mut min_cookie_rem: Option<u64> = None;
+            pending_renames.retain(|_, (_, _, _, start_time)| {
+                let elapsed = now.duration_since(*start_time).as_millis() as u64;
+                if elapsed >= COOKIE_WINDOW_MS {
+                    return false;
+                }
+                let rem = COOKIE_WINDOW_MS - elapsed;
+                if min_cookie_rem.is_none() || rem < min_cookie_rem.unwrap() {
+                    min_cookie_rem = Some(rem);
+                }
+                true
+            });
+            if timeout_ms == -1 {
+                if let Some(rem) = min_cookie_rem {
+                    timeout_ms = rem as i32;
+                    if timeout_ms > 100 { timeout_ms = 100; }
                 }
             }
-            None => -1, // Block indefinitely until data arrives
-        };
+        }
 
         let mut pollfd = libc::pollfd {
             fd,
@@ -195,47 +247,111 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
             }
 
             let events = parse_events(&buf[..n as usize]);
-            let mut st = state.lock().unwrap();
-            for (wd, mask, name) in events {
-                if name.is_empty() || name == ".sync-tmp" {
-                    continue;
-                }
-                let dir = match st.wds.get(&wd) {
-                    Some(d) => d.clone(),
-                    None => continue,
-                };
-                let abs = format!("{}/{}", dir, name);
-                let rel = match Path::new(&abs).strip_prefix(&st.root) {
-                    Ok(r) => r.to_string_lossy().to_string(),
-                    Err(_) => continue,
-                };
-                if ignored_rel(&rel) {
-                    continue;
-                }
+            let mut dir_creates: Vec<String> = Vec::new();
 
-                let is_dir = mask & IN_ISDIR != 0;
+            {
+                let st = state.lock().unwrap();
+                let root = st.root.clone();
+                drop(st);
 
-                if is_dir && (mask & (IN_CREATE | IN_MOVED_TO) != 0) {
-                    drop(st);
-                    if let Ok(mut s) = state.lock() {
-                        let _ = watch_tree(&abs, fd, &mut s);
+                // Gather all resolved events + paths first, then process
+                let mut resolved: Vec<(i32, u32, u32, String, String, String)> = Vec::new();
+                {
+                    let st = state.lock().unwrap();
+                    for (wd, mask, cookie, name) in &events {
+                        if name.is_empty() || *name == ".sync-tmp" {
+                            continue;
+                        }
+                        let dir = match st.wds.get(wd) {
+                            Some(d) => d.clone(),
+                            None => continue,
+                        };
+                        let abs = format!("{}/{}", dir, name);
+                        let rel = match Path::new(&abs).strip_prefix(&root) {
+                            Ok(r) => r.to_string_lossy().to_string(),
+                            Err(_) => continue,
+                        };
+                        resolved.push((*wd, *mask, *cookie, name.clone(), abs, rel));
                     }
-                    if let Ok(_entries) = std::fs::read_dir(&abs) {
-                        let root_str = state.lock().unwrap().root.clone();
-                        let mut walk_stack = vec![abs.clone()];
-                        while let Some(d) = walk_stack.pop() {
-                            if let Ok(sub) = std::fs::read_dir(&d) {
-                                for e in sub {
-                                    if let Ok(e) = e {
-                                        let p = e.path();
-                                        if p.is_dir() {
-                                            walk_stack.push(p.to_string_lossy().to_string());
-                                        } else if p.is_file() {
-                                            if let Ok(r) = p.strip_prefix(&root_str) {
-                                                let rel_str = r.to_string_lossy().to_string();
-                                                if !ignored_rel(&rel_str) {
-                                                    pending.insert(rel_str, "put".to_string());
-                                                }
+                }
+
+                for (_wd, mask, cookie, _name, abs, rel) in resolved {
+                    let is_dir = mask & IN_ISDIR != 0;
+                    let rel_ignored = ignored_rel(&rel);
+
+                    // === Cookie correlation ===
+                    if cookie != 0 {
+                        if mask & IN_MOVED_FROM != 0 {
+                            pending_renames.insert(cookie, (rel.clone(), is_dir, abs.clone(), Instant::now()));
+                            continue;
+                        }
+                        if mask & IN_MOVED_TO != 0 {
+                            if let Some((old_rel, _old_is_dir, old_abs, _)) = pending_renames.remove(&cookie) {
+                                let new_ignored = ignored_rel(&rel);
+
+                                if is_dir {
+                                    remap_wds(state, &old_abs, &abs);
+                                }
+
+                                let old_visible = !ignored_rel(&old_rel);
+                                let new_visible = !new_ignored;
+
+                                if old_visible && new_visible {
+                                    pending.push(WatchOp::Rename { old: old_rel, new: rel.clone() });
+                                    debounce_start = Some(Instant::now());
+                                } else if old_visible && !new_visible {
+                                    pending.push(WatchOp::Del(old_rel));
+                                    debounce_start = Some(Instant::now());
+                                } else if !old_visible && new_visible {
+                                    dir_creates.push(abs.clone());
+                                }
+
+                                if new_visible {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if rel_ignored {
+                        continue;
+                    }
+
+                    // === Standard event handling ===
+                    if is_dir && (mask & (IN_CREATE | IN_MOVED_TO) != 0) {
+                        dir_creates.push(abs.clone());
+                    } else if is_dir && (mask & (IN_DELETE | IN_MOVED_FROM) != 0) {
+                        pending.push(WatchOp::Del(rel.clone()));
+                        debounce_start = Some(Instant::now());
+                    } else if mask & (IN_CLOSE_WRITE | IN_MOVED_TO) != 0 {
+                        pending.push(WatchOp::Put(rel.clone()));
+                        debounce_start = Some(Instant::now());
+                    } else if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
+                        pending.push(WatchOp::Del(rel.clone()));
+                        debounce_start = Some(Instant::now());
+                    }
+                }
+            }
+
+            for abs in &dir_creates {
+                if let Ok(mut s) = state.lock() {
+                    let _ = watch_tree(&abs, fd, &mut s);
+                }
+                if let Ok(_entries) = std::fs::read_dir(&abs) {
+                    let root_str = state.lock().unwrap().root.clone();
+                    let mut walk_stack = vec![abs.clone()];
+                    while let Some(d) = walk_stack.pop() {
+                        if let Ok(sub) = std::fs::read_dir(&d) {
+                            for e in sub {
+                                if let Ok(e) = e {
+                                    let p = e.path();
+                                    if p.is_dir() {
+                                        walk_stack.push(p.to_string_lossy().to_string());
+                                    } else if p.is_file() {
+                                        if let Ok(r) = p.strip_prefix(&root_str) {
+                                            let rel_str = r.to_string_lossy().to_string();
+                                            if !ignored_rel(&rel_str) {
+                                                pending.push(WatchOp::Put(rel_str));
                                             }
                                         }
                                     }
@@ -243,28 +359,37 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
                             }
                         }
                     }
-                    st = state.lock().unwrap();
-                    debounce_start = Some(Instant::now());
-                } else if is_dir && (mask & (IN_DELETE | IN_MOVED_FROM) != 0) {
-                    pending.insert(rel, "del".to_string());
-                    debounce_start = Some(Instant::now());
-                } else if mask & (IN_CLOSE_WRITE | IN_MOVED_TO) != 0 {
-                    pending.insert(rel, "put".to_string());
-                    debounce_start = Some(Instant::now());
-                } else if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
-                    pending.insert(rel, "del".to_string());
+                }
+                debounce_start = Some(Instant::now());
+            }
+        }
+
+        // Expire stale rename cookies (fallback to delete for visible source)
+        {
+            let now = Instant::now();
+            let mut expired: Vec<(String, bool)> = Vec::new();
+            pending_renames.retain(|_, (old_rel, _is_dir, _, start_time)| {
+                if now.duration_since(*start_time).as_millis() >= COOKIE_WINDOW_MS as u128 {
+                    let visible = !ignored_rel(old_rel);
+                    expired.push((old_rel.clone(), visible));
+                    false
+                } else {
+                    true
+                }
+            });
+            for (old_rel, visible) in &expired {
+                if *visible {
+                    pending.push(WatchOp::Del(old_rel.clone()));
                     debounce_start = Some(Instant::now());
                 }
             }
         }
 
-        // Flush if debounce expired and we have pending ops
-        if debounce_start.is_some() && debounce_start.unwrap().elapsed() >= Duration::from_millis(DEBOUNCE_MS) && !pending.is_empty() {
-            let ops = std::mem::take(&mut pending);
-            if tx.send(ops).is_err() {
-                break;
-            }
-            debounce_start = None;
+        if debounce_start.is_some()
+            && debounce_start.unwrap().elapsed() >= Duration::from_millis(DEBOUNCE_MS)
+            && !pending.is_empty()
+        {
+            flush_pending!();
         }
     }
 }
@@ -272,6 +397,14 @@ fn watcher_loop(fd: i32, state: &Arc<Mutex<WatcherState>>, tx: &Arc<mpsc::Sender
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[repr(C, align(4))]
+    struct AlignedBuf<const N: usize>([u8; N]);
+
+    impl<const N: usize> std::ops::Deref for AlignedBuf<N> {
+        type Target = [u8; N];
+        fn deref(&self) -> &[u8; N] { &self.0 }
+    }
 
     #[test]
     fn parse_events_empty() {
@@ -281,9 +414,139 @@ mod tests {
 
     #[test]
     fn parse_events_short_buffer() {
-        let buf = [0u8; 3]; // smaller than InotifyEvent
+        let buf = [0u8; 3];
         let events = parse_events(&buf);
         assert!(events.is_empty());
+    }
+
+    fn build_event(wd: i32, mask: u32, cookie: u32, name: &str, buf: &mut Vec<u8>) {
+        let event_size = std::mem::size_of::<InotifyEvent>();
+        let min_name_len = name.len() + 1;
+        let padded_name_len = (min_name_len + 3) & !3;
+        let off = buf.len();
+        buf.resize(off + event_size + padded_name_len, 0u8);
+        let event = InotifyEvent { wd, mask, cookie, len: padded_name_len as u32 };
+        unsafe {
+            std::ptr::copy(
+                &event as *const InotifyEvent as *const u8,
+                buf.as_mut_ptr().add(off),
+                event_size
+            );
+            let name_bytes = name.as_bytes();
+            std::ptr::copy(
+                name_bytes.as_ptr(),
+                buf.as_mut_ptr().add(off + event_size),
+                name_bytes.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn parse_events_single_inotify_event() {
+        let mut buf = AlignedBuf::<256>([0u8; 256]);
+        let mut v: Vec<u8> = Vec::new();
+        build_event(1, IN_CLOSE_WRITE, 0, "test.txt", &mut v);
+        assert!(v.len() <= buf.0.len());
+        buf.0[..v.len()].copy_from_slice(&v);
+        let events = parse_events(&buf.0[..v.len()]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, 1);
+        assert_eq!(events[0].1, IN_CLOSE_WRITE);
+        assert_eq!(events[0].2, 0);
+        assert_eq!(events[0].3, "test.txt");
+    }
+
+    #[test]
+    fn parse_events_multiple_inotify_events() {
+        let mut buf = AlignedBuf::<512>([0u8; 512]);
+        let mut v: Vec<u8> = Vec::new();
+        build_event(1, IN_CLOSE_WRITE, 0, "a.txt", &mut v);
+        build_event(2, IN_DELETE, 0, "b.txt", &mut v);
+        assert!(v.len() <= buf.0.len());
+        buf.0[..v.len()].copy_from_slice(&v);
+
+        let events = parse_events(&buf.0[..v.len()]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, 1);
+        assert_eq!(events[0].1, IN_CLOSE_WRITE);
+        assert_eq!(events[0].2, 0);
+        assert_eq!(events[0].3, "a.txt");
+        assert_eq!(events[1].0, 2);
+        assert_eq!(events[1].1, IN_DELETE);
+        assert_eq!(events[1].2, 0);
+        assert_eq!(events[1].3, "b.txt");
+    }
+
+    #[test]
+    fn parse_events_moved_from_and_to() {
+        let mut buf = AlignedBuf::<512>([0u8; 512]);
+        let mut v: Vec<u8> = Vec::new();
+        build_event(1, IN_MOVED_FROM, 42, "renamed.txt", &mut v);
+        build_event(1, IN_MOVED_TO, 42, "moved.txt", &mut v);
+        assert!(v.len() <= buf.0.len());
+        buf.0[..v.len()].copy_from_slice(&v);
+
+        let events = parse_events(&buf.0[..v.len()]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, IN_MOVED_FROM);
+        assert_eq!(events[0].0, 1);
+        assert_eq!(events[0].2, 42);
+        assert_eq!(events[0].3, "renamed.txt");
+        assert_eq!(events[1].1, IN_MOVED_TO);
+        assert_eq!(events[1].0, 1);
+        assert_eq!(events[1].2, 42);
+        assert_eq!(events[1].3, "moved.txt");
+    }
+
+    #[test]
+    fn parse_events_move_no_cookie_not_correlated() {
+        let mut buf = AlignedBuf::<512>([0u8; 512]);
+        let mut v: Vec<u8> = Vec::new();
+        build_event(1, IN_MOVED_FROM, 99, "src.txt", &mut v);
+        build_event(1, IN_MOVED_TO, 88, "dst.txt", &mut v);
+        assert!(v.len() <= buf.0.len());
+        buf.0[..v.len()].copy_from_slice(&v);
+
+        let events = parse_events(&buf.0[..v.len()]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].2, 99);
+        assert_eq!(events[1].2, 88);
+        assert_eq!(events[0].3, "src.txt");
+        assert_eq!(events[1].3, "dst.txt");
+    }
+
+    #[test]
+    fn parse_events_dir_inotify() {
+        let mut buf = AlignedBuf::<512>([0u8; 512]);
+        let mut v: Vec<u8> = Vec::new();
+        build_event(1, IN_CREATE | IN_ISDIR, 0, "newdir", &mut v);
+        assert!(v.len() <= buf.0.len());
+        buf.0[..v.len()].copy_from_slice(&v);
+
+        let events = parse_events(&buf.0[..v.len()]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, IN_CREATE | IN_ISDIR);
+        assert_eq!(events[0].2, 0);
+        assert_eq!(events[0].3, "newdir");
+    }
+
+    #[test]
+    fn parse_events_moved_dir() {
+        let mut buf = AlignedBuf::<512>([0u8; 512]);
+        let mut v: Vec<u8> = Vec::new();
+        build_event(1, IN_MOVED_FROM | IN_ISDIR, 55, "olddir", &mut v);
+        build_event(1, IN_MOVED_TO | IN_ISDIR, 55, "newdir", &mut v);
+        assert!(v.len() <= buf.0.len());
+        buf.0[..v.len()].copy_from_slice(&v);
+
+        let events = parse_events(&buf.0[..v.len()]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, IN_MOVED_FROM | IN_ISDIR);
+        assert_eq!(events[0].2, 55);
+        assert_eq!(events[0].3, "olddir");
+        assert_eq!(events[1].1, IN_MOVED_TO | IN_ISDIR);
+        assert_eq!(events[1].2, 55);
+        assert_eq!(events[1].3, "newdir");
     }
 
     #[test]
@@ -295,5 +558,32 @@ mod tests {
         assert!(ignored_rel(".DS_Store"));
         assert!(!ignored_rel("src/index.js"));
         assert!(!ignored_rel("valid/path.txt"));
+    }
+
+    #[test]
+    fn remap_wds_exact_match() {
+        let st = Arc::new(Mutex::new(WatcherState { root: "/ws".into(), wds: HashMap::new() }));
+        st.lock().unwrap().wds.insert(1, "/ws/old".into());
+        remap_wds(&st, "/ws/old", "/ws/new");
+        assert_eq!(st.lock().unwrap().wds.get(&1).unwrap(), "/ws/new");
+    }
+
+    #[test]
+    fn remap_wds_subtree() {
+        let st = Arc::new(Mutex::new(WatcherState { root: "/ws".into(), wds: HashMap::new() }));
+        let mut wds = HashMap::new();
+        wds.insert(1, "/ws/old".into());
+        wds.insert(2, "/ws/old/sub".into());
+        wds.insert(3, "/ws/old/sub/deep".into());
+        wds.insert(4, "/ws/keep".into());
+        wds.insert(5, "/ws/other".into());
+        *st.lock().unwrap() = WatcherState { root: "/ws".into(), wds };
+        remap_wds(&st, "/ws/old", "/ws/new");
+        let guard = st.lock().unwrap();
+        assert_eq!(guard.wds.get(&1).unwrap(), "/ws/new");
+        assert_eq!(guard.wds.get(&2).unwrap(), "/ws/new/sub");
+        assert_eq!(guard.wds.get(&3).unwrap(), "/ws/new/sub/deep");
+        assert_eq!(guard.wds.get(&4).unwrap(), "/ws/keep");
+        assert_eq!(guard.wds.get(&5).unwrap(), "/ws/other");
     }
 }

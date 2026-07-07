@@ -18,6 +18,7 @@ export enum FrameType {
   // announces a batched small-file archive; the archive body streams as
   // FILE_CHUNK frames under the same xfer id (see PROTOCOL.md)
   TREE_PUT = 10,
+  FILE_RENAME = 11,
 }
 
 export interface Frame {

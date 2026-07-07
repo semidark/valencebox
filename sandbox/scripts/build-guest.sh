@@ -1,8 +1,12 @@
 #!/bin/sh
-# Build the guest: sync-agent (Go, linux/386) → docker image → ext4 disk
+# Build the guest: sync-agent → docker image → ext4 disk
 # images + kernel/initramfs extracted for direct v86 bzimage boot.
+# AGENT=(rust|go) selects which sync-agent to use (default: rust).
 set -e
 cd "$(dirname "$0")/.."
+
+# TODO: remove AGENT switching and Go agent entirely once Rust is stable
+AGENT="${AGENT:-rust}"
 
 mkdir -p images assets/v86
 
@@ -22,22 +26,34 @@ for f in libv86.js v86.wasm seabios.bin vgabios.bin; do
 	cp "$ENV86_ASSETS/$f" "assets/v86/$f"
 done
 
-echo "==> building sync-agent (Rust, i686-unknown-linux-musl, inside Docker)"
-docker run --rm \
-  --platform=linux/amd64 \
-  -v "$PWD/guest/sync-agent-rust:/src" \
-  -v "$PWD/guest:/output" \
-  rust:alpine \
-  sh -c "
-    apk add musl-dev &&
-    rustup target add i686-unknown-linux-musl &&
-    cd /src &&
-    cargo build --target i686-unknown-linux-musl --release &&
-    cp target/i686-unknown-linux-musl/release/sync-agent /output/sync-agent.bin
-  "
+if [ "$AGENT" = "go" ]; then
+  echo "==> building sync-agent (Go, linux/386)"
+  GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -C guest/sync-agent -o ../sync-agent.bin .
+  GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -C guest/sync-agent -o ../blake2sum.bin ./blake2sum/
+else
+  echo "==> building sync-agent (Rust, i686-unknown-linux-musl, inside Docker)"
+  docker run --rm \
+    --platform=linux/amd64 \
+    -v "$PWD/guest/sync-agent-rust:/src" \
+    -v "$PWD/guest:/output" \
+    rust:alpine \
+    sh -c "
+      apk add musl-dev &&
+      rustup target add i686-unknown-linux-musl &&
+      cd /src &&
+      cargo build --target i686-unknown-linux-musl --release &&
+      cp target/i686-unknown-linux-musl/release/sync-agent /output/sync-agent.bin &&
+      cargo build --target i686-unknown-linux-musl --release --bin blake2sum &&
+      cp target/i686-unknown-linux-musl/release/blake2sum /output/blake2sum.bin
+    "
+fi
 
 echo "==> building guest docker image"
-docker build --platform=linux/386 -t sandbox-guest -f guest/Dockerfile guest
+docker build \
+  --platform=linux/386 \
+  --build-arg AGENT="${AGENT}" \
+  -t sandbox-guest \
+  -f guest/Dockerfile guest
 
 echo "==> exporting rootfs"
 docker rm -f sandbox-export >/dev/null 2>&1 || true

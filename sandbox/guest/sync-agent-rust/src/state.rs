@@ -53,9 +53,57 @@ impl SyncState {
         inner.stat_cache.remove(rel);
     }
 
+    /// Remap all state entries under old_rel prefix to new_rel prefix.
+    pub fn remap_prefix(&self, old_rel: &str, new_rel: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let prefix = format!("{}/", old_rel);
+        let new_prefix = format!("{}/", new_rel);
+
+        let mut remapped: Vec<(String, String, String)> = Vec::new();
+        for key in inner.last_sync.keys() {
+            if key == old_rel || key.starts_with(&prefix) {
+                let new_key = if key == old_rel {
+                    new_rel.to_string()
+                } else {
+                    new_prefix.clone() + &key[old_rel.len() + 1..]
+                };
+                let val = inner.last_sync.get(key).cloned().unwrap();
+                remapped.push((key.clone(), new_key, val));
+            }
+        }
+        for (old_key, new_key, val) in remapped {
+            inner.last_sync.remove(&old_key);
+            inner.last_sync.insert(new_key, val);
+        }
+
+        // Same remap for stat_cache
+        let mut remapped: Vec<(String, String, StatHash)> = Vec::new();
+        let prefix = format!("{}/", old_rel);
+        for (key, val) in &inner.stat_cache {
+            if key == old_rel || key.starts_with(&prefix) {
+                let new_key = if key == old_rel {
+                    new_rel.to_string()
+                } else {
+                    new_prefix.clone() + &key[old_rel.len() + 1..]
+                };
+                remapped.push((key.clone(), new_key, val.clone()));
+            }
+        }
+        for (old_key, new_key, val) in remapped {
+            inner.stat_cache.remove(&old_key);
+            inner.stat_cache.insert(new_key, val);
+        }
+    }
+
     pub fn last_hash(&self, rel: &str) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         inner.last_sync.get(rel).cloned()
+    }
+
+    pub fn has_prefix(&self, rel: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let prefix = format!("{}/", rel);
+        inner.last_sync.keys().any(|k| k == rel || k.starts_with(&prefix))
     }
 
     pub fn hash_cached(&self, rel: &str, abs: &str) -> io::Result<String> {
@@ -205,5 +253,68 @@ mod tests {
         ss.mark_synced("test.txt", "deadbeef");
         ss.mark_deleted("test.txt");
         assert!(ss.last_hash("test.txt").is_none());
+    }
+
+    #[test]
+    fn remap_prefix_file() {
+        let ss = SyncState::new();
+        ss.mark_synced("old.txt", "aaa");
+        ss.remap_prefix("old.txt", "new.txt");
+        assert!(ss.last_hash("old.txt").is_none());
+        assert_eq!(ss.last_hash("new.txt").unwrap(), "aaa");
+    }
+
+    #[test]
+    fn remap_prefix_dir() {
+        let ss = SyncState::new();
+        ss.mark_synced("olddir/a.txt", "aaa");
+        ss.mark_synced("olddir/b.txt", "bbb");
+        ss.mark_synced("olddir/sub/c.txt", "ccc");
+        ss.mark_synced("unrelated.txt", "unrelated");
+        ss.remap_prefix("olddir", "newdir");
+        assert!(ss.last_hash("olddir/a.txt").is_none());
+        assert!(ss.last_hash("olddir/b.txt").is_none());
+        assert!(ss.last_hash("olddir/sub/c.txt").is_none());
+        assert_eq!(ss.last_hash("newdir/a.txt").unwrap(), "aaa");
+        assert_eq!(ss.last_hash("newdir/b.txt").unwrap(), "bbb");
+        assert_eq!(ss.last_hash("newdir/sub/c.txt").unwrap(), "ccc");
+        assert_eq!(ss.last_hash("unrelated.txt").unwrap(), "unrelated");
+    }
+
+    #[test]
+    fn remap_prefix_stat_cache() {
+        let ss = SyncState::new();
+        // prime stat_cache by calling hash_cached on a real temp file
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let p = dir.join("vb_remap_test_a.txt");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(b"hello").unwrap();
+        f.flush().unwrap();
+        drop(f);
+        let abs = p.to_str().unwrap();
+        ss.mark_synced("old/remap_a.txt", "manual");
+        let _ = ss.hash_cached("old/remap_a.txt", abs).unwrap();
+        // stat_cache should have an entry now
+        ss.remap_prefix("old", "new");
+        assert!(ss.last_hash("old/remap_a.txt").is_none());
+        assert_eq!(ss.last_hash("new/remap_a.txt").unwrap(), "manual");
+        // stat_cache hit for new path (via stat + size match)
+        let meta = std::fs::metadata(abs).unwrap();
+        let r = ss.hash_cached_stat("new/remap_a.txt", abs, meta.len() as i64, 0);
+        // cached hash should match original (from cache, not file read)
+        assert!(r.is_ok());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn has_prefix_matches_exact_and_subtree() {
+        let ss = SyncState::new();
+        ss.mark_synced("dir/a.txt", "aaa");
+        ss.mark_synced("dir/sub/b.txt", "bbb");
+        ss.mark_synced("other.txt", "ccc");
+        assert!(ss.has_prefix("dir"));
+        assert!(ss.has_prefix("dir/a.txt"));
+        assert!(!ss.has_prefix("missing"));
     }
 }

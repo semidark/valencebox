@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 pub const TYPE_HELLO: u8 = 1;
 pub const TYPE_MANIFEST: u8 = 2;
@@ -13,6 +14,7 @@ pub const TYPE_NAK: u8 = 7;
 pub const TYPE_EVENT: u8 = 8;
 pub const TYPE_PING: u8 = 9;
 pub const TYPE_TREE_PUT: u8 = 10;
+pub const TYPE_FILE_RENAME: u8 = 11;
 
 pub const MAX_PAYLOAD: u32 = 262_144;
 pub const CHUNK_SIZE: usize = 48 * 1024;
@@ -123,6 +125,62 @@ impl FrameWriter {
         buf.extend_from_slice(&crc_val.to_le_bytes());
         inner.w.write_all(&buf)?;
         Ok(seq)
+    }
+
+    /// Send a frame and block until its seq-matched ACK/NAK arrives.
+    /// Returns Ok((typ, payload)) on ACK, Err on NAK or timeout.
+    pub fn request(&self, typ: u8, payload: &[u8], timeout: Duration) -> Result<(u8, Vec<u8>), io::Error> {
+        let (tx, rx) = mpsc::channel();
+        if payload.len() > MAX_PAYLOAD as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("payload too large: {}", payload.len()),
+            ));
+        }
+        let seq = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.seq = inner.seq.wrapping_add(1);
+            let seq = inner.seq;
+            inner.pending.insert(seq, tx);
+
+            let mut hdr = [0u8; 9];
+            hdr[0] = typ;
+            hdr[1..5].copy_from_slice(&seq.to_le_bytes());
+            hdr[5..9].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&hdr);
+            crc.update(payload);
+            let crc_val = crc.finalize();
+
+            let mut buf = Vec::with_capacity(4 + 9 + payload.len() + 4);
+            buf.extend_from_slice(&MAGIC);
+            buf.extend_from_slice(&hdr);
+            buf.extend_from_slice(payload);
+            buf.extend_from_slice(&crc_val.to_le_bytes());
+            if let Err(e) = inner.w.write_all(&buf) {
+                inner.pending.remove(&seq);
+                return Err(e);
+            }
+            seq
+        };
+        match rx.recv_timeout(timeout) {
+            Ok((resp_typ, resp_payload)) => {
+                if resp_typ == TYPE_NAK {
+                    let msg = String::from_utf8_lossy(&resp_payload).to_string();
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("NAK: {}", msg)));
+                }
+                Ok((resp_typ, resp_payload))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let mut inner = self.inner.lock().unwrap();
+                inner.pending.remove(&seq);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "request timeout"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel disconnected"))
+            }
+        }
     }
 
     /// Deliver an incoming ACK/NAK to a waiting request(). Returns true if consumed.
@@ -291,5 +349,49 @@ mod tests {
         let fw = FrameWriter::new(Box::new(sw));
         let big = vec![0u8; MAX_PAYLOAD as usize + 1];
         assert!(fw.send(TYPE_FILE_PUT, &big).is_err());
+    }
+
+    #[test]
+    fn request_ack_and_nak() {
+        use std::thread;
+        let (sw, _) = SharedWriter::new();
+        let fw = Arc::new(FrameWriter::new(Box::new(sw)));
+
+        // Simulate an ACK arriving from another "thread" via complete_request
+        let fw_clone = fw.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let payload = serde_json::to_vec(&serde_json::json!({"ack": 1})).unwrap();
+            fw_clone.complete_request(1, TYPE_ACK, &payload);
+        });
+
+        let result = fw.request(TYPE_PING, b"hello", Duration::from_secs(5));
+        handle.join().unwrap();
+        assert!(result.is_ok());
+        let (typ, payload) = result.unwrap();
+        assert_eq!(typ, TYPE_ACK);
+        assert!(payload.len() > 0);
+
+        // NAK test
+        let (sw2, _) = SharedWriter::new();
+        let fw2 = Arc::new(FrameWriter::new(Box::new(sw2)));
+        let fw2_clone = fw2.clone();
+        let handle2 = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let payload = serde_json::to_vec(&serde_json::json!({"ack": 1, "error": "bad"})).unwrap();
+            fw2_clone.complete_request(1, TYPE_NAK, &payload);
+        });
+
+        let result = fw2.request(TYPE_PING, b"hello", Duration::from_secs(5));
+        handle2.join().unwrap();
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("NAK"));
+
+        // Timeout test
+        let (sw3, _) = SharedWriter::new();
+        let fw3 = FrameWriter::new(Box::new(sw3));
+        let result = fw3.request(TYPE_PING, b"test", Duration::from_millis(10));
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("timeout"));
     }
 }

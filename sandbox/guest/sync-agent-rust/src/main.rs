@@ -7,7 +7,6 @@ mod termios;
 mod transfer;
 mod watcher;
 
-use std::collections::HashMap;
 use std::io::BufReader;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -127,19 +126,20 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
         op(&push_send)
     });
 
-    let (push_tx, push_rx) = mpsc::channel::<HashMap<String, String>>();
+    let (push_tx, push_rx) = mpsc::channel::<Vec<watcher::WatchOp>>();
     let push_root = root.to_string();
     let push_sync = sync.clone();
     let push_via_clone = push_via.clone();
     let _push_handle = std::thread::spawn(move || {
         while let Ok(ops) = push_rx.recv() {
-            for (rel, op_str) in &ops {
-                if manifest::safe_join(&push_root, rel).is_none() {
-                    continue;
-                }
-                let abs = manifest::safe_join(&push_root, rel).unwrap();
-                match op_str.as_str() {
-                    "put" => {
+            let ops = coalesce_watch_ops(ops, &push_sync);
+            for op in &ops {
+                match op {
+                    watcher::WatchOp::Put(rel) => {
+                        let abs = match manifest::safe_join(&push_root, rel) {
+                            Some(a) => a,
+                            None => continue,
+                        };
                         if push_sync.is_echo(rel, &abs) {
                             continue;
                         }
@@ -148,14 +148,25 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
                             crate::slog!("sync-agent: push {}: {}", rel, e);
                         }
                     }
-                    "del" => {
-                        // forwarded even if never synced — the host no-ops on unknown paths
+                    watcher::WatchOp::Del(rel) => {
+                        if manifest::safe_join(&push_root, rel).is_none() {
+                            continue;
+                        }
                         let rel_copy = rel.clone();
                         if let Err(e) = push_via_clone(&|s| s.push_delete(&rel_copy)) {
                             crate::slog!("sync-agent: push del {}: {}", rel, e);
                         }
                     }
-                    _ => {}
+                    watcher::WatchOp::Rename { old, new } => {
+                        if manifest::safe_join(&push_root, old).is_none() {
+                            continue;
+                        }
+                        let old_copy = old.clone();
+                        let new_copy = new.clone();
+                        if let Err(e) = push_via_clone(&|s| s.push_rename(&old_copy, &new_copy)) {
+                            crate::slog!("sync-agent: push rename {} -> {}: {}", old, new, e);
+                        }
+                    }
                 }
             }
         }
@@ -209,17 +220,32 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
                 recv.handle_del(&frame_data);
             }
             frame::TYPE_ACK | frame::TYPE_NAK => {
-                // Try xfer-based routing first (guest→host transfer ACKs)
-                let xfer_id = serde_json::from_slice::<serde_json::Value>(&frame_data.payload)
-                    .ok()
-                    .and_then(|v| v.get("xfer").and_then(|x| x.as_u64()))
-                    .map(|x| x as u32);
-                let consumed = xfer_id
-                    .map(|x| fw.complete_xfer(x, frame_data.typ, &frame_data.payload))
-                    .unwrap_or(false);
-                if !consumed {
-                    if !fw.complete_request(frame_data.seq, frame_data.typ, &frame_data.payload) {
-                        if !handle_ack_transfer(&frame_data, &send) {
+                // handle_ack_transfer must run first: routes progress ACKs to
+                // Sender.handle_ack (window drain) and ready/done/NAK ACKs to
+                // xfer waiters.  fw.complete_xfer runs second (fallback for
+                // waiters not managed by Sender, e.g. dataplane).
+                // Order matters: if complete_xfer runs first it catches
+                // progress ACKs and routes them into push_file's ack_rx
+                // channel, starving the window semaphore.
+                if !handle_ack_transfer(&frame_data, &send) {
+                    let ack_body = serde_json::from_slice::<serde_json::Value>(&frame_data.payload).ok();
+                    // data-plane sender fallback (if any)
+                    let xfer_id = ack_body
+                        .as_ref()
+                        .and_then(|v| v.get("xfer").and_then(|x| x.as_u64()))
+                        .map(|x| x as u32);
+                    let consumed = xfer_id
+                        .map(|x| fw.complete_xfer(x, frame_data.typ, &frame_data.payload))
+                        .unwrap_or(false);
+                    if !consumed {
+                        let ack_seq = ack_body
+                            .as_ref()
+                            .and_then(|v| v.get("ack").and_then(|a| a.as_u64()))
+                            .map(|x| x as u32);
+                        let request_consumed = ack_seq
+                            .map(|seq| fw.complete_request(seq, frame_data.typ, &frame_data.payload))
+                            .unwrap_or(false);
+                        if !request_consumed {
                             if let Some(cfg) = parse_dp_cfg(&frame_data.payload) {
                                 dplane.update(cfg);
                             }
@@ -249,6 +275,51 @@ fn parse_dp_cfg(payload: &[u8]) -> Option<dataplane::DataPlaneCfg> {
     Some(dataplane::DataPlaneCfg { ip, port, token })
 }
 
+fn map_prefix(rel: &str, old_root: &str, new_root: &str) -> String {
+    if rel == old_root {
+        new_root.to_string()
+    } else {
+        new_root.to_string() + &rel[old_root.len()..]
+    }
+}
+
+fn rewrite_watch_op(op: &mut watcher::WatchOp, old_root: &str, new_root: &str) {
+    let old_prefix = format!("{}/", old_root);
+    match op {
+        watcher::WatchOp::Put(rel) | watcher::WatchOp::Del(rel) => {
+            if rel == old_root || rel.starts_with(&old_prefix) {
+                *rel = map_prefix(rel, old_root, new_root);
+            }
+        }
+        watcher::WatchOp::Rename { old, new } => {
+            if old == old_root || old.starts_with(&old_prefix) {
+                *old = map_prefix(old, old_root, new_root);
+            }
+            if new == old_root || new.starts_with(&old_prefix) {
+                *new = map_prefix(new, old_root, new_root);
+            }
+        }
+    }
+}
+
+fn coalesce_watch_ops(mut ops: Vec<watcher::WatchOp>, sync: &state::SyncState) -> Vec<watcher::WatchOp> {
+    let mut out: Vec<watcher::WatchOp> = Vec::new();
+    for op in ops.drain(..) {
+        match op {
+            watcher::WatchOp::Rename { old, new } if !sync.has_prefix(&old) => {
+                // The old path was never synced, so the host does not know it.
+                // Rewrite any earlier ops in this batch from old prefix to new
+                // prefix and drop the rename itself.
+                for existing in &mut out {
+                    rewrite_watch_op(existing, &old, &new);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn handle_ack_transfer(f: &frame::Frame, send: &transfer::Sender) -> bool {
     send.handle_ack(f)
 }
@@ -256,6 +327,8 @@ fn handle_ack_transfer(f: &frame::Frame, send: &transfer::Sender) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::SyncState;
+    use crate::watcher::WatchOp;
 
     #[test]
     fn flag_parsing_long_form() {
@@ -295,5 +368,63 @@ mod tests {
         let (root, dev) = parse_args(&args);
         assert_eq!(root, "/custom");
         assert_eq!(dev, "/dev/tty2");
+    }
+
+    #[test]
+    fn coalesce_unsynced_file_rename_rewrites_put() {
+        let sync = SyncState::new();
+        let ops = vec![
+            WatchOp::Put("old.txt".to_string()),
+            WatchOp::Rename { old: "old.txt".to_string(), new: "new.txt".to_string() },
+        ];
+        let out = coalesce_watch_ops(ops, &sync);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            WatchOp::Put(rel) => assert_eq!(rel, "new.txt"),
+            other => panic!("expected Put(new.txt), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn coalesce_synced_file_rename_keeps_rename() {
+        let sync = SyncState::new();
+        sync.mark_synced("old.txt", "abc");
+        let ops = vec![
+            WatchOp::Put("old.txt".to_string()),
+            WatchOp::Rename { old: "old.txt".to_string(), new: "new.txt".to_string() },
+        ];
+        let out = coalesce_watch_ops(ops, &sync);
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            WatchOp::Put(rel) => assert_eq!(rel, "old.txt"),
+            other => panic!("expected Put(old.txt), got {:?}", other),
+        }
+        match &out[1] {
+            WatchOp::Rename { old, new } => {
+                assert_eq!(old, "old.txt");
+                assert_eq!(new, "new.txt");
+            }
+            other => panic!("expected Rename(old.txt->new.txt), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn coalesce_unsynced_dir_rename_rewrites_subtree_puts() {
+        let sync = SyncState::new();
+        let ops = vec![
+            WatchOp::Put("old/sub/a.txt".to_string()),
+            WatchOp::Put("old/b.txt".to_string()),
+            WatchOp::Rename { old: "old".to_string(), new: "new".to_string() },
+        ];
+        let out = coalesce_watch_ops(ops, &sync);
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            WatchOp::Put(rel) => assert_eq!(rel, "new/sub/a.txt"),
+            other => panic!("expected Put(new/sub/a.txt), got {:?}", other),
+        }
+        match &out[1] {
+            WatchOp::Put(rel) => assert_eq!(rel, "new/b.txt"),
+            other => panic!("expected Put(new/b.txt), got {:?}", other),
+        }
     }
 }

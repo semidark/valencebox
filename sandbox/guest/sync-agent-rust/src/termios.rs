@@ -37,11 +37,7 @@ const CS8: u32 = 0x30;
 const VTIME: usize = 5;
 const VMIN: usize = 6;
 
-#[cfg(target_pointer_width = "64")]
-fn ioctl_req(v: libc::c_int) -> u64 { v as u64 }
-
-#[cfg(not(target_pointer_width = "64"))]
-fn ioctl_req(v: libc::c_int) -> i32 { v }
+fn ioctl_req(v: libc::c_int) -> libc::c_int { v }
 
 pub fn set_raw(fd: std::fs::File) -> std::io::Result<()> {
     let raw_fd = fd.as_raw_fd();

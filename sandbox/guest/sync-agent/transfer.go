@@ -61,7 +61,7 @@ func NewReceiver(root string, fw *FrameWriter, ss *SyncState) *Receiver {
 		trees: map[uint32]*incomingTree{}, sync: ss, verify: true}
 }
 
-// NewReceiverNoVerify skips the sha256 read-back pass on completed files.
+// NewReceiverNoVerify skips the blake2s-256 read-back pass on completed files.
 // Used on the data plane: every frame is CRC32-checked on top of TCP
 // checksums, and the extra full pass over each file costs real time on the
 // emulated CPU.

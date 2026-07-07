@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -9,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/crypto/blake2s"
 )
 
 type FileMeta struct {
@@ -41,7 +42,7 @@ func hashFile(p string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
-	h := sha256.New()
+	h, _ := blake2s.New256(nil)
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
