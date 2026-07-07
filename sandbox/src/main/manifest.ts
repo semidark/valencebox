@@ -1,6 +1,6 @@
-import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import { blake2sInit, blake2sUpdate, blake2sFinal } from "blakejs";
 import { FileMeta, ManifestPayload, MAX_PAYLOAD } from "../shared/protocol";
 
 export const TMP_DIR_NAME = ".sync-tmp";
@@ -22,19 +22,19 @@ export function isIgnored(rel: string): boolean {
 }
 
 export function hashFileSync(p: string): string {
-  const h = crypto.createHash("blake2s256");
+  const ctx = blake2sInit(32);
   const fd = fs.openSync(p, "r");
   try {
     const buf = Buffer.alloc(256 * 1024);
     for (;;) {
       const n = fs.readSync(fd, buf, 0, buf.length, null);
       if (n <= 0) break;
-      h.update(buf.subarray(0, n));
+      blake2sUpdate(ctx, Uint8Array.prototype.slice.call(buf, 0, n));
     }
   } finally {
     fs.closeSync(fd);
   }
-  return h.digest("hex");
+  return Buffer.from(blake2sFinal(ctx)).toString("hex");
 }
 
 export function buildManifest(root: string): ManifestPayload {

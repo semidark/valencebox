@@ -1,11 +1,11 @@
 // SyncManager: host side of the bidirectional /workspace sync.
 // Canonical store = host directory. See PROTOCOL.md for wire semantics.
 import { EventEmitter } from "events";
-import * as crypto from "crypto";
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as path from "path";
 import * as chokidar from "chokidar";
+import { blake2sHex } from "blakejs";
 import {
   CHUNK_SIZE,
   Frame,
@@ -432,7 +432,7 @@ export class SyncManager extends EventEmitter {
       } catch {
         continue; // raced deletion
       }
-      const hash = crypto.createHash("blake2s256").update(data).digest("hex");
+      const hash = blake2sHex(Uint8Array.prototype.slice.call(data));
       parts.push(
         encodeTreeEntry(
           {

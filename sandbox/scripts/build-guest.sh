@@ -24,6 +24,7 @@ done
 
 echo "==> building sync-agent (Rust, i686-unknown-linux-musl, inside Docker)"
 docker run --rm \
+  --platform=linux/amd64 \
   -v "$PWD/guest/sync-agent-rust:/src" \
   -v "$PWD/guest:/output" \
   rust:alpine \
