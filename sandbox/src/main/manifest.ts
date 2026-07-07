@@ -5,7 +5,7 @@ import { FileMeta, ManifestPayload, MAX_PAYLOAD } from "../shared/protocol";
 
 export const TMP_DIR_NAME = ".sync-tmp";
 
-// Never synced, at any depth. Mirrors guest/sync-agent/manifest.go.
+// Never synced, at any depth. Mirrors guest/sync-agent-rust/src/manifest.rs.
 // node_modules: host-native binaries are useless in the i386 Linux guest
 // (install inside the guest instead); .git: history isn't workspace content.
 export const IGNORE_SEGMENTS = new Set([

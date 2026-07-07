@@ -21,7 +21,7 @@ graph TB
     end
 
     subgraph Guest["Alpine Guest (32-bit, inside v86 WASM)"]
-        Agent["sync-agent (Go)"]
+        Agent["sync-agent (Rust)"]
         WS[("/workspace<br/>ext4 disk image")]
         Eth["eth0 (virtio-net)"]
         Hvc["/dev/hvc0 (virtio-console)"]
