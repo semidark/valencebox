@@ -1,7 +1,7 @@
 // Plain browser script (no imports/exports) so tsc emits no CommonJS wrapper.
 // Terminal + FitAddon come from the xterm.js UMD bundles loaded before this
 // script (globals: window.Terminal, window.FitAddon.FitAddon).
-interface RSyncStats { pushed: number; pulled: number; deleted: number; conflicts: number; bytesOut: number; bytesIn: number; }
+interface RSyncStats { pushed: number; pulled: number; deleted: number; conflicts: number; bytesOut: number; bytesIn: number; throughput?: { out: number; in: number }; }
 interface RStatus {
   phase: string;
   bootMs?: number;
@@ -93,6 +93,17 @@ function render(s: RStatus) {
     $("pulled").textContent = String(s.sync.pulled);
     $("deleted").textContent = String(s.sync.deleted);
     $("conflicts-n").textContent = String(s.sync.conflicts);
+    if (s.sync.throughput) {
+      const fmt = (v: number) =>
+        v >= 1_000_000
+          ? (v / 1_000_000).toFixed(1) + " MB/s"
+          : v >= 1_000
+            ? (v / 1_000).toFixed(1) + " KB/s"
+            : v + " B/s";
+      $("sync-speed").textContent = `↑${fmt(s.sync.throughput.out)} ↓${fmt(s.sync.throughput.in)}`;
+    } else {
+      $("sync-speed").textContent = "–";
+    }
   }
   $("net").textContent = s.net
     ? `${s.net.policyHosts.length} hosts${s.net.dataPlane ? " +dp" : ""}`

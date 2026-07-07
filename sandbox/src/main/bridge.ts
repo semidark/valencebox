@@ -111,10 +111,18 @@ export class FrameChannel extends EventEmitter {
 export class HostBridge extends FrameChannel {
   /** extra fields merged into HELLO / hello-ACK payloads (data-plane advert) */
   helloExtra: Record<string, unknown> = {};
+  /** Cached guest HELLO frame — resolves waitGuestHello even if HELLO arrived before listener. */
+  private lastGuestHello: Frame | null = null;
 
   constructor(vm: SandboxVM) {
     super((buf) => vm.virtioConsoleWrite(buf));
     vm.onVirtioConsole((data) => this.feed(data));
+    // Cache every HELLO frame so waitGuestHello is sticky.
+    this.on("frame", (f: Frame) => {
+      if (f.type === FrameType.HELLO) {
+        this.lastGuestHello = f;
+      }
+    });
   }
 
   hello(): Promise<Frame> {
@@ -126,12 +134,25 @@ export class HostBridge extends FrameChannel {
 
   /** Resolves when the guest agent announces itself. */
   waitGuestHello(timeoutMs = 120000): Promise<Frame> {
+    // If a HELLO frame was already received, resolve immediately.
+    const cached = this.lastGuestHello;
+    if (cached) {
+      this.lastGuestHello = null;
+      // acknowledge the cached hello
+      this.send(
+        FrameType.ACK,
+        Buffer.from(JSON.stringify({ ack: cached.seq, role: "host", ...this.helloExtra }))
+      );
+      return Promise.resolve(cached);
+    }
+
     return new Promise((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error("timeout waiting for guest HELLO")),
         timeoutMs
       );
-      this.once(`frame:${FrameType.HELLO}`, (f: Frame) => {
+      const handler = (f: Frame) => {
+        this.off(`frame:${FrameType.HELLO}`, handler);
         clearTimeout(timer);
         // acknowledge the guest's hello (and advertise the data plane)
         this.send(
@@ -139,7 +160,8 @@ export class HostBridge extends FrameChannel {
           Buffer.from(JSON.stringify({ ack: f.seq, role: "host", ...this.helloExtra }))
         );
         resolve(f);
-      });
+      };
+      this.on(`frame:${FrameType.HELLO}`, handler);
     });
   }
 }

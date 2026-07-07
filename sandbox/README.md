@@ -74,7 +74,7 @@ flowchart TB
 - `HostBridge` is the low-latency control path carrying the framed protocol from `PROTOCOL.md`.
 - `DataPlane` is the token-gated bulk-transfer path over the guest's virtio-net/WISP route, usually ~2-5x faster than the console.
 - `SyncManager` owns manifest diffing, chunked transfer, and LWW conflict handling.
-- `sync-agent` is a static Go/i386 guest agent that watches `/workspace` and applies transfers.
+- `sync-agent` is a static Rust/i686 guest agent that watches `/workspace` and applies transfers.
 - `WispServer + DoH` is the guest's sole allowlisted egress path.
 
 Full walkthrough with diagrams (why two channels, how the data-plane VIP
@@ -86,7 +86,7 @@ trick works, why small files get batched):
 | File | Role |
 |------|------|
 | `guest/Dockerfile` | 32-bit Alpine: kernel (legacy modules stripped), bash login, OpenRC services |
-| `guest/sync-agent/` | Go sync agent (framing, manifest, chunked transfer, inotify, LWW) |
+| `guest/sync-agent-rust/` | Rust sync agent (framing, manifest, chunked transfer, inotify, LWW) |
 | `guest/rootfs/` | `/workspace` mount + sync-agent + networking OpenRC services |
 | `src/shared/protocol.ts` | framed protocol (mirrors the Go side) |
 | `src/main/vm.ts` | headless v86 wrapper; **paced** virtio-console writer |
@@ -102,12 +102,12 @@ trick works, why small files get batched):
 
 ```sh
 npm install
-npm run images   # sync-agent (Go/386) → docker guest → ext4 disks + kernel
+npm run images   # sync-agent (Rust, i686-unknown-linux-musl) → docker guest → ext4 disks + kernel
 npm run build    # compile TS → dist/
 npm start        # launch the Electron app
 ```
 
-`npm run images` requires Docker (for the 32-bit Alpine build) and Go.
+`npm run images` requires Docker (for the 32-bit Alpine build).
 
 ### Pointing `/workspace` at your own project
 

@@ -1,0 +1,21 @@
+[package]
+name = "sync-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crc32fast = "1"
+blake2 = "0.10"
+walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+filetime = "0.2"
+
+[[bin]]
+name = "sync-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "blake2sum"
+path = "src/bin/blake2sum.rs"
