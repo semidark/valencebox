@@ -1,11 +1,11 @@
 // SyncManager: host side of the bidirectional /workspace sync.
 // Canonical store = host directory. See PROTOCOL.md for wire semantics.
 import { EventEmitter } from "events";
-import * as crypto from "crypto";
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as path from "path";
 import * as chokidar from "chokidar";
+import { blake2sHex } from "blakejs";
 import {
   CHUNK_SIZE,
   Frame,
@@ -48,6 +48,11 @@ export interface SyncStats {
   bytesIn: number;
 }
 
+export interface SyncThroughput {
+  out: number; // bytes/sec host→guest
+  in: number;  // bytes/sec guest→host
+}
+
 const WINDOW = 32;
 const ACK_EVERY = 16;
 // data-plane flow control is byte-based (transport queue depth), so its
@@ -59,6 +64,17 @@ const HIGH_WATER = 4 * 1024 * 1024;
 // otherwise dominate many-small-file syncs
 const SMALL_FILE_LIMIT = 256 * 1024;
 const TREE_BATCH_BYTES = 2 * 1024 * 1024;
+const WATCH_SUPPRESS_TTL_MS = 5000;
+const WATCH_ADD = 1 << 0;
+const WATCH_CHANGE = 1 << 1;
+const WATCH_UNLINK = 1 << 2;
+const WATCH_ADD_DIR = 1 << 3;
+const WATCH_UNLINK_DIR = 1 << 4;
+
+interface WatchSuppression {
+  kinds: number;
+  expiresAt: number;
+}
 
 export class SyncManager extends EventEmitter {
   private lastSync = new Map<string, string>(); // rel → hash at last sync
@@ -69,8 +85,13 @@ export class SyncManager extends EventEmitter {
   private flushTimer?: NodeJS.Timeout;
   private pushChain: Promise<void> = Promise.resolve();
   private guestManifest?: ManifestPayload;
+  private watchSuppress = new Map<string, WatchSuppression>();
   stats: SyncStats = { pushed: 0, pulled: 0, deleted: 0, conflicts: 0, bytesOut: 0, bytesIn: 0 };
   conflicts: ConflictRecord[] = [];
+  syncThroughput: SyncThroughput = { out: 0, in: 0 };
+  private lastBytesOut = 0;
+  private lastBytesIn = 0;
+  private throughputTimer?: NodeJS.Timeout;
 
   private dataCh?: FrameChannel;
 
@@ -106,6 +127,116 @@ export class SyncManager extends EventEmitter {
     return this.dataCh ?? this.bridge;
   }
 
+  private relPath(abs: string): string {
+    return path.relative(this.hostDir, abs).split(path.sep).join("/");
+  }
+
+  private cleanupWatchSuppressions(now = Date.now()): void {
+    for (const [rel, entry] of this.watchSuppress) {
+      if (entry.expiresAt <= now) this.watchSuppress.delete(rel);
+    }
+  }
+
+  private suppressWatch(rel: string, kinds: number, ttlMs = WATCH_SUPPRESS_TTL_MS): void {
+    if (!rel || rel.startsWith("..")) return;
+    const now = Date.now();
+    this.cleanupWatchSuppressions(now);
+    const prev = this.watchSuppress.get(rel);
+    this.watchSuppress.set(rel, {
+      kinds: (prev?.kinds ?? 0) | kinds,
+      expiresAt: Math.max(prev?.expiresAt ?? 0, now + ttlMs),
+    });
+  }
+
+  private consumeWatchSuppression(rel: string, kind: number): boolean {
+    if (!rel || rel.startsWith("..")) return false;
+    const now = Date.now();
+    const entry = this.watchSuppress.get(rel);
+    if (!entry) return false;
+    if (entry.expiresAt <= now) {
+      this.watchSuppress.delete(rel);
+      return false;
+    }
+    if ((entry.kinds & kind) === 0) return false;
+    // Consume the whole entry on the first matching event. This is enough to
+    // suppress the expensive remote replay paths without hiding later real edits.
+    this.watchSuppress.delete(rel);
+    return true;
+  }
+
+  private ancestorDirs(rel: string): string[] {
+    const out: string[] = [];
+    let dir = path.posix.dirname(rel);
+    while (dir && dir !== ".") {
+      out.push(dir);
+      dir = path.posix.dirname(dir);
+    }
+    return out;
+  }
+
+  private knownFilesUnder(prefix: string): string[] {
+    const files: string[] = [];
+    const dirPrefix = `${prefix}/`;
+    for (const rel of this.lastSync.keys()) {
+      if (rel === prefix || rel.startsWith(dirPrefix)) files.push(rel);
+    }
+    return files;
+  }
+
+  private deleteLastSyncPrefix(prefix: string): void {
+    for (const rel of this.knownFilesUnder(prefix)) this.lastSync.delete(rel);
+    this.lastSync.delete(prefix);
+  }
+
+  private knownDirsUnder(prefix: string, files: string[], includeRoot: boolean): string[] {
+    const dirs = new Set<string>();
+    if (includeRoot && prefix) dirs.add(prefix);
+    const dirPrefix = `${prefix}/`;
+    for (const rel of files) {
+      let dir = path.posix.dirname(rel);
+      while (dir && dir !== "." && (dir === prefix || dir.startsWith(dirPrefix))) {
+        dirs.add(dir);
+        if (dir === prefix) break;
+        dir = path.posix.dirname(dir);
+      }
+    }
+    return [...dirs];
+  }
+
+  private mapPrefix(rel: string, oldRoot: string, newRoot: string): string {
+    return rel === oldRoot ? newRoot : newRoot + rel.slice(oldRoot.length);
+  }
+
+  private suppressRemotePut(rel: string): void {
+    this.suppressWatch(rel, WATCH_ADD | WATCH_CHANGE);
+    for (const dir of this.ancestorDirs(rel)) this.suppressWatch(dir, WATCH_ADD_DIR);
+  }
+
+  private suppressRemoteDelete(rel: string, isDir: boolean): void {
+    const files = this.knownFilesUnder(rel);
+    for (const file of files) this.suppressWatch(file, WATCH_UNLINK);
+    if (!isDir && files.length === 0) this.suppressWatch(rel, WATCH_UNLINK);
+    for (const dir of this.knownDirsUnder(rel, files, isDir)) {
+      this.suppressWatch(dir, WATCH_UNLINK_DIR);
+    }
+  }
+
+  private suppressRemoteRename(oldRel: string, newRel: string, isDir: boolean): void {
+    const oldFiles = this.knownFilesUnder(oldRel);
+    const newFiles = oldFiles.map((rel) => this.mapPrefix(rel, oldRel, newRel));
+    for (const rel of oldFiles) this.suppressWatch(rel, WATCH_UNLINK);
+    for (const rel of newFiles) this.suppressWatch(rel, WATCH_ADD | WATCH_CHANGE);
+    if (!isDir && oldFiles.length === 0) {
+      this.suppressWatch(oldRel, WATCH_UNLINK);
+      this.suppressWatch(newRel, WATCH_ADD | WATCH_CHANGE);
+    }
+    const oldDirs = this.knownDirsUnder(oldRel, oldFiles, isDir);
+    const newDirs = oldDirs.map((rel) => this.mapPrefix(rel, oldRel, newRel));
+    for (const rel of oldDirs) this.suppressWatch(rel, WATCH_UNLINK_DIR);
+    for (const rel of newDirs) this.suppressWatch(rel, WATCH_ADD_DIR);
+    for (const dir of this.ancestorDirs(newRel)) this.suppressWatch(dir, WATCH_ADD_DIR);
+  }
+
   private wireChannel(ch: FrameChannel): void {
     ch.on(`frame:${FrameType.MANIFEST}`, (f: Frame) => {
       // manifests arrive as one or more parts (see splitManifest) — merge
@@ -124,6 +255,7 @@ export class SyncManager extends EventEmitter {
     ch.on(`frame:${FrameType.FILE_PUT}`, (f: Frame) => void this.handlePut(ch, f));
     ch.on(`frame:${FrameType.FILE_CHUNK}`, (f: Frame) => void this.handleChunk(ch, f));
     ch.on(`frame:${FrameType.FILE_DEL}`, (f: Frame) => void this.handleDel(ch, f));
+    ch.on(`frame:${FrameType.FILE_RENAME}`, (f: Frame) => void this.handleRename(ch, f));
     ch.on(`frame:${FrameType.EVENT}`, (f: Frame) => {
       try {
         const body = JSON.parse(f.payload.toString("utf8"));
@@ -143,7 +275,21 @@ export class SyncManager extends EventEmitter {
    * Initial hydrate: host is canonical. Pushes files whose content differs,
    * deletes guest-only files, then starts the host watcher.
    */
+  private startThroughputTimer(): void {
+    this.lastBytesOut = this.stats.bytesOut;
+    this.lastBytesIn = this.stats.bytesIn;
+    this.throughputTimer = setInterval(() => {
+      const deltaOut = this.stats.bytesOut - this.lastBytesOut;
+      const deltaIn = this.stats.bytesIn - this.lastBytesIn;
+      this.syncThroughput = { out: deltaOut, in: deltaIn };
+      this.lastBytesOut = this.stats.bytesOut;
+      this.lastBytesIn = this.stats.bytesIn;
+      this.emit("throughput", this.syncThroughput);
+    }, 1000);
+  }
+
   async hydrate(): Promise<void> {
+    this.startThroughputTimer();
     const guest = this.guestManifest ?? { files: {} };
     const host = buildManifest(this.hostDir);
     const toPush: string[] = [];
@@ -221,19 +367,41 @@ export class SyncManager extends EventEmitter {
       awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 50 },
     });
     this.watcher
-      .on("add", (p) => this.enqueueLocal(p, "put"))
-      .on("change", (p) => this.enqueueLocal(p, "put"))
-      .on("unlink", (p) => this.enqueueLocal(p, "del"))
-      .on("unlinkDir", (p) => this.enqueueLocal(p, "del"));
+      .on("add", (p) => {
+        const rel = this.relPath(p);
+        if (!this.consumeWatchSuppression(rel, WATCH_ADD)) this.enqueueLocal(p, "put");
+      })
+      .on("change", (p) => {
+        const rel = this.relPath(p);
+        if (!this.consumeWatchSuppression(rel, WATCH_CHANGE)) this.enqueueLocal(p, "put");
+      })
+      .on("unlink", (p) => {
+        const rel = this.relPath(p);
+        if (!this.consumeWatchSuppression(rel, WATCH_UNLINK)) this.enqueueLocal(p, "del");
+      })
+      .on("unlinkDir", (p) => {
+        const rel = this.relPath(p);
+        if (!this.consumeWatchSuppression(rel, WATCH_UNLINK_DIR)) this.enqueueLocal(p, "del");
+      })
+      .on("addDir", (p) => {
+        const rel = this.relPath(p);
+        if (this.consumeWatchSuppression(rel, WATCH_ADD_DIR)) return;
+        if (!isIgnored(rel)) {
+          for (const [childRel] of Object.entries(buildManifest(p).files)) {
+            if (!isIgnored(childRel)) this.enqueueLocal(path.join(p, childRel), "put");
+          }
+        }
+      });
   }
 
   async stop(): Promise<void> {
+    if (this.throughputTimer) clearInterval(this.throughputTimer);
     await this.watcher?.close();
     if (this.flushTimer) clearTimeout(this.flushTimer);
   }
 
   private enqueueLocal(abs: string, op: "put" | "del"): void {
-    const rel = path.relative(this.hostDir, abs).split(path.sep).join("/");
+    const rel = this.relPath(abs);
     if (!rel || rel.startsWith("..")) return;
     this.pendingLocal.set(rel, op);
     if (this.flushTimer) clearTimeout(this.flushTimer);
@@ -408,7 +576,7 @@ export class SyncManager extends EventEmitter {
       } catch {
         continue; // raced deletion
       }
-      const hash = crypto.createHash("sha256").update(data).digest("hex");
+      const hash = blake2sHex(Uint8Array.prototype.slice.call(data));
       parts.push(
         encodeTreeEntry(
           {
@@ -488,7 +656,7 @@ export class SyncManager extends EventEmitter {
 
   async pushDelete(rel: string): Promise<void> {
     await this.txChannel().request(FrameType.FILE_DEL, Buffer.from(JSON.stringify({ path: rel })));
-    this.lastSync.delete(rel);
+    this.deleteLastSyncPrefix(rel);
     this.stats.deleted++;
     this.emit("deleted", rel);
   }
@@ -557,6 +725,7 @@ export class SyncManager extends EventEmitter {
       return this.abortIncoming(seq, inc, `hash mismatch: got ${gotHash}`);
     }
     const abs = safeJoin(this.hostDir, inc.meta.path)!;
+    this.suppressRemotePut(inc.meta.path);
     await fsp.chmod(inc.tmpPath, inc.meta.mode).catch(() => {});
     const mt = new Date(inc.meta.mtimeMs);
     await fsp.utimes(inc.tmpPath, mt, mt).catch(() => {});
@@ -585,10 +754,52 @@ export class SyncManager extends EventEmitter {
     const abs = safeJoin(this.hostDir, body.path);
     if (!abs) return this.nak(ch, f.seq, "illegal path");
     if (isIgnored(body.path)) return this.ack(ch, f.seq); // never synced, nothing to do
+    const isDir = await fsp.stat(abs).then((st) => st.isDirectory()).catch(() => false);
+    this.suppressRemoteDelete(body.path, isDir);
     await fsp.rm(abs, { recursive: true, force: true });
-    this.lastSync.delete(body.path);
+    this.deleteLastSyncPrefix(body.path);
     this.stats.deleted++;
     this.emit("deleted", body.path);
+    this.ack(ch, f.seq);
+  }
+
+  private async handleRename(ch: FrameChannel, f: Frame): Promise<void> {
+    let body: { oldPath: string; newPath: string };
+    try {
+      body = JSON.parse(f.payload.toString("utf8"));
+    } catch {
+      return this.nak(ch, f.seq, "bad FILE_RENAME json");
+    }
+    const srcAbs = safeJoin(this.hostDir, body.oldPath);
+    const dstAbs = safeJoin(this.hostDir, body.newPath);
+    if (!srcAbs || !dstAbs) return this.nak(ch, f.seq, "illegal path");
+    if (isIgnored(body.oldPath) || isIgnored(body.newPath))
+      return this.ack(ch, f.seq);
+
+    const isDir = await fsp.stat(srcAbs).then((st) => st.isDirectory()).catch(() => false);
+    this.suppressRemoteRename(body.oldPath, body.newPath, isDir);
+
+    // Ensure destination parent exists
+    await fsp.mkdir(path.dirname(dstAbs), { recursive: true }).catch(() => {});
+    try {
+      await fsp.rename(srcAbs, dstAbs);
+    } catch (e: any) {
+      return this.nak(ch, f.seq, `rename failed: ${e.message}`);
+    }
+
+    // Remap lastSync: any known entry under the old path moves to the new path
+    const remappedKeys: string[] = [];
+    for (const [rel, hash] of this.lastSync) {
+      if (rel === body.oldPath || rel.startsWith(body.oldPath + "/")) {
+        remappedKeys.push(rel);
+      }
+    }
+    for (const oldRel of remappedKeys) {
+      const h = this.lastSync.get(oldRel)!;
+      this.lastSync.delete(oldRel);
+      const newRel = body.newPath + oldRel.slice(body.oldPath.length);
+      this.lastSync.set(newRel, h);
+    }
     this.ack(ch, f.seq);
   }
 

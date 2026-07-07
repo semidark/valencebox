@@ -12,12 +12,12 @@ git submodule update --init                  # fetch env86 submodule
 make -C env86 all                            # build v86 assets (Go + Docker required, slow first time)
 cd sandbox
 npm install
-npm run images                               # build guest (sync-agent, Alpine 3.18.6, ext4 disks + kernel)
+npm run images                               # build guest (sync-agent Rust, Alpine 3.18.6, ext4 disks + kernel)
 npm run build
 npm start                                    # launch Electron app
 ```
 
-- `npm run images` requires **Docker** and **Go**. Builds Go sync-agent as `GOOS=linux GOARCH=386 CGO_ENABLED=0`, spins up `--platform=linux/386` Alpine, extracts kernel/initramfs, generates two ext4 disks. Outputs are gitignored; regenerate rather than commit.
+- `npm run images` builds Rust sync-agent targeting `i686-unknown-linux-musl`, spins up `--platform=linux/386` Alpine, extracts kernel/initramfs, generates two ext4 disks. Outputs are gitignored; regenerate rather than commit.
 
 ## Build
 
@@ -34,8 +34,8 @@ npm start                                    # launch Electron app
 
 ## Cross-cutting constraints (easy to break)
 
-- **Everything is 32-bit x86**: guest is Alpine **pinned to 3.18.6** (newer `mkinitfs` breaks boot); Go agent must stay `GOARCH=386`.
-- `src/shared/protocol.ts` mirrors `guest/sync-agent/frame.go` framing — **change both together**; 256 KiB frame cap.
+- **Everything is 32-bit x86**: guest is Alpine **pinned to 3.18.6** (newer `mkinitfs` breaks boot); Rust agent must target `i686-unknown-linux-musl`.
+- `src/shared/protocol.ts` mirrors `guest/sync-agent-rust/src/frame.rs` framing — **change both together**; 256 KiB frame cap.
 - Disks are IDE (`/dev/sda|sdb`), not virtio-blk. Guest detects mount point via `blkid`.
 - `src/main/vm.ts` virtio-console writer is deliberately **paced** (<4 KiB slices, waits for free RX descriptor) — do not "optimize" it; v86 silently drops bytes if the ring is full.
 - Security invariants (no live host mount, DNS-gate + IP-pin egress allowlist) live in `HARDENING.md`. Preserve when touching `sync-manager.ts`, `wisp.ts`, `doh.ts`, `data-plane.ts`.

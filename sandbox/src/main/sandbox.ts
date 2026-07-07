@@ -92,6 +92,7 @@ export class Sandbox extends EventEmitter {
     this.sync.on("pushed", () => this.snapshots.markActivity());
     this.sync.on("pulled", () => this.snapshots.markActivity());
     this.sync.on("hydrated", () => this.pushStatus());
+    this.sync.on("throughput", () => this.pushStatus());
     this.dataPlane?.on("channel", (ch) => {
       this.sync.attachDataChannel(ch);
       this.emit("log", "data plane connected (bulk sync over virtio-net TCP)");
@@ -225,7 +226,7 @@ export class Sandbox extends EventEmitter {
 
   private pushStatus(): void {
     this.setStatus({
-      sync: { ...this.sync.stats },
+      sync: { ...this.sync.stats, throughput: { ...this.sync.syncThroughput } },
       net: this.wisp
         ? {
             relayUrl: this.wisp.relayUrl,

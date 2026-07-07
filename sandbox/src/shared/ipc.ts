@@ -12,6 +12,7 @@ export interface SandboxStatus {
     conflicts: number;
     bytesOut: number;
     bytesIn: number;
+    throughput?: { out: number; in: number };
   };
   snapshot?: { at: number; compressedBytes: number } | null;
   error?: string;

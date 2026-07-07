@@ -12,7 +12,7 @@ automated check or the code that enforces it.
       `/workspace` is `/dev/{sd,hd,vd}b … type ext4`; there is no `-fs`/9p
       device in `vm.ts`.
 - [x] **Guest cannot read arbitrary host paths.** `safeJoin` (host
-      `manifest.ts`, guest `manifest.go`) rejects absolute paths and `..`
+      `manifest.ts`, guest `manifest.rs`) rejects absolute paths and `..`
       escapes on every FILE_PUT/FILE_DEL. Sync is confined to `hostDir`.
 - [x] **Renderer is sandboxed from Node.** `contextIsolation: true`,
       `nodeIntegration: false`; the renderer touches the system only through
