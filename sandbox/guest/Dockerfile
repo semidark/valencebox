@@ -55,15 +55,11 @@ RUN echo "root:$PASSWORD" | chpasswd && \
 RUN printf 'virtio_console\nvirtio_net\n' >> /etc/modules
 
 # Services: workspace mount + sync agent + eth0 DHCP
-ARG AGENT=rust
 COPY rootfs/ /
 COPY sync-agent.bin /usr/local/bin/sync-agent
 COPY blake2sum.bin /usr/local/bin/blake2sum
-RUN if [ "$AGENT" = "go" ]; then \
-      chmod +x /etc/init.d/workspace /etc/init.d/sync-agent /usr/local/bin/sync-agent; \
-    else \
-      chmod +x /etc/init.d/workspace /etc/init.d/sync-agent /usr/local/bin/sync-agent /usr/local/bin/blake2sum; \
-    fi
+RUN chmod +x /etc/init.d/workspace /etc/init.d/sync-agent \
+    /usr/local/bin/sync-agent /usr/local/bin/blake2sum
 
 RUN for i in devfs dmesg mdev hwdrivers; do rc-update add $i sysinit; done && \
     for i in hwclock modules sysctl hostname bootmisc; do rc-update add $i boot; done && \

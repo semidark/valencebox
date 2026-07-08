@@ -6,9 +6,13 @@ dist/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
+# v86 build output (regenerate: ./scripts/build-v86.sh)
+/build/
+
 # sandbox app build artifacts (regenerate: npm run images && npm run build)
 sandbox/images/
 sandbox/guest/sync-agent.bin
+sandbox/guest/blake2sum.bin
 sandbox/assets/v86/
 sandbox/snapshots/
 sandbox/workspace/

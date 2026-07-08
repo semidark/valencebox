@@ -3,13 +3,13 @@
 ## Repo shape
 
 - **Product** is entirely in `sandbox/` (TypeScript/Electron). Root has no manifests; `cd sandbox` for all dev work.
-- `env86/` is a git submodule used **only to extract build-time v86 assets** (`libv86.js`, `v86.wasm`, `seabios.bin`, `vgabios.bin`). Do not edit `env86/` to change product behavior.
+- `v86/` is a git submodule pointing at [`semidark/v86`](https://github.com/semidark/v86), a fork of `copy/v86` used **only to build v86 assets** (`libv86.js`, `v86.wasm`, `seabios.bin`, `vgabios.bin`). The fork carries one patch on top of upstream: a bound on `AsyncXHRBuffer`'s disk `block_cache` (opt-in `max_cache_bytes`), fixing unbounded host memory growth from cumulative guest disk I/O — see [semidark/v86#1](https://github.com/semidark/v86/pull/1). Do not edit `v86/` locally to change product behavior; patches belong in the fork.
 
 ## Bootstrap (order matters)
 
 ```sh
-git submodule update --init                  # fetch env86 submodule
-make -C env86 all                            # build v86 assets (Go + Docker required, slow first time)
+git submodule update --init                  # fetch the v86 submodule
+./scripts/build-v86.sh                       # build v86 assets (Docker required, slow first time)
 cd sandbox
 npm install
 npm run images                               # build guest (sync-agent Rust, Alpine 3.18.6, ext4 disks + kernel)
@@ -17,6 +17,7 @@ npm run build
 npm start                                    # launch Electron app
 ```
 
+- `./scripts/build-v86.sh` builds the pinned `v86/` submodule (Closure Compiler + Rust/wasm32, via Docker) into `build/v86/`; `npm run images` copies those four assets into `sandbox/assets/v86/`.
 - `npm run images` builds Rust sync-agent targeting `i686-unknown-linux-musl`, spins up `--platform=linux/386` Alpine, extracts kernel/initramfs, generates two ext4 disks. Outputs are gitignored; regenerate rather than commit.
 
 ## Build
@@ -38,6 +39,7 @@ npm start                                    # launch Electron app
 - `src/shared/protocol.ts` mirrors `guest/sync-agent-rust/src/frame.rs` framing — **change both together**; 256 KiB frame cap.
 - Disks are IDE (`/dev/sda|sdb`), not virtio-blk. Guest detects mount point via `blkid`.
 - `src/main/vm.ts` virtio-console writer is deliberately **paced** (<4 KiB slices, waits for free RX descriptor) — do not "optimize" it; v86 silently drops bytes if the ring is full.
+- `hda`/`hdb` are configured with `max_cache_bytes` (see `src/main/vm.ts`) to bound v86's disk `block_cache`, and `SandboxVM.flushDisks()` is called after hydration and in `SnapshotManager.save()` to proactively reclaim it — without this, host RAM grows unboundedly with cumulative guest disk I/O (see `v86/` fork patch above).
 - Security invariants (no live host mount, DNS-gate + IP-pin egress allowlist) live in `HARDENING.md`. Preserve when touching `sync-manager.ts`, `wisp.ts`, `doh.ts`, `data-plane.ts`.
 
 ## Workspace sync
