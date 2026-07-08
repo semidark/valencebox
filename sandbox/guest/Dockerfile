@@ -1,7 +1,14 @@
-# Minimal 32-bit Alpine guest for the v86 sandbox (v86 emulates 32-bit x86
-# only). Root fs becomes an ext4 disk image (hda); /workspace is a second
-# ext4 disk (hdb). Alpine 3.22.5 — nlplug-findfs (mkinitfs) links only
-# libkmod/libblkid/libcryptsetup, no OpenSSL issue as in 3.19-era edge.
+# ── Stage 1: Build rust-agent natively on 32-bit Alpine ──
+FROM i386/alpine:3.22.5 AS agent-builder
+RUN apk add --no-cache build-base cargo rust
+WORKDIR /app
+COPY rust-agent/Cargo.toml rust-agent/Cargo.lock ./
+RUN mkdir src && printf 'fn main() {}\n' > src/main.rs
+RUN cargo build --release --locked
+COPY rust-agent/src ./src
+RUN touch src/main.rs && cargo build --release --locked
+
+# ── Stage 2: 32-bit Alpine guest ──
 FROM i386/alpine:3.22.5
 
 ENV KERNEL=lts
@@ -9,7 +16,10 @@ ENV HOSTNAME=sandbox
 ENV PASSWORD=root
 
 # Userland: busybox base + init, getty, bash, real blkid (util-linux)
-RUN apk add --no-cache openrc alpine-base agetty bash blkid
+RUN apk add --no-cache openrc alpine-base agetty bash blkid curl wget ripgrep
+
+# Runtime deps for the agent binary
+RUN apk add --no-cache ca-certificates libgcc
 
 # mkinitfs from Alpine 3.22; nlplug-findfs links libkmod/libblkid/libcryptsetup
 # (no OpenSSL issue like 3.19-era edge). Feature flags match v86 IDE disks.
@@ -59,8 +69,9 @@ RUN printf 'virtio_console\nvirtio_net\n' >> /etc/modules
 COPY rootfs/ /
 COPY sync-agent.bin /usr/local/bin/sync-agent
 COPY blake2sum.bin /usr/local/bin/blake2sum
+COPY --from=agent-builder /app/target/release/agent /usr/local/bin/agent
 RUN chmod +x /etc/init.d/workspace /etc/init.d/sync-agent \
-    /usr/local/bin/sync-agent /usr/local/bin/blake2sum
+    /usr/local/bin/sync-agent /usr/local/bin/blake2sum /usr/local/bin/agent
 
 RUN for i in devfs dmesg mdev hwdrivers; do rc-update add $i sysinit; done && \
     for i in hwclock modules sysctl hostname bootmisc; do rc-update add $i boot; done && \
