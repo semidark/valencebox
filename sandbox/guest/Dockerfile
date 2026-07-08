@@ -16,7 +16,16 @@ ENV HOSTNAME=sandbox
 ENV PASSWORD=root
 
 # Userland: busybox base + init, getty, bash, real blkid (util-linux)
-RUN apk add --no-cache openrc alpine-base agetty bash blkid curl wget ripgrep
+RUN apk add --no-cache \
+  openrc \
+  alpine-base \
+  agetty \
+  bash \
+  blkid \
+  curl \
+  wget \
+  ripgrep \
+  file
 
 # Runtime deps for the agent binary
 RUN apk add --no-cache ca-certificates libgcc
