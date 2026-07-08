@@ -12,7 +12,7 @@ git submodule update --init                  # fetch the v86 submodule
 ./scripts/build-v86.sh                       # build v86 assets (Docker required, slow first time)
 cd sandbox
 npm install
-npm run images                               # build guest (sync-agent Rust, Alpine 3.18.6, ext4 disks + kernel)
+npm run images                               # build guest (sync-agent Rust, Alpine 3.22.5, ext4 disks + kernel)
 npm run build
 npm start                                    # launch Electron app
 ```
@@ -35,7 +35,7 @@ npm start                                    # launch Electron app
 
 ## Cross-cutting constraints (easy to break)
 
-- **Everything is 32-bit x86**: guest is Alpine **pinned to 3.18.6** (newer `mkinitfs` breaks boot); Rust agent must target `i686-unknown-linux-musl`.
+- **Everything is 32-bit x86**: guest is Alpine **3.22.5** (nlplug-findfs in mkinitfs 3.19-era edge had an OpenSSL crash; 3.22 mkinitfs links only libkmod/libblkid/libcryptsetup); Rust agent must target `i686-unknown-linux-musl`.
 - `src/shared/protocol.ts` mirrors `guest/sync-agent-rust/src/frame.rs` framing — **change both together**; 256 KiB frame cap.
 - Disks are IDE (`/dev/sda|sdb`), not virtio-blk. Guest detects mount point via `blkid`.
 - `src/main/vm.ts` virtio-console writer is deliberately **paced** (<4 KiB slices, waits for free RX descriptor) — do not "optimize" it; v86 silently drops bytes if the ring is full.
