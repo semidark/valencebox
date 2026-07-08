@@ -28,6 +28,10 @@ npm start                                    # launch Electron app
   - Adding renderer deps requires updating `copy-renderer.js` with the exact asset paths
   - No ESLint/Prettier config; match existing code style
 
+## Linux sandbox note
+
+- Electron's `chrome-sandbox` SUID helper requires root ownership + mode `4755`. On dev machines where `sudo chown` is inconvenient, use `npm run start:no-sandbox` instead of `npm start` (adds `--no-sandbox`).
+
 ## Testing
 
 - No umbrella test target. Run individual test suite: `npm run test:unit` (fast, pure); `test:boot|sync|snapshot|net|dataplane|e2e` (VM tests, need `npm run images` built first); `test:ui` (Electron offscreen).
