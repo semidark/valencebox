@@ -63,6 +63,7 @@ Full build, test, and architecture docs live in
 
 ## Why 32-bit Alpine
 
-v86 emulates a **32-bit** x86 CPU only, so the guest is 32-bit Alpine (pinned
-to 3.18.6 — newer mkinitfs breaks boot here). 64-bit guests such as Fedora
+v86 emulates a **32-bit** x86 CPU only, so the guest is 32-bit Alpine
+(3.22.5 — mkinitfs nlplug-findfs in 3.19-era edge had an OpenSSL crash; 3.22
+mkinitfs links only libkmod/libblkid/libcryptsetup). 64-bit guests such as Fedora
 CoreOS cannot run on v86 regardless of build tricks.

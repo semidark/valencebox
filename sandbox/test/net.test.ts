@@ -30,7 +30,7 @@ async function main() {
   // NOTE: exit-code markers are used because the echoed command itself
   // appears in the serial log — `$?` only expands in the output line.
   const allowed = await run(
-    "wget -q -O /tmp/apkindex http://dl-cdn.alpinelinux.org/alpine/v3.18/main/x86/APKINDEX.tar.gz; echo ALLOWED_RC=$?",
+    "wget -q -O /tmp/apkindex http://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86/APKINDEX.tar.gz; echo ALLOWED_RC=$?",
     /ALLOWED_RC=\d+/,
     90000
   );

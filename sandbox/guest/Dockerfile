@@ -1,8 +1,8 @@
 # Minimal 32-bit Alpine guest for the v86 sandbox (v86 emulates 32-bit x86
 # only). Root fs becomes an ext4 disk image (hda); /workspace is a second
-# ext4 disk (hdb). Alpine 3.18.6 pinned: mkinitfs in 3.19+ breaks 9p/edge
-# cases; kernel is Alpine linux-lts with legacy module trees stripped.
-FROM i386/alpine:3.18.6
+# ext4 disk (hdb). Alpine 3.22.5 — nlplug-findfs (mkinitfs) links only
+# libkmod/libblkid/libcryptsetup, no OpenSSL issue as in 3.19-era edge.
+FROM i386/alpine:3.22.5
 
 ENV KERNEL=lts
 ENV HOSTNAME=sandbox
@@ -11,8 +11,8 @@ ENV PASSWORD=root
 # Userland: busybox base + init, getty, bash, real blkid (util-linux)
 RUN apk add --no-cache openrc alpine-base agetty bash blkid
 
-# stock 3.18 mkinitfs (edge mkinitfs links a newer OpenSSL and its
-# nlplug-findfs crashes at boot; the edge version was only needed for 9p root)
+# mkinitfs from Alpine 3.22; nlplug-findfs links libkmod/libblkid/libcryptsetup
+# (no OpenSSL issue like 3.19-era edge). Feature flags match v86 IDE disks.
 RUN apk add --no-cache mkinitfs
 
 # Kernel without firmware blobs
@@ -32,7 +32,8 @@ RUN KREL=$(cat /usr/share/kernel/$KERNEL/kernel.release) && \
            drivers/input/tablet drivers/iio drivers/leds drivers/mmc \
            drivers/mtd drivers/w1 drivers/watchdog drivers/xen \
            drivers/video net/bluetooth net/wireless net/mac80211 \
-           drivers/scsi/aic7xxx drivers/gpio drivers/platform && \
+           drivers/scsi/aic7xxx drivers/gpio drivers/platform \
+           drivers/soc drivers/firmware && \
     depmod $KREL
 
 # Initramfs: ata/ide (v86 IDE disks), ext4 root, virtio
