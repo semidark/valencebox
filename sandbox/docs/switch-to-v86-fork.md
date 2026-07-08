@@ -193,4 +193,33 @@ Change, in `src/buffer.js` (+ a small Node-only addition to `src/lib.js`):
         ~22s the pre-coalescing naive per-block-write version took),
         confirming the coalescing fix holds under real hydration traffic,
         not just the synthetic buffer.js-level test.
-- [ ] Push branch, open PR against `semidark/valencebox`.
+- [x] Pushed branch, opened PR against `semidark/valencebox`:
+      [#4](https://github.com/semidark/valencebox/pull/4).
+- [x] Found and fixed a latent crash bug in the fork before proposing it
+      upstream: `AsyncFileBuffer`/`AsyncXHRPartfileBuffer` share
+      `set()`/`handle_read()` with `AsyncXHRBuffer` via direct prototype
+      assignment (an existing v86 pattern), but the new
+      `touch_cache_entry`/`maybe_schedule_eviction` methods were only
+      ever assigned onto `AsyncXHRBuffer.prototype` — so calling
+      `set()`/`handle_read()` on either of the other two classes threw
+      `TypeError: this.maybe_schedule_eviction is not a function`. Does
+      not affect this product (only `AsyncXHRBuffer` is used for
+      `hda`/`hdb` here, via `url` + `async: true`, no `use_parts`), which
+      is why it wasn't caught earlier. Fixed in the fork (mirrored the
+      missing methods onto both prototypes, added regression coverage
+      that reproduces the exact crash pre-fix), rebuilt + re-tested via
+      Docker.
+- [x] Rebased the fork onto current `copy/v86` master (4 unrelated
+      commits since our fork point: PS2/mouse fixes + a Linux 0.11 test,
+      zero file overlap with `buffer.js`/`lib.js` — clean, conflict-free
+      rebase) and re-authored the 3 patch commits to the `semidark`
+      identity (previously authored under a different local git config)
+      for a clean, consistent history ahead of proposing this upstream.
+- [x] Created a dedicated `upstream/bounded-async-disk-cache` branch off
+      the rebased tip and opened a PR directly against `copy/v86`:
+      [copy/v86#1607](https://github.com/copy/v86/pull/1607).
+- [x] Bumped this repo's `v86` submodule pin from `901003d1` to
+      `45910c12` (the fixed, rebased commit) on `feature/switch-to-v86-fork`
+      / PR #4. Re-verified end-to-end: rebuilt v86 assets, rebuilt guest
+      images, `test:boot` and `test:snapshot` both pass against the
+      updated pin.
