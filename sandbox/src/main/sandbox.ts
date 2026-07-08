@@ -128,6 +128,10 @@ export class Sandbox extends EventEmitter {
       await this.waitAgentReady();
       await this.waitDataPlane();
       await this.sync.hydrate();
+      // Hydration can write the guest's entire synced workspace into hdb in
+      // one pass; proactively flush its disk-cache now instead of waiting
+      // for size-triggered eviction to catch up (see vm.ts flushDisks doc).
+      await this.vm.flushDisks();
     }
 
     this.snapshots.start();
@@ -176,6 +180,7 @@ export class Sandbox extends EventEmitter {
     });
     await this.waitDataPlane();
     await this.sync.hydrate();
+    await this.vm.flushDisks();
   }
 
   private nudgeTerminalAfterRestore(): void {

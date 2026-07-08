@@ -14,6 +14,16 @@ export function imagesDir(): string {
   return path.resolve(__dirname, "..", "..", "images");
 }
 
+// Caps on v86's async-disk block_cache (see semidark/v86#1). Without a
+// bound, every byte ever read or written to hda/hdb accumulates in host
+// RAM for the life of the process — most visibly during workspace
+// hydration, which can write the guest's entire synced project tree into
+// hdb in one pass. hda is boot-time-reads-mostly (root fs never changes at
+// runtime) so a small cache suffices; hdb absorbs ongoing guest writes so
+// gets more headroom while still bounding worst-case growth.
+const HDA_MAX_CACHE_BYTES = 32 * 1024 * 1024;
+const HDB_MAX_CACHE_BYTES = 128 * 1024 * 1024;
+
 export interface VMOptions {
   memoryMB?: number;
   workspaceImage?: string;
@@ -52,12 +62,21 @@ export class SandboxVM {
       cmdline:
         "rw root=/dev/sda rootfstype=ext4 console=ttyS0 " +
         "modules=ata_piix,sd-mod,ext4 tsc=reliable mitigations=off random.trust_cpu=on",
-      // async + fixed_chunk_size → dirty-block tracking keeps save_state small
-      hda: { url: path.join(images, "alpine-root.img"), async: true, fixed_chunk_size: 256 * 1024 },
+      // async + fixed_chunk_size → dirty-block tracking keeps save_state small.
+      // max_cache_bytes bounds the disk block_cache itself (separate from
+      // save_state's dirty-block set) so host RAM doesn't grow unboundedly
+      // with cumulative guest disk I/O — see semidark/v86#1.
+      hda: {
+        url: path.join(images, "alpine-root.img"),
+        async: true,
+        fixed_chunk_size: 256 * 1024,
+        max_cache_bytes: HDA_MAX_CACHE_BYTES,
+      },
       hdb: {
         url: this.opts.workspaceImage ?? path.join(images, "workspace.img"),
         async: true,
         fixed_chunk_size: 256 * 1024,
+        max_cache_bytes: HDB_MAX_CACHE_BYTES,
       },
       virtio_console: true,
       autostart: true,
@@ -194,6 +213,24 @@ export class SandboxVM {
 
   async saveState(): Promise<ArrayBuffer> {
     return await this.emulator.save_state();
+  }
+
+  /**
+   * Proactively write back dirty hda/hdb disk-cache blocks and drop them
+   * from host memory (see semidark/v86#1's AsyncXHRBuffer.flush()). The
+   * cache also self-evicts once it crosses max_cache_bytes, so this is a
+   * best-effort optimization — call it at known-idle points (e.g. right
+   * after hydration finishes) to reclaim memory sooner rather than waiting
+   * for the next write to trigger eviction. Never throws: disk-cache
+   * flushing is a memory optimization, not correctness-critical (data is
+   * never lost either way — see AsyncXHRBuffer.flush in the v86 fork).
+   */
+  async flushDisks(): Promise<void> {
+    try {
+      await this.emulator?.flush_disks?.();
+    } catch {
+      /* best-effort */
+    }
   }
 
   stop(): void {

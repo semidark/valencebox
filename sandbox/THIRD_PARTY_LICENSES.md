@@ -21,16 +21,21 @@ satisfy attribution requirements.
 ## Build-time / vendored binary assets
 
 The v86 emulator runtime assets (`libv86.js`, `v86.wasm`, `seabios.bin`,
-`vgabios.bin`) are extracted at build time from the `env86/` git submodule
-(see repo root `README.md`) and copied into the shipped application. They are
-not modified.
+`vgabios.bin`) are extracted at build time from the `v86/` git submodule
+(see repo root `README.md`) and copied into the shipped application.
+
+`v86/` points at [`semidark/v86`](https://github.com/semidark/v86), a fork
+of upstream `copy/v86` carrying one patch: an opt-in bound on the disk
+`block_cache` used for `hda`/`hdb`, fixing unbounded host memory growth from
+cumulative guest disk I/O (see
+[semidark/v86#1](https://github.com/semidark/v86/pull/1)). The patch is
+BSD-2-Clause licensed like the rest of v86; no other modifications are made.
 
 | Component | License | Notes |
 |---|---|---|
-| [v86](https://github.com/copy/v86) | BSD-2-Clause | Copyright (c) 2012, The v86 contributors. The emulator itself; assets are copied unmodified into the built app. |
-| [env86](https://github.com/progrium/env86) | MIT | Copyright 2024 Jeff Lindsay. Build-tool only (not shipped at runtime) — used solely to build/extract the v86 assets above. |
+| [v86](https://github.com/copy/v86) (via [semidark/v86](https://github.com/semidark/v86) fork) | BSD-2-Clause | Copyright (c) 2012, The v86 contributors. The emulator itself; assets built from the fork are copied into the built app. |
 
-## MIT License text (xterm.js, env86)
+## MIT License text (xterm.js)
 
 ```
 Permission is hereby granted, free of charge, to any person obtaining a copy
