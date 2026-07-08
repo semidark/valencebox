@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -18,6 +19,7 @@ struct WinSize {
 pub struct PtySession {
     master_fd: RawFd,
     child_pid: i32,
+    alive: Arc<AtomicBool>,
 }
 
 impl PtySession {
@@ -75,15 +77,18 @@ impl PtySession {
         }
 
         // parent
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_clone = alive.clone();
         let fw_clone = fw.clone();
         let fd_for_thread = master_fd;
         thread::spawn(move || {
-            pty_reader_thread(fd_for_thread, fw_clone);
+            pty_reader_thread(fd_for_thread, fw_clone, alive_clone);
         });
 
         Ok(PtySession {
             master_fd,
             child_pid: pid,
+            alive,
         })
     }
 
@@ -109,7 +114,8 @@ impl PtySession {
         set_winsize(self.master_fd, rows, cols)
     }
 
-    pub fn close(&self) {
+    pub fn close(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
         unsafe {
             libc::kill(self.child_pid, libc::SIGHUP);
             libc::close(self.master_fd);
@@ -141,12 +147,19 @@ fn set_winsize(fd: RawFd, rows: u16, cols: u16) -> std::io::Result<()> {
     Ok(())
 }
 
-fn pty_reader_thread(fd: RawFd, fw: Arc<FrameWriter>) {
+fn pty_reader_thread(fd: RawFd, fw: Arc<FrameWriter>, alive: Arc<AtomicBool>) {
     let mut buf = [0u8; 4096];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
-            let _ = fw.send(TYPE_PTY_CLOSE, b"");
+            // Only notify the host if the shell exited on its own — not if
+            // we closed the fd (replacement, host close, or shutdown). Without
+            // this guard, restoring a snapshot replaces the old session, the
+            // old reader thread sees its fd closed, sends PTY_CLOSE, the host
+            // reopens, replaces again → infinite loop.
+            if alive.load(Ordering::SeqCst) {
+                let _ = fw.send(TYPE_PTY_CLOSE, b"");
+            }
             break;
         }
         let _ = fw.send(TYPE_PTY_DATA, &buf[..n as usize]);
