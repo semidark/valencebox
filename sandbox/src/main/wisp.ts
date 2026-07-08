@@ -11,6 +11,8 @@ export interface EgressPolicy {
   /** ports allowed out (defaults: 80, 443) */
   allowPorts?: (number | [number, number])[];
   allowUdp?: boolean;
+  /** When true, all outbound traffic is allowed (bypasses allowlists, UDP gate). */
+  allowAll?: boolean;
 }
 
 /** Default policy: package registries + apk mirrors only. */
@@ -69,6 +71,7 @@ export class WispServer {
 
   /** does the egress policy allow this hostname? (used by the DoH gate) */
   hostAllowed(name: string): boolean {
+    if (this.policy.allowAll) return true;
     return this.policy.allowHosts.some((h) => toRegex(h).test(name));
   }
 
@@ -86,6 +89,18 @@ export class WispServer {
 
   private applyPolicy(): void {
     const o = this.wisp.options;
+    if (this.policy.allowAll) {
+      // Open gate — no restrictions, all traffic allowed.
+      o.hostname_whitelist = null;
+      o.hostname_blacklist = null;
+      o.port_whitelist = null;
+      o.port_blacklist = null;
+      o.allow_udp_streams = true;
+      o.allow_direct_ip = true;
+      o.allow_private_ips = true;
+      o.allow_loopback_ips = true;
+      return;
+    }
     // whitelist matches the CONNECT "hostname" field — which is an IP here
     const ips = [...this.pinnedIps];
     const ports: (number | [number, number])[] = [...(this.policy.allowPorts ?? [80, 443])];
@@ -101,8 +116,11 @@ export class WispServer {
     o.port_whitelist = ports;
     o.allow_udp_streams = this.policy.allowUdp ?? false;
     o.allow_direct_ip = true; // IPs are the only currency; whitelist gates them
-    o.allow_private_ips = false;
-    o.allow_loopback_ips = false;
+    // Private/loopback IPs are allowed because the hostname whitelist only
+    // contains DNS-pinned IPs (resolved from user-allowlisted hostnames).
+    // Blocking them here would break LAN hostnames like llama-cpp.lan.
+    o.allow_private_ips = true;
+    o.allow_loopback_ips = true;
   }
 
   async start(port = 0): Promise<void> {

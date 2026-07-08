@@ -131,6 +131,35 @@ useless in the i386 Linux guest — run `npm install` inside the guest instead
 across frames, so project size isn't limited by the protocol's 256 KiB frame
 cap. Note the workspace disk is 512 MB.
 
+## Egress configuration
+
+Place `sandbox.config.json` in Electron's `userData` directory
+(`~/.config/ValenceBox/` on Linux) to configure the network allowlist. The
+hardcoded default allows only package registries (npm, PyPI, crates.io, Go
+proxy, Alpine apk mirrors) on ports 80 and 443.
+
+```json
+{
+  "egress": {
+    "extraHosts": ["my-registry.example.com", "llama-cpp.lan"],
+    "extraPorts": [8000, [8080, 8082]]
+  }
+}
+```
+
+`extraHosts` and `extraPorts` append to the hardcoded defaults. To allow all
+outbound traffic:
+
+```json
+{
+  "egress": {
+    "allowAll": true
+  }
+}
+```
+
+When `allowAll` is set, `extraHosts` and `extraPorts` are ignored.
+
 ## Test (headless, no display needed)
 
 Each phase has a standalone harness that boots a real VM and asserts behavior:
