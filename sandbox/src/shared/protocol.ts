@@ -19,6 +19,11 @@ export enum FrameType {
   // FILE_CHUNK frames under the same xfer id (see PROTOCOL.md)
   TREE_PUT = 10,
   FILE_RENAME = 11,
+  // PTY terminal session over virtio-console (see PTY.md)
+  PTY_OPEN = 12,   // host → guest: {rows, cols} → allocate PTY, spawn bash
+  PTY_DATA = 13,   // bidirectional: raw PTY bytes
+  PTY_RESIZE = 14, // host → guest: {rows, cols} → TIOCSWINSZ on PTY
+  PTY_CLOSE = 15,  // host → guest: kill shell, close PTY
 }
 
 export interface Frame {

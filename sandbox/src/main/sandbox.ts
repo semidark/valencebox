@@ -8,6 +8,7 @@ import { SyncManager } from "./sync-manager";
 import { SnapshotManager } from "./snapshot";
 import { WispServer, EgressPolicy, DEFAULT_POLICY } from "./wisp";
 import { DataPlane } from "./data-plane";
+import { PtyTerminal } from "./terminal";
 import { DOH_GATE_HOST, installDohGate } from "./doh";
 import { SandboxStatus } from "../shared/ipc";
 
@@ -28,6 +29,7 @@ export class Sandbox extends EventEmitter {
   snapshots!: SnapshotManager;
   wisp?: WispServer;
   dataPlane?: DataPlane;
+  ptyTerminal?: PtyTerminal;
   status: SandboxStatus = { phase: "boot" };
   private stopping = false;
 
@@ -137,6 +139,18 @@ export class Sandbox extends EventEmitter {
     this.snapshots.start();
     this.setStatus({ phase: "ready", bootMs: Date.now() - t0 });
     this.pushStatus();
+
+    // Open a PTY terminal for interactive use (replaces serial as the primary
+    // terminal). The serial console (ttyS0) stays as a boot/fallback channel.
+    try {
+      this.ptyTerminal = new PtyTerminal(this.bridge);
+      this.ptyTerminal.on("data", (chunk: Uint8Array) => this.emit("pty:data", chunk));
+      this.ptyTerminal.on("closed", () => this.emit("pty:closed"));
+      await this.ptyTerminal.start(24, 80);
+      this.emit("log", "pty: session opened");
+    } catch (e: any) {
+      this.emit("log", `pty: open failed — falling back to serial: ${e.message}`);
+    }
   }
 
   private async loginRoot(): Promise<void> {
@@ -217,6 +231,16 @@ export class Sandbox extends EventEmitter {
     this.vm.serialWrite(data);
   }
 
+  /** send keystrokes to the PTY terminal (if open) */
+  sendPtyInput(data: Uint8Array): void {
+    this.ptyTerminal?.sendInput(data);
+  }
+
+  /** resize the PTY terminal (if open) */
+  resizePty(cols: number, rows: number): void {
+    this.ptyTerminal?.resize(cols, rows);
+  }
+
   /** run a shell line in the guest via the serial root session */
   async runInGuest(cmd: string, expect: RegExp, timeoutMs = 30000): Promise<string> {
     const mark = this.vm.serialLog.length;
@@ -245,6 +269,7 @@ export class Sandbox extends EventEmitter {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.ptyTerminal?.close();
     this.snapshots?.stop();
     await this.sync?.stop();
     // Best-effort final checkpoint so a graceful quit doesn't lose ground to

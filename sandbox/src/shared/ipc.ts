@@ -31,4 +31,9 @@ export const IPC = {
   onConflict: "sandbox:conflict",
   saveSnapshot: "sandbox:saveSnapshot",
   serialInput: "sandbox:serialInput", // raw keystrokes renderer→guest serial (fire-and-forget)
+  // PTY terminal (opens after sandbox reaches "ready" phase)
+  onPtyData: "sandbox:pty:data", // guest→renderer: PTY output bytes
+  onPtyClosed: "sandbox:pty:closed", // guest→renderer: PTY session ended
+  ptyInput: "sandbox:pty:input", // renderer→guest: keystrokes (fire-and-forget)
+  ptyResize: "sandbox:pty:resize", // renderer→guest: {cols, rows}
 } as const;

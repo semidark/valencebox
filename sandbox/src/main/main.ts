@@ -75,6 +75,8 @@ function registerIpc() {
   ipcMain.handle(IPC.getStatus, () => sandbox?.status ?? { phase: "boot" });
   ipcMain.handle(IPC.saveSnapshot, () => sandbox?.saveSnapshot());
   ipcMain.on(IPC.serialInput, (_e, data: string) => sandbox?.sendInput(data));
+  ipcMain.on(IPC.ptyInput, (_e, data: Uint8Array) => sandbox?.sendPtyInput(data));
+  ipcMain.on(IPC.ptyResize, (_e, cols: number, rows: number) => sandbox?.resizePty(cols, rows));
 }
 
 async function startSandbox() {
@@ -96,6 +98,8 @@ async function startSandbox() {
   sandbox.on("status", (s) => sendToWindow(IPC.onStatus, s));
   sandbox.on("conflict", (c) => sendToWindow(IPC.onConflict, c));
   sandbox.on("log", (m) => console.log("[sandbox]", m));
+  sandbox.on("pty:data", (chunk: Uint8Array) => sendToWindow(IPC.onPtyData, chunk));
+  sandbox.on("pty:closed", () => sendToWindow(IPC.onPtyClosed));
 
   try {
     await sandbox.start();
