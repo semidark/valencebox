@@ -2,6 +2,7 @@ mod dataplane;
 mod frame;
 mod logging;
 mod manifest;
+mod pty;
 mod state;
 mod termios;
 mod transfer;
@@ -9,7 +10,7 @@ mod watcher;
 
 use std::io::BufReader;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 fn parse_args(args: &[String]) -> (String, String) {
     let mut root = "/workspace".to_string();
@@ -60,6 +61,7 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
     let recv = Arc::new(transfer::new_receiver(root, fw.clone(), sync.clone(), true));
     let send = Arc::new(transfer::new_sender(root, fw.clone(), sync.clone(), 0));
     let dplane = Arc::new(dataplane::DataPlane::new(root, sync.clone()));
+    let pty_session: Arc<Mutex<Option<pty::PtySession>>> = Arc::new(Mutex::new(None));
 
     let hello = serde_json::to_vec(&serde_json::json!({
         "version": 1,
@@ -251,6 +253,47 @@ fn run(root: &str, dev: &str) -> std::io::Result<()> {
                             }
                         }
                     }
+                }
+            }
+            frame::TYPE_PTY_OPEN => {
+                let req: serde_json::Value =
+                    serde_json::from_slice(&frame_data.payload).unwrap_or_default();
+                let rows = req.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                let cols = req.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                match pty::PtySession::open(rows, cols, fw.clone()) {
+                    Ok(session) => {
+                        *pty_session.lock().unwrap() = Some(session);
+                        let ack = serde_json::json!({"ack": frame_data.seq});
+                        let _ = fw.send(frame::TYPE_ACK, ack.to_string().as_bytes());
+                    }
+                    Err(e) => {
+                        crate::slog!("pty: open failed: {}", e);
+                        let nack = serde_json::json!({"ack": frame_data.seq, "error": format!("{e}")});
+                        let _ = fw.send(frame::TYPE_NAK, nack.to_string().as_bytes());
+                    }
+                }
+            }
+            frame::TYPE_PTY_DATA => {
+                if let Some(session) = pty_session.lock().unwrap().as_ref() {
+                    if let Err(e) = session.write(&frame_data.payload) {
+                        crate::slog!("pty: write failed: {}", e);
+                    }
+                }
+            }
+            frame::TYPE_PTY_RESIZE => {
+                let req: serde_json::Value =
+                    serde_json::from_slice(&frame_data.payload).unwrap_or_default();
+                let rows = req.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                let cols = req.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                if let Some(session) = pty_session.lock().unwrap().as_ref() {
+                    if let Err(e) = session.resize(rows, cols) {
+                        crate::slog!("pty: resize failed: {}", e);
+                    }
+                }
+            }
+            frame::TYPE_PTY_CLOSE => {
+                if pty_session.lock().unwrap().take().is_some() {
+                    crate::slog!("pty: session closed by host");
                 }
             }
             frame::TYPE_EVENT => {

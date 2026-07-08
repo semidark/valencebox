@@ -15,6 +15,10 @@ pub const TYPE_EVENT: u8 = 8;
 pub const TYPE_PING: u8 = 9;
 pub const TYPE_TREE_PUT: u8 = 10;
 pub const TYPE_FILE_RENAME: u8 = 11;
+pub const TYPE_PTY_OPEN: u8 = 12;
+pub const TYPE_PTY_DATA: u8 = 13;
+pub const TYPE_PTY_RESIZE: u8 = 14;
+pub const TYPE_PTY_CLOSE: u8 = 15;
 
 pub const MAX_PAYLOAD: u32 = 262_144;
 pub const CHUNK_SIZE: usize = 48 * 1024;
