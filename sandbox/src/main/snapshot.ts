@@ -93,6 +93,10 @@ export class SnapshotManager extends EventEmitter {
       return res;
     } finally {
       this.saving = false;
+      // We're only ever here after idleMs of no sync activity, so it's a
+      // good point to also proactively reclaim hda/hdb disk-cache memory
+      // (bounded/self-evicting regardless — see vm.ts flushDisks doc).
+      await this.vm.flushDisks();
     }
   }
 

@@ -24,9 +24,9 @@ isolated from the host but gets native-speed file I/O against a real ext4
 disk; files sync bidirectionally between host and guest; internet egress is
 proxied and allowlisted.
 
-Built on the env86/v86 foundation in the parent repo. **v86 emulates 32-bit
-x86 only**, so the guest is 32-bit Alpine (see parent README for why Fedora
-CoreOS can't run here).
+Built on v86 (via a small fork, see parent README) in the parent repo.
+**v86 emulates 32-bit x86 only**, so the guest is 32-bit Alpine (see parent
+README for why Fedora CoreOS can't run here).
 
 ## Architecture
 
@@ -88,7 +88,7 @@ trick works, why small files get batched):
 | `guest/Dockerfile` | 32-bit Alpine: kernel (legacy modules stripped), bash login, OpenRC services |
 | `guest/sync-agent-rust/` | Rust sync agent (framing, manifest, chunked transfer, inotify, LWW) |
 | `guest/rootfs/` | `/workspace` mount + sync-agent + networking OpenRC services |
-| `src/shared/protocol.ts` | framed protocol (mirrors the Go side) |
+| `src/shared/protocol.ts` | framed protocol (mirrors the Rust side) |
 | `src/main/vm.ts` | headless v86 wrapper; **paced** virtio-console writer |
 | `src/main/bridge.ts` | request/response + event routing over the console |
 | `src/main/sync-manager.ts` | host side of bidirectional sync + conflict policy |
@@ -182,6 +182,14 @@ AGPL-3.0-only — see [`../LICENSE`](../LICENSE). Third-party attributions
 - **Paced console writer.** v86's virtio-console drops bytes if the guest RX
   ring is empty; `vm.ts` slices to <4 KiB and only sends when a descriptor is
   free (with stall backoff). This was essential to get reliable bulk transfer.
+- **Bounded disk block_cache.** Upstream v86's `hda`/`hdb` buffers cache
+  every disk block ever read or written with no eviction, so host memory
+  grows unboundedly with cumulative guest disk I/O (most visibly during
+  workspace hydration). The `v86/` fork adds an opt-in `max_cache_bytes`
+  bound with LRU eviction + write-back (see
+  [semidark/v86#1](https://github.com/semidark/v86/pull/1)); `vm.ts`
+  configures it and `SandboxVM.flushDisks()` proactively reclaims it after
+  hydration and on each idle-triggered snapshot.
 - **Egress = DNS gate + IP pinning.** v86's wisp adapter connects by resolved
   IP, so the allowlist is enforced in two layers: `doh.ts` only resolves
   allowlisted hostnames; `wisp.ts` only permits the IPs it pinned. Granularity
