@@ -145,12 +145,39 @@ export class Sandbox extends EventEmitter {
     try {
       this.ptyTerminal = new PtyTerminal(this.bridge);
       this.ptyTerminal.on("data", (chunk: Uint8Array) => this.emit("pty:data", chunk));
-      this.ptyTerminal.on("closed", () => this.emit("pty:closed"));
+      this.ptyTerminal.on("closed", () => {
+        this.emit("pty:closed");
+        this.schedulePtyReopen();
+      });
       await this.ptyTerminal.start(24, 80);
+      this.ptyRetries = 0;
       this.emit("log", "pty: session opened");
     } catch (e: any) {
       this.emit("log", `pty: open failed — falling back to serial: ${e.message}`);
     }
+  }
+
+  private ptyRetries = 0;
+  private schedulePtyReopen(): void {
+    if (this.stopping) return;
+    if (this.ptyRetries >= 5) {
+      this.emit("log", "pty: max retries reached — staying on serial");
+      return;
+    }
+    this.ptyRetries++;
+    const delay = Math.min(500 * this.ptyRetries, 3000);
+    this.emit("log", `pty: reopening in ${delay}ms (attempt ${this.ptyRetries})`);
+    setTimeout(async () => {
+      if (this.stopping || !this.ptyTerminal) return;
+      try {
+        await this.ptyTerminal.start(24, 80);
+        this.ptyRetries = 0;
+        this.emit("log", "pty: session reopened");
+      } catch (e: any) {
+        this.emit("log", `pty: reopen failed: ${e.message}`);
+        this.schedulePtyReopen();
+      }
+    }, delay);
   }
 
   private async loginRoot(): Promise<void> {

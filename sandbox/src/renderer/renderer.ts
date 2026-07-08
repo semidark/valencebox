@@ -56,12 +56,13 @@ api.onPtyData((chunk) => {
   if (!usingPty) {
     usingPty = true;
     term.reset();
+    api.sendPtyResize(term.cols, term.rows);
   }
   term.write(chunk);
 });
 api.onPtyClosed(() => {
   usingPty = false;
-  term.write("\r\n\x1b[33m[pty session ended — falling back to serial]\x1b[0m\r\n");
+  term.write("\r\n\x1b[33m[pty session ended — reopening…]\x1b[0m\r\n");
 });
 let isReady = false;
 term.onData((data: string) => {
