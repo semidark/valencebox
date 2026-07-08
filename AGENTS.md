@@ -52,6 +52,24 @@ npm start                                    # launch Electron app
 - Never synced at any depth: `node_modules`, `.git`, `.DS_Store`, `.sync-tmp`, `lost+found`. Run `npm install` inside the guest.
 - Workspace disk is 512 MB.
 
+## Egress config (sandbox.config.json)
+
+Place in Electron `userData` dir (`~/.config/ValenceBox/` on Linux). Merges
+into `DEFAULT_POLICY` (wisp.ts) at startup.
+
+```jsonc
+{
+  "egress": {
+    "allowAll": false,          // true = unrestricted egress
+    "extraHosts": ["..."],      // appended to hardcoded allowlist
+    "extraPorts": [8080, [3000, 3999]]  // single ports and [start,end] ranges
+  }
+}
+```
+
+When `allowAll` is true, `extraHosts`/`extraPorts` are ignored. Parsed in
+`src/main/main.ts:loadAppConfig`.
+
 ## Key docs
 
 - `sandbox/README.md` — architecture overview, measured boot/hydrate/snapshot timings.

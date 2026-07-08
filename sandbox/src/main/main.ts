@@ -1,8 +1,48 @@
 // Electron main process: owns the Sandbox, bridges it to the renderer.
 import { app, BrowserWindow, ipcMain } from "electron";
+import * as fs from "fs";
 import * as path from "path";
 import { Sandbox, defaultPaths } from "./sandbox";
+import { EgressPolicy, DEFAULT_POLICY } from "./wisp";
 import { IPC } from "../shared/ipc";
+
+export interface SandboxAppConfig {
+  /** Extra hostnames to allow through the egress gate (appended to defaults). */
+  egress?: {
+    /** Allow all outbound traffic (bypasses all allowlists). */
+    allowAll?: boolean;
+    extraHosts?: string[];
+    /**
+     * Extra ports to allow (appended to default [80, 443]).
+     * Each entry is a port number or a [start, end] range.
+     */
+    extraPorts?: (number | [number, number])[];
+  };
+}
+
+function loadAppConfig(root: string): SandboxAppConfig {
+  const p = path.join(root, "sandbox.config.json");
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function mergeEgress(cfg: SandboxAppConfig): EgressPolicy {
+  const extra = cfg.egress;
+  if (!extra) return DEFAULT_POLICY;
+  if (extra.allowAll) return { allowHosts: [], allowAll: true };
+  return {
+    ...DEFAULT_POLICY,
+    allowHosts: extra.extraHosts?.length
+      ? [...DEFAULT_POLICY.allowHosts, ...extra.extraHosts]
+      : DEFAULT_POLICY.allowHosts,
+    allowPorts: extra.extraPorts?.length
+      ? [...(DEFAULT_POLICY.allowPorts ?? [80, 443]), ...extra.extraPorts]
+      : DEFAULT_POLICY.allowPorts,
+  };
+}
 
 let win: BrowserWindow | null = null;
 let sandbox: Sandbox | null = null;
@@ -44,11 +84,13 @@ async function startSandbox() {
   if (process.env.WORKSPACE_DIR) {
     paths.hostDir = path.resolve(process.env.WORKSPACE_DIR);
   }
+  const appCfg = loadAppConfig(app.getPath("userData"));
   console.log("[sandbox] host workspace:", paths.hostDir);
   sandbox = new Sandbox({
     ...paths,
     memoryMB: 512,
     enableNetwork: true,
+    egress: mergeEgress(appCfg),
     onSerial: (chunk) => sendToWindow(IPC.onSerial, chunk),
   });
   sandbox.on("status", (s) => sendToWindow(IPC.onStatus, s));
