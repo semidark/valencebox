@@ -187,7 +187,7 @@ export class Sandbox extends EventEmitter {
     // Best-effort: force the guest shell to print a fresh prompt so the
     // user sees the terminal is alive after a warm restore.
     try {
-      this.vm.serialWrite("echo '[sandbox] restored' && reset\n");
+      this.vm.serialWrite(" echo '[sandbox] restored' && reset\n");
     } catch {
       // ignore — restore still completed successfully
     }
