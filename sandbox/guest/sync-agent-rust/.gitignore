@@ -1,4 +1,2 @@
 target/
 **/*.rs.bk
-src/bin/
-../blake2sum.bin
