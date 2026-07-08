@@ -25,6 +25,7 @@ RUN apk add --no-cache \
   curl \
   wget \
   ripgrep \
+  tmux \
   file
 
 # Runtime deps for the agent binary
