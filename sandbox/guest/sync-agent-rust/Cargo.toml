@@ -3,6 +3,16 @@ name = "sync-agent"
 version = "0.1.0"
 edition = "2021"
 
+# Mirror guest/rust-agent/Cargo.toml's release profile: aggressive binary
+# size reduction. Shaves ~50-70% off sync-agent + blake2sum, which both
+# land in /usr/local/bin on the rootfs image.
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = "symbols"
+opt-level = "z"
+
 [dependencies]
 crc32fast = "1"
 blake2 = "0.10"

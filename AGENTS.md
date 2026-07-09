@@ -19,6 +19,7 @@ npm start                                    # launch Electron app
 
 - `./scripts/build-v86.sh` builds the pinned `v86/` submodule (Closure Compiler + Rust/wasm32, via Docker) into `build/v86/`; `npm run images` copies those four assets into `sandbox/assets/v86/`.
 - `npm run images` builds Rust sync-agent targeting `i686-unknown-linux-musl`, spins up `--platform=linux/386` Alpine, extracts kernel/initramfs, generates two ext4 disks. Outputs are gitignored; regenerate rather than commit.
+- The guest `Dockerfile` is multi-stage: `kernel-builder` installs `linux-lts` + `mkinitfs` to build the kernel modules and initramfs, then `COPY --from=kernel-builder` carries only `/lib/modules` and `/boot/initramfs-lts` into the final rootfs. **Do not** add `mkinitfs` or `linux-lts` to the final stage — that re-bloats the root disk with their transitive deps (`cryptsetup-libs`, `lvm2-libs`, `libkmod`, `e2fsprogs-libs`). When pruning kernel modules inside `kernel-builder`, KEEP `sd_mod` + `scsi_mod` + `libata` + `ata_piix` (v86 IDE disks mount `/dev/sdX` through the SCSI block layer; see `vm.ts` cmdline `modules=ata_piix,sd-mod,ext4`), and KEEP the `scsi` feature in `mkinitfs -F` (it brings `sd_mod` into the initramfs).
 
 ## Build
 
@@ -43,14 +44,14 @@ npm start                                    # launch Electron app
 - `src/shared/protocol.ts` mirrors `guest/sync-agent-rust/src/frame.rs` framing — **change both together**; 256 KiB frame cap.
 - Disks are IDE (`/dev/sda|sdb`), not virtio-blk. Guest detects mount point via `blkid`.
 - `src/main/vm.ts` virtio-console writer is deliberately **paced** (<4 KiB slices, waits for free RX descriptor) — do not "optimize" it; v86 silently drops bytes if the ring is full.
-- `hda`/`hdb` are configured with `max_cache_bytes` (see `src/main/vm.ts`) to bound v86's disk `block_cache`, and `SandboxVM.flushDisks()` is called after hydration and in `SnapshotManager.save()` to proactively reclaim it — without this, host RAM grows unboundedly with cumulative guest disk I/O (see `v86/` fork patch above).
+- `hda`/`hdb` are configured with `max_cache_bytes` (see `src/main/vm.ts`) to bound v86's disk `block_cache`, and `SandboxVM.flushDisks()` is called after hydration and in `SnapshotManager.save()` to proactively reclaim it — without this, host RAM grows unboundedly with cumulative guest disk I/O (see `v86/` fork patch above). The caps in `vm.ts` (HDA 16 MiB, HDB 32 MiB) are deliberately tight; raise them if disk-I/O working-set thrashing shows up in serial logs but keep in mind every MiB here is host RAM held for the VM's lifetime.
 - Security invariants (no live host mount, DNS-gate + IP-pin egress allowlist) live in `HARDENING.md`. Preserve when touching `sync-manager.ts`, `wisp.ts`, `doh.ts`, `data-plane.ts`.
 
 ## Workspace sync
 
 - `WORKSPACE_DIR=~/src/project npm start` points guest `/workspace` at a host dir (synced bidirectionally, **not mounted**).
 - Never synced at any depth: `node_modules`, `.git`, `.DS_Store`, `.sync-tmp`, `lost+found`. Run `npm install` inside the guest.
-- Workspace disk is 512 MB.
+- Workspace disk defaults to **128 MB**; override at image-build time with `WORKSPACE_MB=<n> npm run images`. Bump this if a guest `npm install` runs the workspace disk out of space.
 
 ## Egress config (sandbox.config.json)
 

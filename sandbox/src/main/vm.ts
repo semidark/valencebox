@@ -18,11 +18,14 @@ export function imagesDir(): string {
 // bound, every byte ever read or written to hda/hdb accumulates in host
 // RAM for the life of the process — most visibly during workspace
 // hydration, which can write the guest's entire synced project tree into
-// hdb in one pass. hda is boot-time-reads-mostly (root fs never changes at
-// runtime) so a small cache suffices; hdb absorbs ongoing guest writes so
-// gets more headroom while still bounding worst-case growth.
-const HDA_MAX_CACHE_BYTES = 32 * 1024 * 1024;
-const HDB_MAX_CACHE_BYTES = 128 * 1024 * 1024;
+// hdb in one pass. hda is boot-time-reads-mostly (root fs effectively
+// read-only at runtime — sync-agent writes hdb, not hda) so a small cache
+// suffices; hdb absorbs ongoing guest writes so gets more headroom while
+// still bounding worst-case growth. The cache self-evicts past this bound,
+// so lowering it is a pure host-RAM win, never a correctness issue
+// (data is never lost — see flushDisks doc below).
+const HDA_MAX_CACHE_BYTES = 16 * 1024 * 1024;
+const HDB_MAX_CACHE_BYTES = 32 * 1024 * 1024;
 
 export interface VMOptions {
   memoryMB?: number;
@@ -60,8 +63,18 @@ export class SandboxVM {
       bzimage: { url: path.join(images, "vmlinuz.bin") },
       initrd: { url: path.join(images, "initramfs.bin") },
       cmdline:
+        // modprobe.blacklist=sr_mod skips the v86 default ATAPI CD-ROM's
+        // sr_mod probe, which alone takes ~13 s of emulated CPU on every
+        // boot (sr_mod init issues slow SCSI INQUIRY over the IDE bus for
+        // an empty CD-ROM). We don't use the CD-ROM. NB: do NOT add
+        // `quiet`/`loglevel=3` here — the Electron renderer pipes serial
+        // straight into the xterm terminal (main.ts onSerial →
+        // IPC.onSerial), and the kernel printk trace is the only visible
+        // "boot is happening" feedback during the ~25 s of silent kernel
+        // init before OpenRC starts. Silencing it makes the UI look dead.
         "rw root=/dev/sda rootfstype=ext4 console=ttyS0 " +
-        "modules=ata_piix,sd-mod,ext4 tsc=reliable mitigations=off random.trust_cpu=on",
+        "modules=ata_piix,sd-mod,ext4 tsc=reliable mitigations=off " +
+        "random.trust_cpu=on modprobe.blacklist=sr_mod",
       // async + fixed_chunk_size → dirty-block tracking keeps save_state small.
       // max_cache_bytes bounds the disk block_cache itself (separate from
       // save_state's dirty-block set) so host RAM doesn't grow unboundedly
