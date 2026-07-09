@@ -129,7 +129,9 @@ within ~1 s while the app runs.
 useless in the i386 Linux guest — run `npm install` inside the guest instead
 (its `node_modules` stays guest-local too). Big manifests are sent chunked
 across frames, so project size isn't limited by the protocol's 256 KiB frame
-cap. Note the workspace disk is 512 MB.
+cap. Note the workspace disk defaults to 128 MB; override its size at
+image-build time with `WORKSPACE_MB=<n> npm run images` if your project
+needs more room (the guest runs `npm install` inside `/workspace`).
 
 ## Egress configuration
 

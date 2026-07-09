@@ -51,7 +51,7 @@ docker export sandbox-export -o images/rootfs.tar
 docker rm sandbox-export >/dev/null
 
 echo "==> creating ext4 images (inside container for mkfs.ext4 -d)"
-docker run --rm -v "$PWD/images:/images" alpine:3.20 sh -ec '
+docker run --rm -e WORKSPACE_MB -v "$PWD/images:/images" alpine:3.20 sh -ec '
 	apk add -q e2fsprogs
 	mkdir /fs && tar -xf /images/rootfs.tar -C /fs
 	echo sandbox > /fs/etc/hostname
@@ -59,10 +59,20 @@ docker run --rm -v "$PWD/images:/images" alpine:3.20 sh -ec '
 	cp /fs/boot/vmlinuz-lts /images/vmlinuz.bin
 	cp /fs/boot/initramfs-lts /images/initramfs.bin
 	rm -rf /fs/boot/* /fs/.dockerenv
-	SZ=$(du -sm /fs | cut -f1); SZ=$((SZ + SZ / 4 + 64))
+	# Root image headroom: 25% slack + 32 MiB (was 12.5% + 16 MiB, which
+	# filled / to 100% on first boot — ext4 metadata + first-boot writes
+	# (logs, run state) consumed the headroom). The rootfs sees limited
+	# runtime writes (sync-agent writes hdb, not hda) but OpenRC scratch
+	# and apk cache land here; keep some breathing room.
+	SZ=$(du -sm /fs | cut -f1); SZ=$((SZ + SZ / 4 + 32))
 	rm -f /images/alpine-root.img /images/workspace.img
 	mkfs.ext4 -q -d /fs -L sandboxroot /images/alpine-root.img "${SZ}M"
-	mkfs.ext4 -q -L workspace /images/workspace.img 512M
+	# Workspace disk size is configurable (128 MiB default); override with
+	# WORKSPACE_MB=<n> when running `npm run images`. The guest runs npm
+	# install inside /workspace, so 128 is tight for big Node projects —
+	# bump via the env var when you need more room.
+	WSZ="${WORKSPACE_MB:-128}"
+	mkfs.ext4 -q -L workspace /images/workspace.img "${WSZ}M"
 	chmod 644 /images/*.img /images/vmlinuz.bin /images/initramfs.bin
 '
 rm -f images/rootfs.tar

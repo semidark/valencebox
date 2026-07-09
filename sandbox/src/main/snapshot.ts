@@ -30,7 +30,9 @@ export interface SnapshotOptions {
   intervalMs?: number;
   /** only save if no sync activity for this long (default 10s) */
   idleMs?: number;
-  /** zstd level (default 3: fast, ~2-3x) */
+  /** zstd level (default 10: slower but ~half the on-disk size of level 3,
+   * which matters because snapshots accumulate on disk; saves run on the
+   * idle path off the UI thread, so CPU cost is acceptable) */
   level?: number;
 }
 
@@ -79,7 +81,7 @@ export class SnapshotManager extends EventEmitter {
     const t0 = Date.now();
     try {
       const state: ArrayBuffer = await this.vm.saveState();
-      const z = await compress(Buffer.from(state), this.opts.level ?? 3);
+      const z = await compress(Buffer.from(state), this.opts.level ?? 10);
       await fsp.mkdir(path.dirname(this.file), { recursive: true });
       const tmp = this.file + ".tmp";
       await fsp.writeFile(tmp, z);
