@@ -2,6 +2,8 @@ node_modules/
 dist/
 *.log
 
+AGENTS.md
+
 # local Claude Code state
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
@@ -16,3 +18,8 @@ sandbox/guest/blake2sum.bin
 sandbox/assets/v86/
 sandbox/snapshots/
 sandbox/workspace/
+sandbox/build/
+
+# QEMU bundled binary + firmware (regenerate: scripts/build-qemu.sh)
+sandbox/resources/qemu/linux/qemu-system-x86_64
+sandbox/resources/qemu/linux/pc-bios/*
