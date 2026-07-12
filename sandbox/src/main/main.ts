@@ -76,7 +76,7 @@ async function startVm() {
     accel: appCfg.accel,
     kernel: path.join(assetPaths.imagesDir(), "vmlinuz.bin"),
     initrd: path.join(assetPaths.imagesDir(), "initramfs.bin"),
-    kernelCmdline: "console=ttyS0 root=/dev/vda rootfstype=ext4 rw modules=virtio_blk,ext4",
+    kernelCmdline: "console=ttyS0 root=/dev/vda rootfstype=ext4 rootflags=rw modules=virtio_blk,ext4",
     rootImage,
   });
 

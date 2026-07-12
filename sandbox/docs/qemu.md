@@ -241,44 +241,34 @@ Built binary (`resources/qemu/linux/qemu-system-x86_64`):
 
 ### microvm smoke test (manual, 2026-07-12)
 
-Confirmed `qemu-system-x86_64 -M microvm` boots with our static binary:
+Current boot command (x86-64 qcow2, verified with root auto-login + read-write root):
 
 ```
-# Requires -L pointing at pc-bios/ so QEMU finds bios-microvm.bin
+# TCG smoke test (no KVM available)
 ./sandbox/resources/qemu/linux/qemu-system-x86_64 \
   -L ./sandbox/resources/qemu/linux/pc-bios \
-  -M microvm -enable-kvm -cpu host -m 512m -smp 2 \
-  -kernel sandbox/images/vmlinuz.bin \
-  -append "earlyprintk=ttyS0 console=ttyS0 root=/dev/vda" \
-  -nodefaults -no-user-config -nographic -serial stdio \
-  -drive id=test,file=sandbox/images/alpine-root.img,format=raw,if=none \
-  -device virtio-blk-device,drive=test \
-  -netdev user,id=net0 \
-  -device virtio-net-device,netdev=net0
-```
-
-Updated boot command (x86-64 qcow2, Post-Phase-4 guest image):
-
-```
-./sandbox/resources/qemu/linux/qemu-system-x86_64 \
-  -L ./sandbox/resources/qemu/linux/pc-bios \
-  -M microvm -enable-kvm -cpu host -m 512m -smp 2 \
+  -M microvm -accel tcg,thread=multi -m 256 -smp 1 \
   -kernel sandbox/images/vmlinuz.bin \
   -initrd sandbox/images/initramfs.bin \
-  -append "console=ttyS0 root=/dev/vda rootfstype=ext4 modules=virtio_blk,ext4" \
-  -nodefaults -no-user-config -nographic -serial stdio \
+  -append "console=ttyS0 root=/dev/vda rootfstype=ext4 rootflags=rw modules=virtio_blk,ext4" \
+  -nodefaults -no-user-config -nographic -no-reboot \
   -drive id=root,file=sandbox/images/root.qcow2,format=qcow2,if=none \
   -device virtio-blk-device,drive=root \
   -netdev user,id=net0 \
   -device virtio-net-device,netdev=net0
 ```
 
-Result: boots to `sandbox login:` prompt with root auto-login on serial.
+**Key findings (documented for future reference):**
 
-The kernel cmdline must include `rootfstype=ext4 modules=virtio_blk,ext4`
-for the initramfs to load the block driver and root filesystem module before
-attempting to mount root. Without it the mount fails with ENOENT because
-the modules aren't in the initramfs's default modprobe list.
+| Issue | Root cause | Fix |
+|---|---|---|
+| No serial output with `-nodefaults -serial stdio` | microvm with `-nodefaults` omits the ISA serial device. `-serial stdio` attaches to it and produces nothing. | Use `-serial unix:...,server,nowait` + `nc -U` to read (what the app does). |
+| KVM not available on this machine | No `/dev/kvm` access | `-accel tcg,thread=multi` fallback works, guest boots in ~8s |
+| Read-only root filesystem | Alpine's initramfs `init` defaults `mount -o ${KOPT_rootflags:-ro}` — even when kernel cmdline has `rw`, it's ignored unless `rootflags=rw` is explicit | Add `rootflags=rw` to `-append` |
+| Kernels need `modules=` param | `virtio_blk.ko` and `ext4.ko` are kernel modules in `linux-virt`, not built-in. Initramfs must load them before mounting root. | Add `modules=virtio_blk,ext4` to `-append` |
+| No boot at all without initramfs | `ext4.ko` is a module, not built-in. Kernel can't mount root without loading it. | Keep `-initrd` — initramfs provides busybox + kmod + modules and performs `switch_root` to `/dev/vda` |
+
+Result: boots to `sandbox login:` prompt with root auto-login on serial, full OpenRC, networking, writable root.
 
 Accel snippet:
 
@@ -418,6 +408,7 @@ Since auth is handled via Basic + token, configure `/etc/davfs2/davfs2.conf`:
 
 - [x] Rewrite `guest/Dockerfile`: amd64 Alpine, `linux-virt` kernel + modules
 - [x] Initramfs features: `virtio_blk`, `virtio_net`, `ext4`
+- [x] Read-only root fix: add `rootflags=rw` to kernel cmdline (initramfs defaults to `ro`)
 - [ ] Root fs on `/dev/vda`; workspace qcow2 on `/dev/vdb` mounted at `/workspace`
 - [ ] Install `davfs2`, `rsync`, `inotify-tools` in the guest
 - [ ] Configure `/etc/davfs2/davfs2.conf`: `use_locks 0`
