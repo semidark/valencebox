@@ -2,11 +2,15 @@ node_modules/
 dist/
 *.log
 
-AGENTS.md
-
 # local Claude Code state
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# QEMU configure probes (ephemeral build artifacts)
+config-temp/
+
+# QEMU build artifacts (scripts/build-qemu.sh)
+build/qemu/
 
 # v86 build output (regenerate: ./scripts/build-v86.sh)
 /build/
