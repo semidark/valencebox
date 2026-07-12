@@ -1,30 +1,29 @@
-# ── Stage 1: Build rust-agent natively on 32-bit Alpine ──
-FROM i386/alpine:3.22.5 AS agent-builder
-RUN apk add --no-cache build-base cargo rust
-WORKDIR /app
-COPY rust-agent/Cargo.toml rust-agent/Cargo.lock ./
-RUN mkdir src && printf 'fn main() {}\n' > src/main.rs
-RUN cargo build --release --locked
-COPY rust-agent/src ./src
-RUN touch src/main.rs && cargo build --release --locked
+# ── Single-stage: x86-64 Alpine guest rootfs ──
+# Produces a minimal bootable rootfs for QEMU microvm with virtio-blk root
+# on ttyS0 serial (root auto-login). No sync, no agents, no WebDAV — those
+# come in Phase 4+ of the QEMU rewrite (see docs/qemu.md).
+FROM amd64/alpine:3.21
 
-# ── Stage 2: Build kernel + initramfs in an isolated stage ──
-# linux-lts + mkinitfs (and their transitive deps: cryptsetup-libs,
-# lvm2-libs, libblkid, libkmod, e2fsprogs-libs) are NOT needed on the
-# final root disk — the initramfs they produce is exported to v86 as a
-# separate boot asset (build-guest.sh extracts /boot/initramfs-lts).
-# Keeping them out of stage 3 is the single biggest bloat saving here.
-FROM i386/alpine:3.22.5 AS kernel-builder
-ENV KERNEL=lts
-RUN apk add --no-cache mkinitfs linux-lts linux-firmware-none
+ENV KERNEL=virt
+ENV HOSTNAME=sandbox
 
-# Strip legacy/irrelevant kernel modules (micro-VM style): sound, graphics,
-# USB, media, wireless, bluetooth, printers/parallel, exotic HBA drivers,
-# network filesystems/non-ext4 filesystems, etc.
-# KEEP (v86 needs these): virtio (console/net), the libata/ata_piix IDE
-# controller path, and the SCSI midlayer (sd_mod + scsi_mod) — v86 disks
-# enumerate as IDE but mount /dev/sdX through the SCSI block layer, and
-# the kernel cmdline at vm.ts uses modules=ata_piix,sd-mod,ext4.
+# Userland: busybox init, serial getty, networking
+RUN apk add --no-cache \
+    alpine-base \
+    linux-virt \
+    mkinitfs \
+    agetty \
+    openssh \
+    dhcpcd \
+    curl
+
+# Rebuild initramfs with ext4 + virtio features (default virt initramfs only
+# has "base", which doesn't include ext4.ko). The linux-virt trigger already
+# built /boot/initramfs-virt once; we overwrite it with the right features.
+RUN mkinitfs -F "base ext4 virtio" \
+    $(cat /usr/share/kernel/$KERNEL/kernel.release)
+
+# Strip irrelevant kernel modules (microvm: no sound, GPU, USB, wireless, etc.)
 RUN KREL=$(cat /usr/share/kernel/$KERNEL/kernel.release) && \
     cd /lib/modules/$KREL/kernel && \
     rm -rf sound \
@@ -51,80 +50,24 @@ RUN KREL=$(cat /usr/share/kernel/$KERNEL/kernel.release) && \
            fs/ocfs2 fs/ocfs2_dlm fs/isofs fs/udf fs/exfat && \
     depmod $KREL
 
-# Initramfs: ata/ide (v86 IDE disks), scsi (sd_mod block layer), ext4 root,
-# virtio. Features mirror the kernel cmdline in src/main/vm.ts.
-RUN mkinitfs -F "ata base ide scsi virtio ext4" \
-    $(cat /usr/share/kernel/$KERNEL/kernel.release)
+# Ensure virtio modules load at boot
+RUN printf 'virtio_blk\nvirtio_net\n' >> /etc/modules
 
-# ── Stage 3: 32-bit Alpine guest rootfs (no kernel/mkinitfs) ──
-FROM i386/alpine:3.22.5
+# Serial console: root auto-login on ttyS0 at 115200
+RUN echo 'ttyS0::respawn:/sbin/agetty -a root -s ttyS0 115200 vt100' >> /etc/inittab && \
+    printf '\nsandbox login ready (x86-64, linux-virt)\n' > /etc/motd
 
-ENV KERNEL=lts
-ENV HOSTNAME=sandbox
-ENV PASSWORD=root
+# DHCP on SLIRP eth0
+RUN printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' \
+    > /etc/network/interfaces
 
-# Userland: busybox base + init, getty, bash, real blkid (util-linux)
-RUN apk add --no-cache \
-  openrc \
-  alpine-base \
-  agetty \
-  bash \
-  blkid \
-  curl \
-  wget \
-  ripgrep \
-  tmux \
-  file
-
-# Runtime deps for the agent binary
-RUN apk add --no-cache ca-certificates libgcc
-
-# Kernel modules + prebuilt initramfs come from the kernel-builder stage;
-# stage 3 deliberately does NOT install linux-lts / mkinitfs (see top of
-# kernel-builder for why). build-guest.sh extracts /boot/initramfs-lts
-# to images/initramfs.bin and /boot/vmlinuz-lts to images/vmlinuz.bin at
-# image-export time.
-COPY --from=kernel-builder /lib/modules /lib/modules
-COPY --from=kernel-builder /boot/initramfs-lts /boot/initramfs-lts
-COPY --from=kernel-builder /boot/vmlinuz-lts /boot/vmlinuz-lts
-
-# Login shell: bash for root, login prompts on VGA tty1 and serial ttyS0
-# (both for debugging; the sync agent uses /dev/hvc0, never a getty).
-RUN echo "root:$PASSWORD" | chpasswd && \
-    sed -i 's|^root:\(.*\):/bin/ash$|root:\1:/bin/bash|' /etc/passwd && \
-    sed -i -e 's|^tty1:.*|tty1::respawn:/sbin/agetty tty1 linux|' \
-           -e '/^tty[2-6]:/d' /etc/inittab && \
-    echo 'ttyS0::respawn:/sbin/agetty -s ttyS0 115200 vt100' >> /etc/inittab && \
-    printf 'v86 sandbox (i386) - login: root / root\n' > /etc/motd
-
-# Note: /etc/hostname and /etc/hosts are docker bind mounts during build —
-# they are written into the ext4 image by scripts/build-guest.sh instead.
-
-# Ensure virtio drivers load even if hwdrivers misses them
-RUN printf 'virtio_console\nvirtio_net\n' >> /etc/modules
-
-# Services: workspace mount + sync agent + eth0 DHCP
-COPY rootfs/ /
-COPY sync-agent.bin /usr/local/bin/sync-agent
-COPY blake2sum.bin /usr/local/bin/blake2sum
-COPY --from=agent-builder /app/target/release/agent /usr/local/bin/agent
-RUN chmod +x /etc/init.d/workspace /etc/init.d/sync-agent \
-    /usr/local/bin/sync-agent /usr/local/bin/blake2sum /usr/local/bin/agent
-
-# Strip bloat that apk leaves behind (man pages, docs, locales, zoneinfo
-# stubs, licenses). Single RUN keeps the layer count down.
+# Strip bloat
 RUN rm -rf /usr/share/man /usr/share/doc /usr/share/info /usr/share/i18n \
     /usr/share/zoneinfo/iso3166.rst /usr/share/licenses \
     /var/cache/* /tmp/* /root/.cache
 
-# OpenRC runlevels. Skipping `hwdrivers` in sysinit (the service that
-# prints "Loading hardware drivers" and walks every /sys modalias running
-# modprobe twice) is a major boot-speed win; our only drivers are
-# already loaded by the kernel cmdline (modules=ata_piix,sd-mod,ext4) and
-# /etc/modules (virtio_console, virtio_net). devfs + mdev stay (mdev
-# provides the `dev` service other things depend on; devtmpfs already
-# has /dev/sda|sdb|hvc0 nodes, so mdev -s coldplug is fast on v86).
+# Minimal OpenRC runlevel (hwdralls=no for boot speed)
 RUN for i in devfs dmesg mdev; do rc-update add $i sysinit; done && \
     for i in hwclock modules sysctl hostname bootmisc; do rc-update add $i boot; done && \
-    for i in workspace sync-agent networking; do rc-update add $i default; done && \
+    rc-update add networking default && \
     rc-update add killprocs shutdown
