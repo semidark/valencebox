@@ -29,6 +29,7 @@ export class VmManager extends EventEmitter {
 
   async start(): Promise<void> {
     this.qemu.on("qmp:event", (event: string) => this.emit("qmp:event", event));
+    this.qemu.on("accel", (info: { name: string; available: boolean }) => this.emit("accel", info));
     await this.qemu.start(this.opts);
     this.connectSerial();
   }

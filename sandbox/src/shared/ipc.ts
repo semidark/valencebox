@@ -2,6 +2,8 @@
 export interface SandboxStatus {
   phase: "boot" | "restore" | "hydrating" | "ready" | "stopped" | "error";
   bootMs?: number;
+  accel?: string;
+  accelAvailable?: boolean;
   restored?: boolean;
   guest?: { root: string; version: number };
   net?: { relayUrl: string; policyHosts: string[]; dataPlane?: boolean };

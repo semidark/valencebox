@@ -53,6 +53,13 @@ export class QemuProcess extends EventEmitter {
     this.serialPath = serialSockPath(opts.tmpDir);
     this.qmpPath = qmpSockPath(opts.tmpDir);
 
+    const hw = opts.accel === "auto" || !opts.accel
+      ? QemuProcess.checkAccel(process.platform)
+      : { name: opts.accel, available: true };
+    console.log(`[qemu] accel: ${hw.name}${hw.available ? "" : " (unavailable)"}`);
+    if (hw.hint) console.log(`[qemu] ${hw.hint}`);
+    this.emit("accel", hw);
+
     const args = this.buildArgs(opts);
     const binPath = qemuBinaryPath();
 
@@ -186,6 +193,27 @@ export class QemuProcess extends EventEmitter {
     }
 
     return args;
+  }
+
+  static checkAccel(platform: string): { name: string; available: boolean; hint?: string } {
+    if (platform === "linux") {
+      try {
+        fs.accessSync("/dev/kvm", fs.constants.R_OK | fs.constants.W_OK);
+        return { name: "kvm", available: true };
+      } catch {
+        return {
+          name: "kvm", available: false,
+          hint: "user not in kvm group? try: sudo usermod -aG kvm $USER && logout/login",
+        };
+      }
+    }
+    if (platform === "darwin") {
+      try { return { name: "hvf", available: true }; } catch { return { name: "hvf", available: false }; }
+    }
+    if (platform === "win32") {
+      try { return { name: "whpx", available: true }; } catch { return { name: "whpx", available: false }; }
+    }
+    return { name: "tcg", available: true };
   }
 
   private resolveAccels(override?: string): string[] {
