@@ -15,6 +15,7 @@ export interface VmManagerOptions {
   kernelCmdline?: string;
   rootImage?: string;
   workspaceImage?: string;
+  fwCfgConfig?: string;
 }
 
 export class VmManager extends EventEmitter {
@@ -30,6 +31,10 @@ export class VmManager extends EventEmitter {
     this.qemu.on("qmp:event", (event: string) => this.emit("qmp:event", event));
     await this.qemu.start(this.opts);
     this.connectSerial();
+  }
+
+  get qemuProcess(): QemuProcess {
+    return this.qemu;
   }
 
   async stop(): Promise<void> {

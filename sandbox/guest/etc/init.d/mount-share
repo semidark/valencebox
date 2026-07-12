@@ -1,0 +1,78 @@
+#!/sbin/openrc-run
+# Read fw_cfg config, mount workspace qcow2 at /workspace, mount WebDAV share at /host-workspace
+description="Mount workspace disk and WebDAV share"
+
+depend() {
+  need modules
+  use net
+  after bootmisc
+}
+
+start() {
+  # Mount workspace qcow2 on /dev/vdb
+  if [ ! -d /workspace ]; then
+    mkdir -p /workspace
+  fi
+  if ! mountpoint -q /workspace; then
+    # Wait for /dev/vdb to appear (virtio probe is async)
+    local waited=0
+    while [ ! -b /dev/vdb ] && [ $waited -lt 10 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if [ ! -b /dev/vdb ]; then
+      eerror "workspace disk /dev/vdb not found after 10s"
+      return 1
+    fi
+    mkfs.ext4 -F -q /dev/vdb 2>/dev/null || true
+    mount -t ext4 /dev/vdb /workspace || {
+      eerror "failed to mount /workspace"
+      return 1
+    }
+  fi
+  ebegin "Mounted /workspace"
+
+  # Read fw_cfg config
+  modprobe qemu_fw_cfg 2>/dev/null || true
+  if [ -f /sys/firmware/qemu_fw_cfg/by_name/opt/org.valencebox.config/raw ]; then
+    local config
+    config=$(cat /sys/firmware/qemu_fw_cfg/by_name/opt/org.valencebox.config/raw)
+    local port
+    port=$(echo "$config" | grep -o '"port":[0-9]*' | grep -o '[0-9]*')
+    local token
+    token=$(echo "$config" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+    if [ -n "$port" ] && [ -n "$token" ]; then
+      # Configure davfs2
+      mkdir -p /host-workspace
+      mkdir -p /etc/davfs2
+      echo "http://10.0.2.2:${port}/ valence ${token}" > /etc/davfs2/secrets
+      chmod 0600 /etc/davfs2/secrets
+      chown 0:0 /etc/davfs2/secrets 2>/dev/null || true
+      chown 0:0 /etc/davfs2 2>/dev/null || true
+
+      # Mount WebDAV share (best-effort — workspace qcow2 mount is the critical part)
+      if mountpoint -q /host-workspace; then
+        ebegin "WebDAV already mounted at /host-workspace"
+      else
+        mount -t davfs http://10.0.2.2:${port}/ /host-workspace 2>/dev/null || \
+          ebegin "WebDAV share not available (will retry in sync service)"
+      fi
+    else
+      eerror "fw_cfg config missing port or token"
+    fi
+  else
+    eerror "fw_cfg entry opt/org.valencebox.config not found"
+  fi
+  
+  eend 0
+}
+
+stop() {
+  if mountpoint -q /host-workspace; then
+    umount /host-workspace && ebegin "Unmounted /host-workspace"
+  fi
+  if mountpoint -q /workspace; then
+    umount /workspace && ebegin "Unmounted /workspace"
+  fi
+}

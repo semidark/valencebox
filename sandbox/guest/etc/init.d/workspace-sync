@@ -1,0 +1,62 @@
+#!/sbin/openrc-run
+# bidir sync between /workspace (native qcow2) and /host-workspace (WebDAV mirror)
+description="Workspace bidirectional sync via rsync"
+
+depend() {
+  need mount-share
+  after net
+}
+
+start() {
+  ebegin "Starting workspace sync service"
+
+  local waited=0
+  while ! mountpoint -q /workspace; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ $waited -ge 30 ]; then
+      eerror "/workspace not ready after 30s"
+      return 1
+    fi
+  done
+
+  cat > /var/run/workspace-sync.sh << 'SYNC_SCRIPT'
+#!/bin/sh
+EXCLUDES="--exclude=node_modules --exclude=.git --exclude=.DS_Store --exclude=.sync-tmp --exclude=lost+found"
+
+host_ok() { mountpoint -q /host-workspace; }
+
+# host→guest: poll every 2s
+(
+  while true; do
+    sleep 2
+    host_ok && rsync -a --delete $EXCLUDES /host-workspace/ /workspace/
+  done
+) &
+POLL_PID=$!
+
+# guest→host: inotify on local qcow2, restart on transient failure
+(
+  while true; do
+    inotifywait -r -q -e modify,create,delete,move --format '%w%f' /workspace \
+      --exclude 'node_modules|\.git|\.DS_Store|\.sync-tmp|lost\+found' 2>/dev/null | \
+      while IFS= read -r file; do
+        host_ok && rsync -a $EXCLUDES /workspace/ /host-workspace/
+      done
+  done
+) &
+INOTIFY_PID=$!
+
+wait $INOTIFY_PID
+kill $POLL_PID 2>/dev/null
+SYNC_SCRIPT
+  chmod +x /var/run/workspace-sync.sh
+  /var/run/workspace-sync.sh &
+  ebegin "Sync loop started (PID: $!)"
+}
+
+stop() {
+  pkill -f '/var/run/workspace-sync.sh' 2>/dev/null || true
+  sleep 0.5
+  ebegin "Sync service stopped"
+}

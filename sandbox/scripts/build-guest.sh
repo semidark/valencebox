@@ -31,7 +31,10 @@ echo sandbox > /tmp/sandbox-rootfs/etc/hostname
 printf "127.0.0.1\tlocalhost sandbox\n" > /tmp/sandbox-rootfs/etc/hosts
 
 # Remove unnecessary files before creating fs
-rm -f /tmp/sandbox-rootfs/.dockerenv /tmp/sandbox-rootfs/bin/bbsuid 2>/dev/null || true
+rm -f /tmp/sandbox-rootfs/.dockerenv 2>/dev/null || true
+# bbsuid is ---s--x--x owned by root — mkfs.ext4 -d can't create it as non-root.
+# Relax to 755; the guest doesn't need suid binaries.
+chmod 0755 /tmp/sandbox-rootfs/bin/bbsuid 2>/dev/null || true
 
 # Extract kernel + initramfs from exported rootfs
 cp /tmp/sandbox-rootfs/boot/vmlinuz-virt images/vmlinuz.bin

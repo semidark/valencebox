@@ -299,7 +299,7 @@ serial console.
 - [x] Refactor `QemuProcess.stop()` — QMP `system_powerdown` first, then SIGTERM/SIGKILL
 - [x] Add `query-status` lifecycle helper (used in `stop()` before `system_powerdown`)
 - [x] Surface QMP events through `VmManager` → `main.ts`
-- [ ] Write a unit test: start QEMU, connect QMP, `query-status`, `system_powerdown`, assert clean exit
+- [x] Write a unit test: start QEMU, connect QMP, `query-status`, `system_powerdown`, assert clean exit
 
 ### Phase 3 — Host WebDAV share server
 
@@ -358,10 +358,10 @@ traversal bugs to write, no PROPFIND parsing. The Nephele packages are actively
 maintained (SciActive Inc, Apache-2.0, 10 transitive deps for the core, 3 for
 the custom authenticator).
 
-- [ ] `npm install nephele @nephele/adapter-file-system @nephele/authenticator-custom`
-- [ ] New `src/main/http-share.ts`: generate token + port, start Express + Nephele
-- [ ] Random free port on `127.0.0.1` (use `net.createServer().listen(0)` pattern)
-- [ ] Write `{"port":<n>,"token":"..."}` to a temp file with `0600` permissions
+- [x] `npm install nephele @nephele/adapter-file-system @nephele/authenticator-custom`
+- [x] New `src/main/http-share.ts`: generate token + port, start Express + Nephele
+- [x] Random free port on `127.0.0.1` (use `net.createServer().listen(0)` pattern)
+- [x] Write `{"port":<n>,"token":"..."}` to a temp file with `0600` permissions
 - [ ] `chokidar` watch on workspace dir → notify guest of changes (optional optimization for Phase 6)
 - [ ] Honor `WORKSPACE_DIR` env / config
 - [ ] Path scope: `FileSystemAdapter({ root })` naturally rejects traversal (adapters control namespace)
@@ -409,12 +409,12 @@ Since auth is handled via Basic + token, configure `/etc/davfs2/davfs2.conf`:
 - [x] Rewrite `guest/Dockerfile`: amd64 Alpine, `linux-virt` kernel + modules
 - [x] Initramfs features: `virtio_blk`, `virtio_net`, `ext4`
 - [x] Read-only root fix: add `rootflags=rw` to kernel cmdline (initramfs defaults to `ro`)
-- [ ] Root fs on `/dev/vda`; workspace qcow2 on `/dev/vdb` mounted at `/workspace`
-- [ ] Install `davfs2`, `rsync`, `inotify-tools` in the guest
-- [ ] Configure `/etc/davfs2/davfs2.conf`: `use_locks 0`
-- [ ] Boot-time init script that reads fw_cfg config, writes davfs2 secrets,
+- [x] Root fs on `/dev/vda`; workspace qcow2 on `/dev/vdb` mounted at `/workspace`
+- [x] Install `davfs2`, `rsync`, `inotify-tools` in the guest
+- [x] Configure `/etc/davfs2/davfs2.conf`: `use_locks 0`
+- [x] Boot-time init script that reads fw_cfg config, writes davfs2 secrets,
       then mounts the WebDAV share
-- [ ] OpenRC service `workspace-sync`:
+- [x] OpenRC service `workspace-sync`:
        1. wait for WebDAV mount at `/host-workspace`
        2. `inotifywait` loop on `/workspace` → `rsync` to `/host-workspace` (guest→host, prompt)
        3. ~2s poll `rsync` `/host-workspace` → `/workspace` (host→guest, poll-bound)
