@@ -1,13 +1,12 @@
 # ── Single-stage: x86-64 Alpine guest rootfs ──
-# Produces a minimal bootable rootfs for QEMU microvm with virtio-blk root
-# on ttyS0 serial (root auto-login). No sync, no agents, no WebDAV — those
-# come in Phase 4+ of the QEMU rewrite (see docs/qemu.md).
+# Produces a bootable rootfs for QEMU microvm with virtio-blk root,
+# workspace qcow2 mount, WebDAV host share, and bidir sync service.
 FROM amd64/alpine:3.21
 
 ENV KERNEL=virt
 ENV HOSTNAME=sandbox
 
-# Userland: busybox init, serial getty, networking
+# Userland: busybox init, serial getty, networking, sync
 RUN apk add --no-cache \
     alpine-base \
     linux-virt \
@@ -15,7 +14,11 @@ RUN apk add --no-cache \
     agetty \
     openssh \
     dhcpcd \
-    curl
+    curl \
+    davfs2 \
+    rsync \
+    inotify-tools \
+    e2fsprogs
 
 # Rebuild initramfs with ext4 + virtio features (default virt initramfs only
 # has "base", which doesn't include ext4.ko). The linux-virt trigger already
@@ -39,7 +42,7 @@ RUN KREL=$(cat /usr/share/kernel/$KERNEL/kernel.release) && \
            net/nfc net/6lowpan net/ieee802154 net/qrtr net/rfkill \
            drivers/char/agp drivers/char/ipmi drivers/char/hw_random \
            drivers/char/tpm drivers/char/mwave drivers/char/drm \
-           drivers/gpio drivers/platform drivers/soc drivers/firmware \
+           drivers/gpio drivers/platform drivers/soc \
            drivers/scsi/aic7xxx drivers/scsi/aic79xx drivers/scsi/megaraid \
            drivers/scsi/mpt3sas drivers/scsi/hpsa drivers/scsi/qla2xxx \
            drivers/scsi/lpfc drivers/scsi/be2iscsi drivers/scsi/csiostor \
@@ -50,8 +53,13 @@ RUN KREL=$(cat /usr/share/kernel/$KERNEL/kernel.release) && \
            fs/ocfs2 fs/ocfs2_dlm fs/isofs fs/udf fs/exfat && \
     depmod $KREL
 
+# davfs2 config: no locking, no Expect:100 (SLIRP can be slow), short timeouts
+RUN mkdir -p /etc/davfs2 && \
+    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\n' >> /etc/davfs2/davfs2.conf && \
+    chmod 0644 /etc/davfs2/davfs2.conf && chown 0:0 /etc/davfs2 /etc/davfs2/davfs2.conf
+
 # Ensure virtio modules load at boot
-RUN printf 'virtio_blk\nvirtio_net\n' >> /etc/modules
+RUN printf 'virtio_blk\nvirtio_net\nqemu_fw_cfg\n' >> /etc/modules
 
 # Serial console: root auto-login on ttyS0 at 115200
 RUN echo 'ttyS0::respawn:/sbin/agetty -a root -s ttyS0 115200 vt100' >> /etc/inittab && \
@@ -66,8 +74,15 @@ RUN rm -rf /usr/share/man /usr/share/doc /usr/share/info /usr/share/i18n \
     /usr/share/zoneinfo/iso3166.rst /usr/share/licenses \
     /var/cache/* /tmp/* /root/.cache
 
-# Minimal OpenRC runlevel (hwdralls=no for boot speed)
+# Copy init scripts for workspace mount and sync
+COPY etc/init.d/mount-share /etc/init.d/mount-share
+COPY etc/init.d/workspace-sync /etc/init.d/workspace-sync
+RUN chmod +x /etc/init.d/mount-share /etc/init.d/workspace-sync
+
+# Minimal OpenRC runlevel
 RUN for i in devfs dmesg mdev; do rc-update add $i sysinit; done && \
     for i in hwclock modules sysctl hostname bootmisc; do rc-update add $i boot; done && \
     rc-update add networking default && \
+    rc-update add mount-share default && \
+    rc-update add workspace-sync default && \
     rc-update add killprocs shutdown

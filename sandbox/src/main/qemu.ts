@@ -10,11 +10,13 @@ export interface QemuOptions {
   smp: number;
   tmpDir: string;
   accel?: "auto" | "kvm" | "hvf" | "whpx" | "tcg";
+  freeze?: boolean;
   kernel?: string;
   initrd?: string;
   kernelCmdline?: string;
   rootImage?: string;
   workspaceImage?: string;
+  fwCfgConfig?: string;
 }
 
 export interface QemuStats {
@@ -141,6 +143,7 @@ export class QemuProcess extends EventEmitter {
     const accels = this.resolveAccels(opts.accel);
     const args: string[] = [];
 
+    if (opts.freeze) args.push("-S");
     for (const a of accels) args.push("-accel", a);
     args.push(
       "-machine", "microvm",
@@ -177,6 +180,10 @@ export class QemuProcess extends EventEmitter {
     }
 
     args.push("-netdev", "user,id=net0", "-device", "virtio-net-device,netdev=net0");
+
+    if (opts.fwCfgConfig) {
+      args.push("-fw_cfg", `name=opt/org.valencebox.config,file=${opts.fwCfgConfig}`);
+    }
 
     return args;
   }

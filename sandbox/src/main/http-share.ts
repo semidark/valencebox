@@ -1,0 +1,81 @@
+import express from "express";
+import { createServer, Server } from "http";
+import nepheleServer from "nephele";
+import FileSystemAdapter from "@nephele/adapter-file-system";
+import CustomAuthenticator, { User } from "@nephele/authenticator-custom";
+import { randomBytes } from "crypto";
+import * as net from "net";
+import * as fs from "fs";
+
+export interface ShareConfig {
+  port: number;
+  token: string;
+  fwCfgPath: string;
+}
+
+export class HttpShare {
+  private server: Server | null = null;
+  public readonly token: string;
+  public port = 0;
+  public fwCfgPath = "";
+
+  constructor() {
+    this.token = randomBytes(16).toString("hex");
+  }
+
+  async start(workspaceDir: string): Promise<ShareConfig> {
+    this.port = await getRandomFreePort();
+    this.fwCfgPath = await writeFwCfg(this.port, this.token);
+
+    const app = express();
+    app.use(
+      "/",
+      nepheleServer({
+        adapter: new FileSystemAdapter({ root: workspaceDir }),
+        authenticator: new CustomAuthenticator({
+          getUser: async (username: string) => {
+            if (username === "valence") return new User({ username });
+            return null;
+          },
+          authBasic: async (user: User, password: string) => {
+            return password === this.token;
+          },
+          realm: "ValenceBox Workspace",
+        }),
+      })
+    );
+
+    return new Promise((resolve, reject) => {
+      this.server = createServer(app);
+      this.server.listen(this.port, "127.0.0.1", () => {
+        resolve({ port: this.port, token: this.token, fwCfgPath: this.fwCfgPath });
+      });
+      this.server.on("error", reject);
+    });
+  }
+
+  async stop(): Promise<void> {
+    if (this.server) {
+      return new Promise((resolve) => this.server!.close(() => resolve()));
+    }
+  }
+}
+
+async function getRandomFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(port));
+    });
+    srv.on("error", reject);
+  });
+}
+
+async function writeFwCfg(port: number, token: string): Promise<string> {
+  const tmpDir = fs.mkdtempSync("/tmp/valence-");
+  const cfgPath = `${tmpDir}/config.json`;
+  fs.writeFileSync(cfgPath, JSON.stringify({ port, token }), "utf8");
+  fs.chmodSync(cfgPath, 0o600);
+  return cfgPath;
+}

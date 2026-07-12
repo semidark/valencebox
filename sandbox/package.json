@@ -10,6 +10,7 @@
     "start": "npm run build && electron .",
     "start:no-sandbox": "npm run build && electron . --no-sandbox",
     "test:unit": "tsx test/manifest.unit.ts && tsx test/hydrate-channel-switch.unit.ts",
+    "test:qmp": "tsx test/qmp.test.ts",
     "test:boot": "tsx test/boot.test.ts",
     "test:bridge": "tsx test/bridge.test.ts",
     "test:sync": "tsx test/sync.test.ts",
@@ -24,13 +25,17 @@
   "dependencies": {
     "@mercuryworkshop/wisp-js": "^0.4.1",
     "@mongodb-js/zstd": "^2.0.0",
+    "@nephele/adapter-file-system": "^1.0.0-alpha.67",
+    "@nephele/authenticator-custom": "^1.0.0-alpha.67",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "blakejs": "^1.2.1",
     "chokidar": "^4.0.0",
+    "nephele": "^1.0.0-alpha.67",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
     "electron": "^37.0.0",

@@ -1,16 +1,12 @@
-// Electron main process: owns the VmManager (QEMU), bridges it to the renderer.
+// Electron main process: owns the HTTP share + VmManager (QEMU), bridges to renderer.
 import { app, BrowserWindow, ipcMain } from "electron";
 import * as fs from "fs";
 import * as path from "path";
 import { VmManager } from "./vm-manager";
+import { HttpShare } from "./http-share";
 import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
-
-export interface SandboxAppConfig {
-  accel?: "auto" | "kvm" | "hvf" | "whpx" | "tcg";
-  memMb?: number;
-  smp?: number;
-}
+import { SandboxAppConfig } from "../config";
 
 function loadAppConfig(root: string): SandboxAppConfig {
   const p = path.join(root, "sandbox.config.json");
@@ -21,8 +17,17 @@ function loadAppConfig(root: string): SandboxAppConfig {
   }
 }
 
+function resolveWorkspaceDir(cfg: SandboxAppConfig, tmpDir: string): string {
+  if (cfg.workspaceDir) return cfg.workspaceDir;
+  if (process.env.WORKSPACE_DIR) return process.env.WORKSPACE_DIR;
+  const isolated = path.join(tmpDir, "workspace");
+  fs.mkdirSync(isolated, { recursive: true });
+  return isolated;
+}
+
 let win: BrowserWindow | null = null;
 let vm: VmManager | null = null;
+let share: HttpShare | null = null;
 
 async function createWindow() {
   win = new BrowserWindow({
@@ -69,6 +74,18 @@ async function startVm() {
     return;
   }
 
+  // Start HTTP share server (WebDAV) before QEMU so port+token are ready for fw_cfg
+  const workspaceDir = resolveWorkspaceDir(appCfg, tmpDir);
+  share = new HttpShare();
+  const shareCfg = await share.start(workspaceDir);
+  console.log(`[share] WebDAV on 127.0.0.1:${shareCfg.port}, fw_cfg at ${shareCfg.fwCfgPath}`);
+
+  const workspaceImage = assetPaths.workspaceQcow2Path();
+  if (!fs.existsSync(workspaceImage)) {
+    sendToWindow(IPC.onStatus, { phase: "error", error: "workspace.qcow2 not found — run `npm run images` first" });
+    return;
+  }
+
   vm = new VmManager({
     memoryMB: appCfg.memMb ?? 512,
     smp: appCfg.smp ?? 2,
@@ -78,6 +95,8 @@ async function startVm() {
     initrd: path.join(assetPaths.imagesDir(), "initramfs.bin"),
     kernelCmdline: "console=ttyS0 root=/dev/vda rootfstype=ext4 rootflags=rw modules=virtio_blk,ext4",
     rootImage,
+    workspaceImage,
+    fwCfgConfig: shareCfg.fwCfgPath,
   });
 
   vm.on("serial:data", (chunk: string) => sendToWindow(IPC.onSerial, chunk));
@@ -109,8 +128,7 @@ app.whenReady().then(async () => {
   await startVm();
 });
 
-app.on("window-all-closed", async () => {
-  await vm?.stop();
+app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
@@ -119,7 +137,15 @@ app.on("before-quit", (e) => {
   if (quitting) return;
   e.preventDefault();
   quitting = true;
-  void (vm?.stop() ?? Promise.resolve())
-    .catch((err) => console.error("[qemu] failed to stop cleanly:", err))
-    .finally(() => app.quit());
+  void (async () => {
+    try {
+      await vm?.stop();
+      await share?.stop();
+    } catch (err) {
+      console.error("[qemu] failed to stop cleanly:", err);
+    }
+    if (share?.fwCfgPath) {
+      fs.rmSync(path.dirname(share.fwCfgPath), { recursive: true, force: true });
+    }
+  })().finally(() => app.quit());
 });
