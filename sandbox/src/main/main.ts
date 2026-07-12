@@ -28,6 +28,7 @@ function resolveWorkspaceDir(cfg: SandboxAppConfig, tmpDir: string): string {
 let win: BrowserWindow | null = null;
 let vm: VmManager | null = null;
 let share: HttpShare | null = null;
+let detectedAccel: { name: string; available: boolean } | undefined;
 
 async function createWindow() {
   win = new BrowserWindow({
@@ -57,6 +58,8 @@ function registerIpc() {
     return {
       phase: vm.running ? "ready" as const : "stopped" as const,
       bootMs: vm.bootMs,
+      accel: detectedAccel?.name,
+      accelAvailable: detectedAccel?.available,
     };
   });
   ipcMain.on(IPC.serialInput, (_e, data: string) => vm?.sendInput(data));
@@ -112,10 +115,17 @@ async function startVm() {
   vm.on("qmp:event", (event: string) => {
     console.log("[qemu] QMP event:", event);
   });
+  vm.on("accel", (info: { name: string; available: boolean }) => {
+    detectedAccel = info;
+    console.log(`[qemu] accelerator: ${info.name}${info.available ? "" : " (unavailable — using TCG fallback)"}`);
+  });
 
   try {
     await vm.start();
-    sendToWindow(IPC.onStatus, { phase: "ready", bootMs: vm.bootMs });
+    sendToWindow(IPC.onStatus, {
+      phase: "ready", bootMs: vm.bootMs,
+      accel: detectedAccel?.name, accelAvailable: detectedAccel?.available,
+    });
   } catch (e: any) {
     sendToWindow(IPC.onStatus, { phase: "error", error: e.message });
     console.error("[qemu] failed to start:", e);
