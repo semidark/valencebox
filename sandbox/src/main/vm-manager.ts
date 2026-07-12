@@ -12,6 +12,7 @@ export interface VmManagerOptions {
   accel?: "auto" | "kvm" | "hvf" | "whpx" | "tcg";
   kernel?: string;
   initrd?: string;
+  kernelCmdline?: string;
   rootImage?: string;
   workspaceImage?: string;
 }

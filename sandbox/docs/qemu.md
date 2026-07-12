@@ -211,16 +211,15 @@ login prompt over a Unix serial socket. **No sync, no snapshots, no workspace.**
 
 **Status: Phase 1 complete — QEMU binary vendored, asset resolver written,
 `qemu.ts` spawns microvm over serial+QMP Unix sockets with accel priority,
-`VmManager` bridges serial I/O to renderer. Alpine guest image is the legacy
-v86 32-bit image (boots to kernel panic — expected). Full x86-64 guest image
-built in **Phase 4**.**
+`VmManager` bridges serial I/O to renderer, and the x86-64 guest image now
+boots to a serial login prompt (built in Phase 4).**
 
 - [x] Vendor a QEMU binary into `resources/qemu/linux/` for dev (Linux first)
 - [x] Write `src/main/qemu.ts` — spawns QEMU microvm with serial+QMP sockets, accel priority list
 - [x] Write `src/main/vm-manager.ts` — wraps QEMU process, connects serial socket, exposes events
 - [x] Rewire `main.ts` — replaces `Sandbox`+v86 with `VmManager`; IPC handlers for serial I/O only
 - [x] Implement the accel priority list: `kvm`/`hvf`/`whpx` then `tcg,thread=multi`
-- [ ] Boot a proper x86-64 Alpine root qcow2 (deferred to Phase 4 — guest image build)
+- [x] Boot a proper x86-64 Alpine root qcow2 (deferred to Phase 4 — guest image build)
 - [x] Wire the serial Unix socket into the existing xterm renderer (`onSerial` / input)
 - [x] Cross-platform binary/asset path resolver (dev vs `process.resourcesPath`)
 
@@ -258,11 +257,28 @@ Confirmed `qemu-system-x86_64 -M microvm` boots with our static binary:
   -device virtio-net-device,netdev=net0
 ```
 
-Result: machine boots, kernel initialises, virtio devices probe, but panics with
-`VFS: Unable to mount root fs on "/dev/vda"` — this is expected: the existing
-`sandbox/images/alpine-root.img` is a v86-era 32-bit Alpine image and its kernel
-does not match the 64-bit QEMU microvm environment. A proper x86-64 Alpine root
-qcow2 will be built in **Phase 4**.
+Updated boot command (x86-64 qcow2, Post-Phase-4 guest image):
+
+```
+./sandbox/resources/qemu/linux/qemu-system-x86_64 \
+  -L ./sandbox/resources/qemu/linux/pc-bios \
+  -M microvm -enable-kvm -cpu host -m 512m -smp 2 \
+  -kernel sandbox/images/vmlinuz.bin \
+  -initrd sandbox/images/initramfs.bin \
+  -append "console=ttyS0 root=/dev/vda rootfstype=ext4 modules=virtio_blk,ext4" \
+  -nodefaults -no-user-config -nographic -serial stdio \
+  -drive id=root,file=sandbox/images/root.qcow2,format=qcow2,if=none \
+  -device virtio-blk-device,drive=root \
+  -netdev user,id=net0 \
+  -device virtio-net-device,netdev=net0
+```
+
+Result: boots to `sandbox login:` prompt with root auto-login on serial.
+
+The kernel cmdline must include `rootfstype=ext4 modules=virtio_blk,ext4`
+for the initramfs to load the block driver and root filesystem module before
+attempting to mount root. Without it the mount fails with ENOENT because
+the modules aren't in the initramfs's default modprobe list.
 
 Accel snippet:
 
@@ -400,20 +416,20 @@ Since auth is handled via Basic + token, configure `/etc/davfs2/davfs2.conf`:
 - No TLS settings needed — `http://` URLs are treated as plain HTTP
 - `secrets ''` means davfs2 reads from the default secrets file, not env
 
-- [ ] Rewrite `guest/Dockerfile`: amd64 Alpine, `linux-virt` kernel + modules
-- [ ] Initramfs features: `virtio_blk`, `virtio_net`, `virtio_console`, `ext4`
+- [x] Rewrite `guest/Dockerfile`: amd64 Alpine, `linux-virt` kernel + modules
+- [x] Initramfs features: `virtio_blk`, `virtio_net`, `ext4`
 - [ ] Root fs on `/dev/vda`; workspace qcow2 on `/dev/vdb` mounted at `/workspace`
 - [ ] Install `davfs2`, `rsync`, `inotify-tools` in the guest
 - [ ] Configure `/etc/davfs2/davfs2.conf`: `use_locks 0`
 - [ ] Boot-time init script that reads fw_cfg config, writes davfs2 secrets,
       then mounts the WebDAV share
 - [ ] OpenRC service `workspace-sync`:
-      1. wait for WebDAV mount at `/host-workspace`
-      2. `inotifywait` loop on `/workspace` → `rsync` to `/host-workspace` (guest→host, prompt)
-      3. ~2s poll `rsync` `/host-workspace` → `/workspace` (host→guest, poll-bound)
-      4. exclude `node_modules`, `.git`, `.DS_Store`, `.sync-tmp`, `lost+found`
-- [ ] Serial getty autologin on `ttyS0`
-- [ ] Rewrite `scripts/build-guest.sh`: output `root.qcow2` + empty `workspace.qcow2` (no Rust, no v86 assets); honor `WORKSPACE_MB`
+       1. wait for WebDAV mount at `/host-workspace`
+       2. `inotifywait` loop on `/workspace` → `rsync` to `/host-workspace` (guest→host, prompt)
+       3. ~2s poll `rsync` `/host-workspace` → `/workspace` (host→guest, poll-bound)
+       4. exclude `node_modules`, `.git`, `.DS_Store`, `.sync-tmp`, `lost+found`
+- [x] Serial getty autologin on `ttyS0`
+- [x] Rewrite `scripts/build-guest.sh`: output `root.qcow2` + empty `workspace.qcow2` (no Rust, no v86 assets); honor `WORKSPACE_MB`
 
 ### Phase 5 — Snapshots via QMP
 

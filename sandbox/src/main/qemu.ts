@@ -12,6 +12,7 @@ export interface QemuOptions {
   accel?: "auto" | "kvm" | "hvf" | "whpx" | "tcg";
   kernel?: string;
   initrd?: string;
+  kernelCmdline?: string;
   rootImage?: string;
   workspaceImage?: string;
 }
@@ -158,6 +159,7 @@ export class QemuProcess extends EventEmitter {
 
     if (opts.kernel) args.push("-kernel", opts.kernel);
     if (opts.initrd) args.push("-initrd", opts.initrd);
+    if (opts.kernelCmdline) args.push("-append", opts.kernelCmdline);
 
     const rootImg = opts.rootImage;
     if (rootImg) {

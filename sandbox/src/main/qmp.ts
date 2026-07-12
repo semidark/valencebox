@@ -13,6 +13,9 @@ export class QmpClient extends EventEmitter {
   private cmdSeq = 0;
   private pending: PendingCmd | null = null;
   private queue: PendingCmd[] = [];
+  private greetingResolve: (() => void) | null = null;
+  private greetingReject: ((e: Error) => void) | null = null;
+  private greetingTimer: ReturnType<typeof setTimeout> | null = null;
 
   get connected(): boolean {
     return this.sock !== null && !this.sock.destroyed;
@@ -20,10 +23,16 @@ export class QmpClient extends EventEmitter {
 
   async connect(sockPath: string, timeoutMs = 5_000): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`QMP connect timeout`)), timeoutMs);
+      this.greetingResolve = resolve;
+      this.greetingReject = reject;
+      this.greetingTimer = setTimeout(() => {
+        if (this.greetingReject) {
+          this.greetingReject(new Error("QMP greeting timeout"));
+        }
+      }, timeoutMs);
 
       this.sock = net.createConnection(sockPath, () => {
-        clearTimeout(timer);
+        // TCP connected — wait for QMP greeting JSON in onData
       });
       this.sock.setEncoding("utf8");
 
@@ -32,9 +41,12 @@ export class QmpClient extends EventEmitter {
         this.sock = null;
         this.emit("close");
       });
-      this.sock.on("error", (err) => this.emit("error", err));
-
-      this.waitForGreeting().then(resolve).catch(reject);
+      this.sock.on("error", (err) => {
+        if (this.greetingReject) {
+          this.greetingReject(err);
+        }
+        this.emit("error", err);
+      });
     });
   }
 
@@ -74,7 +86,12 @@ export class QmpClient extends EventEmitter {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
-        const msg: { event?: string; return?: unknown; error?: { class: string; desc: string } } = JSON.parse(trimmed);
+        const msg: {
+          event?: string;
+          return?: unknown;
+          error?: { class: string; desc: string };
+          QMP?: { version: unknown };
+        } = JSON.parse(trimmed);
         this.processMessage(msg);
       } catch {
         // skip malformed JSON
@@ -82,7 +99,24 @@ export class QmpClient extends EventEmitter {
     }
   }
 
-  private processMessage(msg: { event?: string; return?: unknown; error?: { class: string; desc: string } }): void {
+  private processMessage(msg: {
+    event?: string;
+    return?: unknown;
+    error?: { class: string; desc: string };
+    QMP?: { version: unknown };
+  }): void {
+    // QMP greeting — resolve the connect() promise
+    if (msg.QMP) {
+      if (this.greetingTimer) clearTimeout(this.greetingTimer);
+      this.greetingTimer = null;
+      if (this.greetingResolve) {
+        this.greetingResolve();
+        this.greetingResolve = null;
+        this.greetingReject = null;
+      }
+      return;
+    }
+
     if (msg.event) {
       this.emit("event", msg.event);
       return;
@@ -102,30 +136,5 @@ export class QmpClient extends EventEmitter {
       this.pending = next;
       this.sock!.write(next.request);
     }
-  }
-
-  private waitForGreeting(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const check = () => {
-        const idx = this.buf.indexOf("\n");
-        if (idx === -1) {
-          this.sock?.once("data", () => check());
-          return;
-        }
-        const line = this.buf.slice(0, idx).trim();
-        this.buf = this.buf.slice(idx + 1);
-        try {
-          const msg = JSON.parse(line);
-          if (msg.QMP) {
-            resolve();
-          } else {
-            reject(new Error("Unexpected QMP greeting"));
-          }
-        } catch {
-          reject(new Error("QMP greeting parse error"));
-        }
-      };
-      check();
-    });
   }
 }
