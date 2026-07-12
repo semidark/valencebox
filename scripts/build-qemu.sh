@@ -11,10 +11,10 @@
 #   ./scripts/build-qemu.sh linux         # build for a specific platform
 #   ./scripts/build-qemu.sh all           # build for all platforms
 #
-# Output goes to resources/qemu/<platform>/qemu-system-x86_64
+# Output goes to sandbox/resources/qemu/<platform>/qemu-system-x86_64
 # plus any needed firmware blobs.
 #
-# Builds are cached in build/qemu/ per platform. Re-run to rebuild
+# Builds are cached in build/qemu/ at repo root. Re-run to rebuild
 # (or delete build/qemu/ to force a clean build).
 
 set -e
@@ -25,7 +25,7 @@ QEMU_TARBALL="qemu-${QEMU_VERSION}.tar.xz"
 QEMU_URL="https://download.qemu.org/${QEMU_TARBALL}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 BUILD_DIR="build/qemu"
-RESOURCE_DIR="resources/qemu"
+RESOURCE_DIR="sandbox/resources/qemu"
 
 TARGET="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 
@@ -129,7 +129,10 @@ RUN file qemu-system-x86_64 | grep -q -E "statically linked|static-pie" || { ech
 FROM alpine:3.20
 COPY --from=build /src/build/qemu-system-x86_64 /qemu-system-x86_64
 COPY --from=build /src/qemu-9.2.4/pc-bios/bios-256k.bin /
+COPY --from=build /src/qemu-9.2.4/pc-bios/bios-microvm.bin /
 COPY --from=build /src/qemu-9.2.4/pc-bios/vgabios-stdvga.bin /
+COPY --from=build /src/qemu-9.2.4/pc-bios/linuxboot_dma.bin /
+COPY --from=build /src/qemu-9.2.4/pc-bios/linuxboot.bin /
 DOCKERFILE
 
     # Extract the binary + firmware from the image
@@ -141,7 +144,10 @@ DOCKERFILE
     # Also copy firmware blobs
     mkdir -p "${tmpd}/pc-bios"
     docker cp valencebox-qemu-extract:/bios-256k.bin "${tmpd}/pc-bios/" 2>/dev/null || true
+    docker cp valencebox-qemu-extract:/bios-microvm.bin "${tmpd}/pc-bios/" 2>/dev/null || true
     docker cp valencebox-qemu-extract:/vgabios-stdvga.bin "${tmpd}/pc-bios/" 2>/dev/null || true
+    docker cp valencebox-qemu-extract:/linuxboot_dma.bin "${tmpd}/pc-bios/" 2>/dev/null || true
+    docker cp valencebox-qemu-extract:/linuxboot.bin "${tmpd}/pc-bios/" 2>/dev/null || true
     docker rm valencebox-qemu-extract >/dev/null
 
     # Verify it's actually statically linked

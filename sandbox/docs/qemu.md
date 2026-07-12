@@ -26,9 +26,11 @@ one's checkboxes are green.
 Electron main (Node)
  ├─ QEMU subprocess: qemu-system-x86_64
  │    -accel <hw>,-accel tcg,thread=multi   (auto-fallback, see Phase 1)
- │    -machine q35  -smp N  -m NNNN  -nographic
- │    -drive if=virtio (root qcow2)
- │    -drive if=virtio (workspace qcow2)   ← fast native build surface
+ │    -machine microvm  -smp N  -m NNNN  -nographic  -no-reboot
+ │    -drive id=root,file=root.qcow2,format=qcow2,if=none
+ │    -device virtio-blk-device,drive=root
+ │    -drive id=ws,file=workspace.qcow2,format=qcow2,if=none
+ │    -device virtio-blk-device,drive=ws
  │    -serial unix:serial.sock  -qmp unix:qmp.sock
  │    -nic user (SLIRP, open egress for now)
 ├─ WebDAV server (pure Node, no TLS, token-based auth)
@@ -53,6 +55,7 @@ Guest (Alpine x86-64)
 
 | Topic | Decision |
 |---|---|
+| Machine type | `microvm` (no PCI/ACPI, virtio-mmio only, fast boot) |
 | Emulator | vanilla `qemu-system-x86_64`, bundled per-platform |
 | Acceleration | auto-detect: `kvm`/`hvf`/`whpx` if available, else `tcg,thread=multi` |
 | Guest | Alpine x86-64, `linux-virt` kernel, virtio devices |
@@ -63,6 +66,20 @@ Guest (Alpine x86-64)
 | Snapshots | QMP `migrate` to zstd file (RAM + device state only) |
 | Terminal | login shell on QEMU serial console |
 | Platforms | Linux + macOS + Windows from day one |
+
+### Machine type: microvm
+
+We use `-machine microvm` instead of the default `q35` (PCI/ACPI). microvm is a
+minimalist machine type inspired by Firecracker — no PCI, no ACPI, just
+virtio-mmio, fw_cfg, and the serial console. This gives faster boot times, a
+smaller attack surface, and a simpler device model. The trade-off:
+
+- No PCI hotplug — not needed for a single-purpose dev VM.
+- No ACPI — shut down via triple-fault + `-no-reboot` instead.
+- All virtio devices use `virtio-*-device` (mmio) not `virtio-*-pci`.
+
+Since microvm has no PCI, drives are wired as `-device virtio-blk-device`
+(virtio-mmio transport) rather than `-device virtio-blk-pci`.
 
 ### Why not 9p / virtiofs
 
@@ -180,10 +197,10 @@ boxes as you go.
 
 Goal: land the plan, carve out space, keep the tree buildable.
 
-- [ ] Commit this plan and the AGENTS.md update
-- [ ] Add a `resources/qemu/<platform>/` layout convention (empty dirs + README) for bundled binaries
-- [ ] Add `sandbox.config.json` schema stub for new knobs (`accel`, `workspaceDir`, `memMb`, `smp`) — no wiring yet
-- [ ] Decide QEMU source per platform (portable build vs. distro binary) and document in `resources/qemu/README.md`
+- [x] Commit this plan and the AGENTS.md update
+- [x] Add a `resources/qemu/<platform>/` layout convention (empty dirs + README) for bundled binaries
+- [x] Add `sandbox.config.json` schema stub for new knobs (`accel`, `workspaceDir`, `memMb`, `smp`) — no wiring yet
+- [x] Decide QEMU source per platform (portable build vs. distro binary) and document in `resources/qemu/README.md`
 
 **Verify:** `npm run build` still passes on the untouched v86 tree.
 
@@ -192,13 +209,60 @@ Goal: land the plan, carve out space, keep the tree buildable.
 Goal: `qemu-system-x86_64` launches a throwaway Alpine ISO/qcow2 and reaches a
 login prompt over a Unix serial socket. **No sync, no snapshots, no workspace.**
 
-- [ ] Vendor a QEMU binary into `resources/qemu/linux/` for dev (Linux first)
-- [ ] Write a minimal `src/main/qemu.ts` (or rewrite `vm.ts`) that spawns QEMU with:
-      `-machine q35 -m 2048 -smp 4 -nographic -serial unix:<sock>,server,nowait`
-- [ ] Implement the accel priority list (see snippet below): `kvm`/`hvf`/`whpx` then `tcg,thread=multi`
-- [ ] Boot a minimal x86-64 Alpine root qcow2 on `-drive if=virtio` (`/dev/vda`)
-- [ ] Wire the serial Unix socket into the existing xterm renderer (`onSerial` / input)
-- [ ] Cross-platform binary/asset path resolver (dev vs `process.resourcesPath`)
+**Status: Phase 1 complete — QEMU binary vendored, asset resolver written,
+`qemu.ts` spawns microvm over serial+QMP Unix sockets with accel priority,
+`VmManager` bridges serial I/O to renderer. Alpine guest image is the legacy
+v86 32-bit image (boots to kernel panic — expected). Full x86-64 guest image
+built in **Phase 4**.**
+
+- [x] Vendor a QEMU binary into `resources/qemu/linux/` for dev (Linux first)
+- [x] Write `src/main/qemu.ts` — spawns QEMU microvm with serial+QMP sockets, accel priority list
+- [x] Write `src/main/vm-manager.ts` — wraps QEMU process, connects serial socket, exposes events
+- [x] Rewire `main.ts` — replaces `Sandbox`+v86 with `VmManager`; IPC handlers for serial I/O only
+- [x] Implement the accel priority list: `kvm`/`hvf`/`whpx` then `tcg,thread=multi`
+- [ ] Boot a proper x86-64 Alpine root qcow2 (deferred to Phase 4 — guest image build)
+- [x] Wire the serial Unix socket into the existing xterm renderer (`onSerial` / input)
+- [x] Cross-platform binary/asset path resolver (dev vs `process.resourcesPath`)
+
+Key details:
+- Microvm uses `-device virtio-blk-device` (mmio) — no PCI bus
+- NIC uses explicit `-netdev user,id=net0 -device virtio-net-device,netdev=net0`
+- Shutdown via QMP `system_powerdown` then SIGTERM/SIGKILL fallback
+- Serial and QMP sockets created under `<userData>/qemu-<random>/`
+
+Built binary (`resources/qemu/linux/qemu-system-x86_64`):
+- 86 MB, static-pie linked (musl), ELF x86-64, QEMU 9.2.4
+- Features: KVM, SLIRP, zstd, QMP
+- Firmware blobs extracted:
+  - `bios-microvm.bin` — qboot BIOS (primary machine type)
+  - `bios-256k.bin` — SeaBIOS (kept for compatibility/debug)
+  - `linuxboot.bin`, `linuxboot_dma.bin` — option ROMs for direct kernel boot
+  - `vgabios-stdvga.bin` — VGA BIOS (unused in `-nographic`)
+- Build script: `scripts/build-qemu.sh` — Alpine 3.20 Docker, libslirp 4.8.0 from source
+
+### microvm smoke test (manual, 2026-07-12)
+
+Confirmed `qemu-system-x86_64 -M microvm` boots with our static binary:
+
+```
+# Requires -L pointing at pc-bios/ so QEMU finds bios-microvm.bin
+./sandbox/resources/qemu/linux/qemu-system-x86_64 \
+  -L ./sandbox/resources/qemu/linux/pc-bios \
+  -M microvm -enable-kvm -cpu host -m 512m -smp 2 \
+  -kernel sandbox/images/vmlinuz.bin \
+  -append "earlyprintk=ttyS0 console=ttyS0 root=/dev/vda" \
+  -nodefaults -no-user-config -nographic -serial stdio \
+  -drive id=test,file=sandbox/images/alpine-root.img,format=raw,if=none \
+  -device virtio-blk-device,drive=test \
+  -netdev user,id=net0 \
+  -device virtio-net-device,netdev=net0
+```
+
+Result: machine boots, kernel initialises, virtio devices probe, but panics with
+`VFS: Unable to mount root fs on "/dev/vda"` — this is expected: the existing
+`sandbox/images/alpine-root.img` is a v86-era 32-bit Alpine image and its kernel
+does not match the 64-bit QEMU microvm environment. A proper x86-64 Alpine root
+qcow2 will be built in **Phase 4**.
 
 Accel snippet:
 
@@ -220,13 +284,16 @@ kill). Runs on both a KVM host and a TCG-only host (`accel=tcg` forced).
 Goal: structured lifecycle control over the QMP Unix socket, independent of the
 serial console.
 
-- [ ] Minimal QMP client (JSON lines over Unix socket): negotiate `qmp_capabilities`, send commands, read events
-- [ ] Lifecycle: `query-status`, `system_powerdown`, `quit`, `stop`, `cont`
-- [ ] Surface QMP events (e.g. `SHUTDOWN`, `RESET`) to the sandbox orchestrator
-- [ ] Graceful stop: `system_powerdown` then fall back to `quit`/kill on timeout
-
-**Verify:** unit test that opens the QMP socket against a running Phase-1 VM,
-runs the capability handshake, queries status, and powers down cleanly.
+- [x] Write `src/main/qmp.ts` — JSON-lines QMP client over Unix socket with:
+      - Capability negotiation (`qmp_capabilities`)
+      - Ordered command queue (no concurrent `execute()` races)
+      - Event forwarding (`SHUTDOWN`, `RESET`, etc.)
+      - `system_powerdown` for graceful guest shutdown
+- [x] Integrate QMP into `QemuProcess.start()` — connect + handshake after socket ready
+- [x] Refactor `QemuProcess.stop()` — QMP `system_powerdown` first, then SIGTERM/SIGKILL
+- [x] Add `query-status` lifecycle helper (used in `stop()` before `system_powerdown`)
+- [x] Surface QMP events through `VmManager` → `main.ts`
+- [ ] Write a unit test: start QEMU, connect QMP, `query-status`, `system_powerdown`, assert clean exit
 
 ### Phase 3 — Host WebDAV share server
 

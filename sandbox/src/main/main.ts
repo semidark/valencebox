@@ -1,23 +1,15 @@
-// Electron main process: owns the Sandbox, bridges it to the renderer.
+// Electron main process: owns the VmManager (QEMU), bridges it to the renderer.
 import { app, BrowserWindow, ipcMain } from "electron";
 import * as fs from "fs";
 import * as path from "path";
-import { Sandbox, defaultPaths } from "./sandbox";
-import { EgressPolicy, DEFAULT_POLICY } from "./wisp";
+import { VmManager } from "./vm-manager";
+import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
 
 export interface SandboxAppConfig {
-  /** Extra hostnames to allow through the egress gate (appended to defaults). */
-  egress?: {
-    /** Allow all outbound traffic (bypasses all allowlists). */
-    allowAll?: boolean;
-    extraHosts?: string[];
-    /**
-     * Extra ports to allow (appended to default [80, 443]).
-     * Each entry is a port number or a [start, end] range.
-     */
-    extraPorts?: (number | [number, number])[];
-  };
+  accel?: "auto" | "kvm" | "hvf" | "whpx" | "tcg";
+  memMb?: number;
+  smp?: number;
 }
 
 function loadAppConfig(root: string): SandboxAppConfig {
@@ -29,23 +21,8 @@ function loadAppConfig(root: string): SandboxAppConfig {
   }
 }
 
-function mergeEgress(cfg: SandboxAppConfig): EgressPolicy {
-  const extra = cfg.egress;
-  if (!extra) return DEFAULT_POLICY;
-  if (extra.allowAll) return { allowHosts: [], allowAll: true };
-  return {
-    ...DEFAULT_POLICY,
-    allowHosts: extra.extraHosts?.length
-      ? [...DEFAULT_POLICY.allowHosts, ...extra.extraHosts]
-      : DEFAULT_POLICY.allowHosts,
-    allowPorts: extra.extraPorts?.length
-      ? [...(DEFAULT_POLICY.allowPorts ?? [80, 443]), ...extra.extraPorts]
-      : DEFAULT_POLICY.allowPorts,
-  };
-}
-
 let win: BrowserWindow | null = null;
-let sandbox: Sandbox | null = null;
+let vm: VmManager | null = null;
 
 async function createWindow() {
   win = new BrowserWindow({
@@ -70,66 +47,78 @@ function sendToWindow(channel: string, ...args: any[]) {
 }
 
 function registerIpc() {
-  // Registered before the window loads so the renderer's initial getStatus()
-  // never races the handler. sandbox may still be null at that point.
-  ipcMain.handle(IPC.getStatus, () => sandbox?.status ?? { phase: "boot" });
-  ipcMain.handle(IPC.saveSnapshot, () => sandbox?.saveSnapshot());
-  ipcMain.on(IPC.serialInput, (_e, data: string) => sandbox?.sendInput(data));
-  ipcMain.on(IPC.ptyInput, (_e, data: Uint8Array) => sandbox?.sendPtyInput(data));
-  ipcMain.on(IPC.ptyResize, (_e, cols: number, rows: number) => sandbox?.resizePty(cols, rows));
+  ipcMain.handle(IPC.getStatus, () => {
+    if (!vm) return { phase: "boot" } as const;
+    return {
+      phase: vm.running ? "ready" as const : "stopped" as const,
+      bootMs: vm.bootMs,
+    };
+  });
+  ipcMain.on(IPC.serialInput, (_e, data: string) => vm?.sendInput(data));
+  // Stub handlers for legacy IPC channels — renderer may still call them
+  ipcMain.handle(IPC.saveSnapshot, () => {});
 }
 
-async function startSandbox() {
-  const paths = defaultPaths(app.getPath("userData"));
-  // WORKSPACE_DIR points the sync engine at an arbitrary host project dir
-  // (default: <userData>/workspace). Not a live mount — see README.
-  if (process.env.WORKSPACE_DIR) {
-    paths.hostDir = path.resolve(process.env.WORKSPACE_DIR);
-  }
+async function startVm() {
   const appCfg = loadAppConfig(app.getPath("userData"));
-  console.log("[sandbox] host workspace:", paths.hostDir);
-  sandbox = new Sandbox({
-    ...paths,
-    memoryMB: 512,
-    enableNetwork: true,
-    egress: mergeEgress(appCfg),
-    onSerial: (chunk) => sendToWindow(IPC.onSerial, chunk),
+  const tmpDir = fs.mkdtempSync(path.join(app.getPath("userData"), "qemu-"));
+
+  const rootImage = assetPaths.rootQcow2Path();
+  if (!fs.existsSync(rootImage)) {
+    sendToWindow(IPC.onStatus, { phase: "error", error: "root.qcow2 not found — run `npm run images` first" });
+    return;
+  }
+
+  vm = new VmManager({
+    memoryMB: appCfg.memMb ?? 512,
+    smp: appCfg.smp ?? 2,
+    tmpDir,
+    accel: appCfg.accel,
+    kernel: path.join(assetPaths.imagesDir(), "vmlinuz.bin"),
+    initrd: path.join(assetPaths.imagesDir(), "initramfs.bin"),
+    rootImage,
   });
-  sandbox.on("status", (s) => sendToWindow(IPC.onStatus, s));
-  sandbox.on("conflict", (c) => sendToWindow(IPC.onConflict, c));
-  sandbox.on("log", (m) => console.log("[sandbox]", m));
-  sandbox.on("pty:data", (chunk: Uint8Array) => sendToWindow(IPC.onPtyData, chunk));
-  sandbox.on("pty:closed", () => sendToWindow(IPC.onPtyClosed));
+
+  vm.on("serial:data", (chunk: string) => sendToWindow(IPC.onSerial, chunk));
+  vm.on("serial:connected", () => console.log("[qemu] serial connected"));
+  vm.on("serial:error", (err: Error) => {
+    console.error("[qemu] serial error:", err);
+    sendToWindow(IPC.onStatus, { phase: "error", error: err.message });
+  });
+  vm.on("serial:closed", () => {
+    console.log("[qemu] serial closed");
+    sendToWindow(IPC.onStatus, { phase: "stopped" });
+  });
+  vm.on("qmp:event", (event: string) => {
+    console.log("[qemu] QMP event:", event);
+  });
 
   try {
-    await sandbox.start();
+    await vm.start();
+    sendToWindow(IPC.onStatus, { phase: "ready", bootMs: vm.bootMs });
   } catch (e: any) {
     sendToWindow(IPC.onStatus, { phase: "error", error: e.message });
-    console.error("sandbox failed to start:", e);
+    console.error("[qemu] failed to start:", e);
   }
 }
 
 app.whenReady().then(async () => {
   registerIpc();
   await createWindow();
-  await startSandbox();
+  await startVm();
 });
 
 app.on("window-all-closed", async () => {
-  await sandbox?.stop();
+  await vm?.stop();
   if (process.platform !== "darwin") app.quit();
 });
 
-// Electron doesn't wait for an async "before-quit" listener — without
-// preventDefault() the process can exit mid-snapshot (e.g. Cmd+Q). Defer the
-// actual quit until sandbox.stop() (final snapshot included) has finished,
-// then let it through on the second pass.
 let quitting = false;
 app.on("before-quit", (e) => {
   if (quitting) return;
   e.preventDefault();
   quitting = true;
-  void (sandbox?.stop() ?? Promise.resolve())
-    .catch((err) => console.error("sandbox failed to stop cleanly:", err))
+  void (vm?.stop() ?? Promise.resolve())
+    .catch((err) => console.error("[qemu] failed to stop cleanly:", err))
     .finally(() => app.quit());
 });
