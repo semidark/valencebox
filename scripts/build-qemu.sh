@@ -133,6 +133,9 @@ COPY --from=build /src/qemu-9.2.4/pc-bios/bios-microvm.bin /
 COPY --from=build /src/qemu-9.2.4/pc-bios/vgabios-stdvga.bin /
 COPY --from=build /src/qemu-9.2.4/pc-bios/linuxboot_dma.bin /
 COPY --from=build /src/qemu-9.2.4/pc-bios/linuxboot.bin /
+# Needed for -machine pc (virtio-pci devices)
+COPY --from=build /src/qemu-9.2.4/pc-bios/efi-virtio.rom /
+COPY --from=build /src/qemu-9.2.4/pc-bios/kvmvapic.bin /
 DOCKERFILE
 
     # Extract the binary + firmware from the image
@@ -148,6 +151,8 @@ DOCKERFILE
     docker cp valencebox-qemu-extract:/vgabios-stdvga.bin "${tmpd}/pc-bios/" 2>/dev/null || true
     docker cp valencebox-qemu-extract:/linuxboot_dma.bin "${tmpd}/pc-bios/" 2>/dev/null || true
     docker cp valencebox-qemu-extract:/linuxboot.bin "${tmpd}/pc-bios/" 2>/dev/null || true
+    docker cp valencebox-qemu-extract:/efi-virtio.rom "${tmpd}/pc-bios/" 2>/dev/null || true
+    docker cp valencebox-qemu-extract:/kvmvapic.bin "${tmpd}/pc-bios/" 2>/dev/null || true
     docker rm valencebox-qemu-extract >/dev/null
 
     # Verify it's actually statically linked

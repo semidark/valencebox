@@ -21,33 +21,85 @@ export class QmpClient extends EventEmitter {
     return this.sock !== null && !this.sock.destroyed;
   }
 
-  async connect(sockPath: string, timeoutMs = 5_000): Promise<void> {
+  async connect(port: number, host = "127.0.0.1", timeoutMs = 15_000): Promise<void> {
+    return this.connectRetry(timeoutMs, () => this.tryConnect(port, host));
+  }
+
+  async connectPath(path: string, timeoutMs = 15_000): Promise<void> {
+    return this.connectRetry(timeoutMs, () => this.tryConnectPath(path));
+  }
+
+  private async connectRetry(timeoutMs: number, tryConnect: () => Promise<void>): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let lastErr: Error | undefined;
+
+    while (Date.now() < deadline) {
+      try {
+        await tryConnect();
+        return;
+      } catch (e: any) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+
+    throw lastErr ?? new Error(`QMP connect timeout after ${timeoutMs}ms`);
+  }
+
+  private async tryConnect(port: number, host: string): Promise<void> {
+    this.cleanup();
     return new Promise((resolve, reject) => {
-      this.greetingResolve = resolve;
-      this.greetingReject = reject;
-      this.greetingTimer = setTimeout(() => {
-        if (this.greetingReject) {
-          this.greetingReject(new Error("QMP greeting timeout"));
-        }
-      }, timeoutMs);
-
-      this.sock = net.createConnection(sockPath, () => {
-        // TCP connected — wait for QMP greeting JSON in onData
-      });
+      this.setupGreetingHandlers(resolve, reject);
+      this.sock = net.createConnection(port, host, () => {});
       this.sock.setEncoding("utf8");
-
       this.sock.on("data", (data: string) => this.onData(data));
-      this.sock.on("close", () => {
-        this.sock = null;
-        this.emit("close");
-      });
-      this.sock.on("error", (err) => {
-        if (this.greetingReject) {
-          this.greetingReject(err);
-        }
-        this.emit("error", err);
-      });
+      this.sock.on("close", () => this.onClose());
+      this.sock.on("error", (err) => this.onError(err));
     });
+  }
+
+  private async tryConnectPath(path: string): Promise<void> {
+    this.cleanup();
+    return new Promise((resolve, reject) => {
+      this.setupGreetingHandlers(resolve, reject);
+      this.sock = net.createConnection(path, () => {});
+      this.sock.setEncoding("utf8");
+      this.sock.on("data", (data: string) => this.onData(data));
+      this.sock.on("close", () => this.onClose());
+      this.sock.on("error", (err) => this.onError(err));
+    });
+  }
+
+  private setupGreetingHandlers(resolve: () => void, reject: (e: Error) => void): void {
+    this.greetingResolve = resolve;
+    this.greetingReject = reject;
+    this.greetingTimer = setTimeout(() => {
+      if (this.greetingReject) {
+        this.greetingReject(new Error("QMP greeting timeout"));
+      }
+    }, 15_000);
+  }
+
+  private cleanup(): void {
+    this.sock?.destroy();
+    this.sock = null;
+    this.greetingResolve = null;
+    this.greetingReject = null;
+    if (this.greetingTimer) clearTimeout(this.greetingTimer);
+    this.greetingTimer = null;
+  }
+
+  private onClose(): void {
+    if (this.greetingReject) {
+      this.greetingReject(new Error("QMP connection closed before greeting"));
+    }
+    this.sock = null;
+  }
+
+  private onError(err: Error): void {
+    if (this.greetingReject) {
+      this.greetingReject(err);
+    }
   }
 
   disconnect(): void {

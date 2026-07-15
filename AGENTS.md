@@ -1,17 +1,21 @@
 # AGENTS.md
 
-## ⚠️ Active rewrite: v86 → QEMU
+## ⚠️ Active rewrite: v86 → QEMU (currently targeting `-machine <microvm|pc>`)
 
 The product is mid-pivot from **v86** (in-process WASM JIT, 32-bit guest) to
 **vanilla QEMU** (`qemu-system-x86_64` as a bundled host subprocess, 64-bit
-guest). **`sandbox/docs/qemu.md` is the source of truth** for the target
-architecture, the phased execution plan, and progress checkboxes. Read it before
-touching `vm.ts`, `snapshot.ts`, `sandbox.ts`, the guest image, or packaging.
+guest). **`sandbox/docs/qemu.md` is the source of truth.**
 
-Many facts below describe the **legacy v86 stack** that is being torn out. They
-are marked **(LEGACY — being removed)**. Do not build new work on them; follow
-`docs/qemu.md` instead. As phases land, migrate the corresponding notes here from
-LEGACY to current.
+The machine type is selected dynamically at runtime:
+- **microvm** when hardware acceleration (KVM/HVF/WHPX) is available — kvmclock
+  provides reliable TSC, so microvm's missing HPET doesn't matter.
+- **pc** (i440fx) when falling back to TCG — provides HPET + ACPI PM timer for
+  working TSC calibration under pure emulation.
+
+Virtio devices match the machine (`virtio-*-device` for microvm mmio,
+`virtio-*-pci` for pc). The `reboot=t` kernel parameter (triple-fault reboot for
+`-no-reboot`) is appended automatically for microvm. Revisit microvm-under-TCG
+once QEMU implements TSC frequency via CPUID (upstream issue #2381).
 
 ## Repo shape
 
@@ -27,8 +31,8 @@ LEGACY to current.
 
 Full detail in `sandbox/docs/qemu.md`. In brief:
 
-- `qemu-system-x86_64` spawned by Electron main; `-machine q35`, virtio devices,
-  `-nographic`, serial + QMP over Unix sockets, `-nic user` (SLIRP).
+- `qemu-system-x86_64` spawned by Electron main; `-machine pc` (i440fx), virtio
+  devices, `-nographic`, serial + QMP over TCP sockets, `-nic user` (SLIRP).
 - **Acceleration auto-detects**: `kvm` (Linux) / `hvf` (macOS) / `whpx` (Windows)
   via an `-accel` priority list, falling back to `-accel tcg,thread=multi`. Users
   get hardware virtualization when available, full software emulation otherwise.
