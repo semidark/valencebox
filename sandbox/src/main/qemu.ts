@@ -1,8 +1,8 @@
-import { ChildProcess, spawn } from "child_process";
+import { ChildProcess, spawn, execSync } from "child_process";
 import * as fs from "fs";
-import * as path from "path";
+import * as fsp from "fs/promises";
 import { EventEmitter } from "events";
-import { qemuBinaryPath, firmwareDir, serialSockPath, qmpSockPath } from "./asset-paths";
+import { qemuBinaryPath, firmwareDir, allocSerialTransport, allocQmpTransport, VmTransport } from "./asset-paths";
 import { QmpClient } from "./qmp";
 
 export interface QemuOptions {
@@ -29,8 +29,9 @@ export class QemuProcess extends EventEmitter {
   private proc: ChildProcess | null = null;
   private startedAt = 0;
   private qmp: QmpClient | null = null;
-  public serialPath = "";
-  public qmpPath = "";
+  public serialTransport: VmTransport | null = null;
+  public qmpTransport: VmTransport | null = null;
+  public machineType: "microvm" | "pc" = "pc";
 
   get running(): boolean {
     return this.proc !== null && this.proc.exitCode === null;
@@ -50,17 +51,19 @@ export class QemuProcess extends EventEmitter {
 
   async start(opts: QemuOptions): Promise<void> {
     this.startedAt = Date.now();
-    this.serialPath = serialSockPath(opts.tmpDir);
-    this.qmpPath = qmpSockPath(opts.tmpDir);
+    this.serialTransport = await allocSerialTransport(opts.tmpDir);
+    this.qmpTransport = await allocQmpTransport(opts.tmpDir);
 
-    const hw = opts.accel === "auto" || !opts.accel
-      ? QemuProcess.checkAccel(process.platform)
-      : { name: opts.accel, available: true };
+    const detected = QemuProcess.checkAccel(process.platform);
+    const hw = opts.accel && opts.accel !== "auto" && opts.accel !== "tcg"
+      ? { name: opts.accel, available: opts.accel === detected.name && detected.available, hint: detected.hint }
+      : detected;
     console.log(`[qemu] accel: ${hw.name}${hw.available ? "" : " (unavailable)"}`);
     if (hw.hint) console.log(`[qemu] ${hw.hint}`);
     this.emit("accel", hw);
 
     const args = this.buildArgs(opts);
+    console.log(`[qemu] machine: ${this.machineType}`);
     const binPath = qemuBinaryPath();
 
     if (!fs.existsSync(binPath)) {
@@ -68,7 +71,7 @@ export class QemuProcess extends EventEmitter {
     }
 
     this.proc = spawn(binPath, args, {
-      stdio: ["ignore", "pipe", "inherit"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
     const stderrChunks: Buffer[] = [];
@@ -97,14 +100,31 @@ export class QemuProcess extends EventEmitter {
       this.emit("error", err);
     });
 
-    console.log(`[qemu] spawned PID ${proc.pid}, waiting for serial socket at ${this.serialPath}`);
-    await this.waitForSocket(this.serialPath, 15_000);
-    console.log(`[qemu] serial socket ready`);
-    await this.waitForSocket(this.qmpPath, 15_000);
-    console.log(`[qemu] QMP socket ready`);
+    // chmod Unix sockets after QEMU creates them
+    if (this.serialTransport.type === "unix") {
+      this.chmodSocket(this.serialTransport.connectPath).catch(() => {});
+      this.chmodSocket(this.qmpTransport.connectPath).catch(() => {});
+    }
+
+    const qmpLabel = this.qmpTransport.type === "unix"
+      ? this.qmpTransport.connectPath
+      : `127.0.0.1:${this.qmpTransport.connectPath}`;
+    console.log(`[qemu] spawned PID ${proc.pid}, waiting for QMP on ${qmpLabel}`);
 
     this.qmp = new QmpClient();
-    await this.qmp.connect(this.qmpPath);
+    try {
+      if (this.qmpTransport.type === "unix") {
+        await this.qmp.connectPath(this.qmpTransport.connectPath, 15_000);
+      } else {
+        await this.qmp.connect(Number(this.qmpTransport.connectPath), "127.0.0.1", 15_000);
+      }
+    } catch (e) {
+      if (this.proc?.exitCode !== null && stderrChunks.length > 0) {
+        const msg = Buffer.concat(stderrChunks).toString("utf8").trim();
+        throw new Error(`QEMU exited during startup (exit code ${proc.exitCode ?? "?"}): ${msg}`);
+      }
+      throw e;
+    }
     await this.qmp.execute("qmp_capabilities");
     console.log(`[qemu] QMP handshake complete`);
 
@@ -148,51 +168,90 @@ export class QemuProcess extends EventEmitter {
 
   private buildArgs(opts: QemuOptions): string[] {
     const accels = this.resolveAccels(opts.accel);
+    // Use microvm when hardware acceleration is available (first accel isn't TCG);
+    // fall back to pc (i440fx) under TCG so the guest has HPET for TSC calibration.
+    const useMicrovm = accels[0] !== "tcg,thread=multi";
+    const machineType = useMicrovm ? "microvm" : "pc";
+    this.machineType = machineType;
+
     const args: string[] = [];
 
     if (opts.freeze) args.push("-S");
     for (const a of accels) args.push("-accel", a);
     args.push(
-      "-machine", "microvm",
+      "-machine", machineType,
       "-m", `${opts.memoryMB}`,
       "-smp", `${opts.smp}`,
       "-nodefaults",
       "-no-user-config",
       "-nographic",
       "-no-reboot",
-      "-serial", `unix:${this.serialPath},server,nowait`,
-      "-qmp", `unix:${this.qmpPath},server,nowait`,
     );
+
+    // QMP transport (put before serial so monitor init happens first on Windows)
+    const qmpTr = this.qmpTransport!;
+    const qmpArg = qmpTr.type === "unix"
+      ? `unix:${qmpTr.local},server,nowait`
+      : `tcp:127.0.0.1:${qmpTr.local},server,nowait`;
+    args.push("-qmp", qmpArg);
+
+    // Serial transport arg
+    const serialTr = this.serialTransport!;
+    const serialArg = serialTr.type === "unix"
+      ? `unix:${serialTr.local},server,nowait`
+      : `tcp:127.0.0.1:${serialTr.local},server,nowait`;
+    args.push("-serial", serialArg);
 
     const fwDir = firmwareDir();
     if (fwDir) args.push("-L", fwDir);
 
     if (opts.kernel) args.push("-kernel", opts.kernel);
     if (opts.initrd) args.push("-initrd", opts.initrd);
-    if (opts.kernelCmdline) args.push("-append", opts.kernelCmdline);
+    if (opts.kernelCmdline) {
+      // microvm needs reboot=t (triple-fault reboot) for -no-reboot to work
+      const cmdline = useMicrovm ? `${opts.kernelCmdline} reboot=t` : opts.kernelCmdline;
+      args.push("-append", cmdline);
+    }
+
+    const blkDev = useMicrovm ? "virtio-blk-device" : "virtio-blk-pci";
+    const netDev = useMicrovm ? "virtio-net-device" : "virtio-net-pci";
 
     const rootImg = opts.rootImage;
     if (rootImg) {
       args.push(
         "-drive", `id=root,file=${rootImg},format=qcow2,if=none`,
-        "-device", "virtio-blk-device,drive=root",
+        "-device", `${blkDev},drive=root`,
       );
     }
 
     if (opts.workspaceImage) {
       args.push(
         "-drive", `id=ws,file=${opts.workspaceImage},format=qcow2,if=none`,
-        "-device", "virtio-blk-device,drive=ws",
+        "-device", `${blkDev},drive=ws`,
       );
     }
 
-    args.push("-netdev", "user,id=net0", "-device", "virtio-net-device,netdev=net0");
+    args.push("-netdev", "user,id=net0", "-device", `${netDev},netdev=net0`);
 
     if (opts.fwCfgConfig) {
       args.push("-fw_cfg", `name=opt/org.valencebox.config,file=${opts.fwCfgConfig}`);
     }
 
     return args;
+  }
+
+  /** Poll for a Unix socket to appear, then chmod 0600 to restrict access. */
+  private async chmodSocket(sockPath: string): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      try {
+        await fsp.chmod(sockPath, 0o600);
+        return;
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    // Non-fatal — socket works, just less restrictive
   }
 
   static checkAccel(platform: string): { name: string; available: boolean; hint?: string } {
@@ -208,34 +267,44 @@ export class QemuProcess extends EventEmitter {
       }
     }
     if (platform === "darwin") {
-      try { return { name: "hvf", available: true }; } catch { return { name: "hvf", available: false }; }
+      // HVF is built into macOS — just check we're on a supported version
+      return { name: "hvf", available: true };
     }
     if (platform === "win32") {
-      try { return { name: "whpx", available: true }; } catch { return { name: "whpx", available: false }; }
+      const whpxAvailable = QemuProcess.checkWhpx();
+      return whpxAvailable
+        ? { name: "whpx", available: true }
+        : { name: "whpx", available: false, hint: "WHPX not available — enable Windows Hypervisor Platform (Windows Features) or use -accel tcg" };
     }
     return { name: "tcg", available: true };
+  }
+
+  /** Check if WHPX (Windows Hypervisor Platform) is available. */
+  private static checkWhpx(): boolean {
+    try {
+      execSync("sc.exe query whpx", { stdio: "pipe", windowsHide: true });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private resolveAccels(override?: string): string[] {
     if (override && override !== "auto") {
       if (override === "tcg") return ["tcg,thread=multi"];
-      return [override, "tcg,thread=multi"];
+      const accelInfo = QemuProcess.checkAccel(process.platform);
+      if (accelInfo.name === override && accelInfo.available) {
+        return [override, "tcg,thread=multi"];
+      }
+      return ["tcg,thread=multi"];
     }
     const accels: string[] = [];
-    if (process.platform === "linux") accels.push("kvm");
-    if (process.platform === "darwin") accels.push("hvf");
-    if (process.platform === "win32") accels.push("whpx");
+    {
+      const info = QemuProcess.checkAccel(process.platform);
+      if (info.available) accels.push(info.name);
+    }
     accels.push("tcg,thread=multi");
     return accels;
-  }
-
-  private async waitForSocket(sockPath: string, timeoutMs: number): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (fs.existsSync(sockPath)) return;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    throw new Error(`QEMU socket ${sockPath} not ready within ${timeoutMs}ms`);
   }
 
   private async waitForExit(proc: ChildProcess, timeoutMs: number): Promise<void> {

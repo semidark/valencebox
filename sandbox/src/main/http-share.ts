@@ -4,8 +4,10 @@ import nepheleServer from "nephele";
 import FileSystemAdapter from "@nephele/adapter-file-system";
 import CustomAuthenticator, { User } from "@nephele/authenticator-custom";
 import { randomBytes } from "crypto";
-import * as net from "net";
 import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { getRandomFreePort } from "./asset-paths";
 
 export interface ShareConfig {
   port: number;
@@ -61,20 +63,9 @@ export class HttpShare {
   }
 }
 
-async function getRandomFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const port = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(port));
-    });
-    srv.on("error", reject);
-  });
-}
-
 async function writeFwCfg(port: number, token: string): Promise<string> {
-  const tmpDir = fs.mkdtempSync("/tmp/valence-");
-  const cfgPath = `${tmpDir}/config.json`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "valence-"));
+  const cfgPath = path.join(tmpDir, "config.json");
   fs.writeFileSync(cfgPath, JSON.stringify({ port, token }), "utf8");
   fs.chmodSync(cfgPath, 0o600);
   return cfgPath;

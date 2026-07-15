@@ -26,13 +26,14 @@ one's checkboxes are green.
 Electron main (Node)
  ├─ QEMU subprocess: qemu-system-x86_64
  │    -accel <hw>,-accel tcg,thread=multi   (auto-fallback, see Phase 1)
- │    -machine microvm  -smp N  -m NNNN  -nographic  -no-reboot
- │    -drive id=root,file=root.qcow2,format=qcow2,if=none
- │    -device virtio-blk-device,drive=root
- │    -drive id=ws,file=workspace.qcow2,format=qcow2,if=none
- │    -device virtio-blk-device,drive=ws
- │    -serial unix:serial.sock  -qmp unix:qmp.sock
- │    -nic user (SLIRP, open egress for now)
+ │    -machine <microvm|pc>  -smp N  -m NNNN  -nographic  -no-reboot
+ │    │   microvm when hw-accel (kvmclock provides TSC)
+ │    │   pc when TCG fallback (needs HPET for TSC calibration)
+ │    ├─ drives: -device <virtio-blk-device|virtio-blk-pci>
+ │    ├─ net:    -device <virtio-net-device|virtio-net-pci>
+ │    ├─ serial tcp:127.0.0.1:<port>,server,nowait
+ │    ├─ qmp    tcp:127.0.0.1:<port>,server,nowait
+ │    └─ -nic user (SLIRP, open egress for now)
 ├─ WebDAV server (pure Node, no TLS, token-based auth)
   │    listens on 127.0.0.1:<random_port> — token prevents other
   │    local users from accessing the workspace on a multi-user host
@@ -55,7 +56,7 @@ Guest (Alpine x86-64)
 
 | Topic | Decision |
 |---|---|
-| Machine type | `microvm` (no PCI/ACPI, virtio-mmio only, fast boot) |
+| Machine type | `pc` (i440fx, PCI/ACPI/HPET — microvm has no HPET, fails under TCG) |
 | Emulator | vanilla `qemu-system-x86_64`, bundled per-platform |
 | Acceleration | auto-detect: `kvm`/`hvf`/`whpx` if available, else `tcg,thread=multi` |
 | Guest | Alpine x86-64, `linux-virt` kernel, virtio devices |
@@ -67,19 +68,29 @@ Guest (Alpine x86-64)
 | Terminal | login shell on QEMU serial console |
 | Platforms | Linux + macOS + Windows from day one |
 
-### Machine type: microvm
+### Machine type: dynamic (microvm or pc)
 
-We use `-machine microvm` instead of the default `q35` (PCI/ACPI). microvm is a
-minimalist machine type inspired by Firecracker — no PCI, no ACPI, just
-virtio-mmio, fw_cfg, and the serial console. This gives faster boot times, a
-smaller attack surface, and a simpler device model. The trade-off:
+The machine type is selected at runtime based on whether hardware acceleration
+is available:
 
-- No PCI hotplug — not needed for a single-purpose dev VM.
-- No ACPI — shut down via triple-fault + `-no-reboot` instead.
-- All virtio devices use `virtio-*-device` (mmio) not `virtio-*-pci`.
+| Accel | Machine | Rationale |
+|---|---|---|
+| KVM / HVF / WHPX | `microvm` | kvmclock provides reliable TSC — HPET not needed |
+| TCG (fallback) | `pc` (i440fx) | microvm lacks HPET; guest cannot calibrate TSC under TCG |
 
-Since microvm has no PCI, drives are wired as `-device virtio-blk-device`
-(virtio-mmio transport) rather than `-device virtio-blk-pci`.
+Under hardware acceleration, the guest uses kvmclock (KVM) or analogous
+paravirtual clocksource, so microvm's missing HPET is irrelevant. Under TCG,
+`-machine pc` provides HPET + ACPI PM timer for working TSC calibration.
+
+**Virtio transport** matches the machine type:
+- `microvm` → `virtio-*-device` (mmio)
+- `pc` → `virtio-*-pci`
+
+The `reboot=t` kernel parameter (triple-fault reboot for `-no-reboot`) is
+appended automatically when using microvm.
+
+Revisit microvm-under-TCG once QEMU implements TSC frequency via CPUID
+([upstream issue #2381](https://gitlab.com/qemu-project/qemu/-/issues/2381)).
 
 ### Why not 9p / virtiofs
 
@@ -210,9 +221,13 @@ Goal: `qemu-system-x86_64` launches a throwaway Alpine ISO/qcow2 and reaches a
 login prompt over a Unix serial socket. **No sync, no snapshots, no workspace.**
 
 **Status: Phase 1 complete — QEMU binary vendored, asset resolver written,
-`qemu.ts` spawns microvm over serial+QMP Unix sockets with accel priority,
-`VmManager` bridges serial I/O to renderer, and the x86-64 guest image now
-boots to a serial login prompt (built in Phase 4).**
+`qemu.ts` spawns `-M pc` (i440fx) over serial+QMP TCP sockets with accel
+priority, `VmManager` bridges serial I/O to renderer, and the x86-64 guest image
+now boots to a serial login prompt (built in Phase 4).**
+
+Note: `-machine pc` is used instead of microvm because microvm lacks HPET.
+Under TCG (no KVM/HVF/WHPX), the guest kernel cannot calibrate TSC and hangs.
+`pc` provides HPET + ACPI PM timer for working TSC calibration under TCG.
 
 - [x] Vendor a QEMU binary into `resources/qemu/linux/` for dev (Linux first)
 - [x] Write `src/main/qemu.ts` — spawns QEMU microvm with serial+QMP sockets, accel priority list
@@ -224,10 +239,10 @@ boots to a serial login prompt (built in Phase 4).**
 - [x] Cross-platform binary/asset path resolver (dev vs `process.resourcesPath`)
 
 Key details:
-- Microvm uses `-device virtio-blk-device` (mmio) — no PCI bus
-- NIC uses explicit `-netdev user,id=net0 -device virtio-net-device,netdev=net0`
+- PC machine uses `-device virtio-blk-pci` (PCI) — standard PCI bus with HPET/ACPI
+- NIC uses explicit `-netdev user,id=net0 -device virtio-net-pci,netdev=net0`
 - Shutdown via QMP `system_powerdown` then SIGTERM/SIGKILL fallback
-- Serial and QMP sockets created under `<userData>/qemu-<random>/`
+- Serial and QMP over TCP (`127.0.0.1:port`) for cross-platform compatibility
 
 Built binary (`resources/qemu/linux/qemu-system-x86_64`):
 - 86 MB, static-pie linked (musl), ELF x86-64, QEMU 9.2.4
@@ -239,23 +254,22 @@ Built binary (`resources/qemu/linux/qemu-system-x86_64`):
   - `vgabios-stdvga.bin` — VGA BIOS (unused in `-nographic`)
 - Build script: `scripts/build-qemu.sh` — Alpine 3.20 Docker, libslirp 4.8.0 from source
 
-### microvm smoke test (manual, 2026-07-12)
+### pc smoke test (manual, 2026-07-13)
 
-Current boot command (x86-64 qcow2, verified with root auto-login + read-write root):
+Current boot command (x86-64 qcow2, verified with root auto-login + read-write root, TCG):
 
 ```
-# TCG smoke test (no KVM available)
 ./sandbox/resources/qemu/linux/qemu-system-x86_64 \
   -L ./sandbox/resources/qemu/linux/pc-bios \
-  -M microvm -accel tcg,thread=multi -m 256 -smp 1 \
+  -M pc -accel tcg,thread=multi -m 512 -smp 2 \
   -kernel sandbox/images/vmlinuz.bin \
   -initrd sandbox/images/initramfs.bin \
   -append "console=ttyS0 root=/dev/vda rootfstype=ext4 rootflags=rw modules=virtio_blk,ext4" \
   -nodefaults -no-user-config -nographic -no-reboot \
   -drive id=root,file=sandbox/images/root.qcow2,format=qcow2,if=none \
-  -device virtio-blk-device,drive=root \
+  -device virtio-blk-pci,drive=root \
   -netdev user,id=net0 \
-  -device virtio-net-device,netdev=net0
+  -device virtio-net-pci,netdev=net0
 ```
 
 **Key findings (documented for future reference):**
@@ -270,15 +284,17 @@ Current boot command (x86-64 qcow2, verified with root auto-login + read-write r
 
 Result: boots to `sandbox login:` prompt with root auto-login on serial, full OpenRC, networking, writable root.
 
-Accel snippet:
+Accel snippet (auto branch checks availability before adding HW accel):
 
 ```ts
 const accels: string[] = [];
-if (process.platform === "linux")  accels.push("kvm");
-if (process.platform === "darwin") accels.push("hvf");
-if (process.platform === "win32")  accels.push("whpx");
-accels.push("tcg,thread=multi");          // always last (fallback)
-// → args: -accel kvm -accel tcg,thread=multi   (QEMU uses first that works)
+{
+  const info = QemuProcess.checkAccel(process.platform);
+  if (info.available) accels.push(info.name);
+}
+accels.push("tcg,thread=multi");   // always last (fallback)
+// → ["kvm", "tcg,thread=multi"] when KVM available
+// → ["tcg,thread=multi"] when no HW accel → machine selects pc
 ```
 
 **Verify (`test:boot`):** spawn QEMU, assert Alpine login prompt appears on the

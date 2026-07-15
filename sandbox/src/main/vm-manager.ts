@@ -1,5 +1,4 @@
 import { EventEmitter } from "events";
-import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as net from "net";
 import { QemuProcess, QemuOptions } from "./qemu";
@@ -64,10 +63,16 @@ export class VmManager extends EventEmitter {
   }
 
   private connectSerial(): void {
-    const sockPath = this.qemu.serialPath;
-    if (!sockPath || !fs.existsSync(sockPath)) return;
+    const transport = this.qemu.serialTransport;
+    if (!transport) return;
 
-    this.serialClient = net.createConnection(sockPath, () => {
+    if (transport.type === "unix") {
+      this.serialClient = net.createConnection(transport.connectPath);
+    } else {
+      this.serialClient = net.createConnection(Number(transport.connectPath), "127.0.0.1");
+    }
+
+    this.serialClient.on("connect", () => {
       this.emit("serial:connected");
     });
 

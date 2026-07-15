@@ -20,7 +20,8 @@
     "test:e2e": "tsx test/e2e.test.ts",
     "test:ui": "electron test/ui-smoke.js",
     "test:agent": "cargo test --manifest-path guest/sync-agent-rust/Cargo.toml",
-    "images": "./scripts/build-guest.sh"
+    "images": "./scripts/build-guest.sh",
+    "build:qemu": "pwsh -NoProfile -File scripts/build-qemu.ps1"
   },
   "dependencies": {
     "@mercuryworkshop/wisp-js": "^0.4.1",
@@ -38,8 +39,14 @@
     "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
-    "electron": "^37.0.0",
+    "electron": "^37.10.3",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "@mongodb-js/zstd@2.0.1": true,
+    "bufferutil@4.1.0": true,
+    "electron@37.10.3": true,
+    "esbuild@0.28.1": true
   }
 }
