@@ -4,6 +4,7 @@ import * as net from "net";
 import * as path from "path";
 
 function isDev(): boolean {
+  if (typeof app === "undefined" || app === null) return true;
   return !app.isPackaged;
 }
 
