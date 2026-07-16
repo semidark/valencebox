@@ -169,18 +169,157 @@ DOCKERFILE
 }
 
 build_darwin() {
-    echo "==> building for darwin (macOS, with HVF support)"
-    echo "    macOS build not yet implemented — requires macOS CI runner"
-    echo "    Manual build on macOS:"
-    echo "      brew install ninja pkg-config pixman glib"
-    echo "      cd build/qemu/qemu-${QEMU_VERSION}"
-    echo "      mkdir build && cd build"
-    echo "      ../configure --target-list=x86_64-softmmu --enable-hvf --disable-cocoa"
-    echo "      make -j\$(nproc) qemu-system-x86_64"
-    mkdir -p "${RESOURCE_DIR}/darwin"
-    # Placeholder: create a stub so the app doesn't crash
-    echo "Placeholder — build QEMU manually on macOS" > "${RESOURCE_DIR}/darwin/PLATFORM_SETUP_REQUIRED.txt"
-    echo "==> darwin build (placeholder)"
+    echo "==> building for darwin (macOS, TCG-only x86_64-softmmu)"
+
+    # macOS may lack wget; use curl as fallback
+    if ! command -v wget >/dev/null 2>&1; then
+        fetch_qemu() {
+            mkdir -p "${BUILD_DIR}"
+            if [ ! -f "${BUILD_DIR}/${QEMU_TARBALL}" ]; then
+                echo "==> fetching QEMU ${QEMU_VERSION} (curl)"
+                curl -sL -o "${BUILD_DIR}/${QEMU_TARBALL}" "${QEMU_URL}"
+            fi
+            if [ ! -d "${BUILD_DIR}/qemu-${QEMU_VERSION}" ]; then
+                echo "==> extracting"
+                tar -xf "${BUILD_DIR}/${QEMU_TARBALL}" -C "${BUILD_DIR}"
+            fi
+        }
+    fi
+    fetch_qemu
+
+    # Prerequisites: brew install on the build machine only (not a runtime dep)
+    if ! command -v meson >/dev/null 2>&1; then echo "==> installing meson"; brew install meson; fi
+    if ! command -v ninja >/dev/null 2>&1; then echo "==> installing ninja"; brew install ninja; fi
+    if ! command -v pkg-config >/dev/null 2>&1; then echo "==> installing pkg-config"; brew install pkg-config; fi
+    for pkg in pixman glib; do
+        brew list "$pkg" >/dev/null 2>&1 || { echo "==> installing $pkg"; brew install "$pkg"; }
+    done
+
+    local jobs
+    jobs="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
+    local src_dir="${BUILD_DIR}/qemu-${QEMU_VERSION}"
+    local build_dir="${src_dir}/build"
+    local out_dir="${RESOURCE_DIR}/darwin"
+
+    rm -rf "${build_dir}"
+    mkdir -p "${build_dir}"
+
+    echo "==> configuring QEMU (x86_64-softmmu, TCG, slirp, zstd)"
+    (
+        cd "${build_dir}"
+        ../configure \
+            --target-list=x86_64-softmmu \
+            --enable-slirp \
+            --enable-zstd \
+            --disable-cocoa \
+            --disable-docs \
+            --disable-gcrypt \
+            --disable-gnutls \
+            --disable-nettle \
+            --disable-werror
+    )
+
+    echo "==> building qemu-system-x86_64 (${jobs} jobs)"
+    make -C "${build_dir}" -j"${jobs}" qemu-system-x86_64
+
+    echo "==> building qemu-img"
+    make -C "${build_dir}" -j"${jobs}" qemu-img
+
+    # ── Stage output ──
+    mkdir -p "${out_dir}"
+
+    cp "${build_dir}/qemu-system-x86_64" "${out_dir}/"
+    chmod 755 "${out_dir}/qemu-system-x86_64"
+    echo "=> ${out_dir}/qemu-system-x86_64 ($(du -h "${out_dir}/qemu-system-x86_64" | cut -f1))"
+
+    cp "${build_dir}/qemu-img" "${out_dir}/"
+    chmod 755 "${out_dir}/qemu-img"
+    echo "=> ${out_dir}/qemu-img ($(du -h "${out_dir}/qemu-img" | cut -f1))"
+
+    # Firmware blobs (same set that Linux build extracts)
+    mkdir -p "${out_dir}/pc-bios"
+    local fw fw_dir="${src_dir}/pc-bios"
+    for f in bios-256k.bin bios-microvm.bin vgabios-stdvga.bin \
+             linuxboot_dma.bin linuxboot.bin efi-virtio.rom kvmvapic.bin; do
+        if [ -f "${fw_dir}/${f}" ]; then
+            cp "${fw_dir}/${f}" "${out_dir}/pc-bios/"
+        fi
+    done
+    echo "  firmware: $(ls "${out_dir}/pc-bios/" | wc -l) files in ${out_dir}/pc-bios/"
+
+    # ── Bundle non-system dylibs ──
+    local lib_dir="${out_dir}/lib"
+    mkdir -p "${lib_dir}"
+
+    # ── Bundle non-system dylibs ──
+    echo "  bundling dylibs..."
+    local deps_file="/tmp/qemu-darwin-deps-$$.txt"
+
+    for binary in "${out_dir}/qemu-system-x86_64" "${out_dir}/qemu-img"; do
+        [ -f "$binary" ] || continue
+        otool -L "$binary" 2>/dev/null | tail -n +2 | awk '{print $1}' > "$deps_file"
+        while IFS= read -r dylib; do
+            case "$dylib" in
+                /usr/lib/*|/System/*|@rpath/*|@executable_path/*) continue ;;
+            esac
+            local name; name="$(basename "$dylib")"
+            [ ! -f "${lib_dir}/${name}" ] && cp -n "$dylib" "${lib_dir}/" 2>/dev/null && echo "    dylib: ${name}"
+            install_name_tool -change "$dylib" "@executable_path/lib/${name}" "$binary" 2>/dev/null
+        done < "$deps_file"
+    done
+
+    # Recursively fix dylib cross-dependencies (using temp file to avoid subshell issues)
+    local changed=1
+    while [ "$changed" -gt 0 ]; do
+        changed=0
+        for lib in "${lib_dir}"/*.dylib; do
+            [ -f "$lib" ] || continue
+            local libname; libname="$(basename "$lib")"
+            otool -L "$lib" 2>/dev/null | tail -n +2 | awk '{print $1}' > "$deps_file"
+            while IFS= read -r dep; do
+                case "$dep" in
+                    /usr/lib/*|/System/*|@rpath/*|@executable_path/*|@loader_path/*) continue ;;
+                esac
+                local depname; depname="$(basename "$dep")"
+                [ "$depname" = "$libname" ] && continue
+                if [ ! -f "${lib_dir}/${depname}" ]; then
+                    cp -n "$dep" "${lib_dir}/" 2>/dev/null && echo "    dylib (transitive): ${depname}" && changed=$((changed + 1))
+                fi
+                install_name_tool -change "$dep" "@loader_path/${depname}" "$lib" 2>/dev/null
+            done < "$deps_file"
+        done
+    done
+    rm -f "$deps_file"
+
+    # ── Ad-hoc sign (install_name_tool invalidates code signatures on Apple Silicon) ──
+    echo "  signing..."
+    codesign --force --sign - --timestamp=none "${out_dir}/qemu-system-x86_64" 2>/dev/null
+    codesign --force --sign - --timestamp=none "${out_dir}/qemu-img" 2>/dev/null
+    for lib in "${lib_dir}"/*.dylib; do
+        [ -f "$lib" ] && codesign --force --sign - --timestamp=none "$lib" 2>/dev/null
+    done
+
+    # ── Verify no Homebrew references (skip dylib install name / ID line) ──
+    local cellar=""
+    [ -d "/opt/homebrew" ] && cellar="/opt/homebrew"
+    [ -z "$cellar" ] && [ -d "/usr/local/Cellar" ] && cellar="/usr/local/Cellar"
+    local leak=0
+    if [ -n "$cellar" ]; then
+        otool -L "${out_dir}/qemu-system-x86_64" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
+        otool -L "${out_dir}/qemu-img" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
+        for lib in "${lib_dir}"/*.dylib; do
+            [ -f "$lib" ] || continue
+            otool -L "$lib" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
+        done
+    fi
+    if [ "$leak" -ne 0 ]; then
+        echo "ERROR: Homebrew references remain in staged output (check otool -L for details)"
+        exit 1
+    fi
+
+    echo "  bundled dylibs: $(ls "${lib_dir}/" 2>/dev/null | wc -l) files in ${lib_dir}/"
+    echo "  verified: no Homebrew runtime references"
+    echo "==> darwin build done"
 }
 
 build_win32() {

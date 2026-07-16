@@ -1,6 +1,8 @@
 #!/sbin/openrc-run
-# bidir sync between /workspace (native qcow2) and /host-workspace (WebDAV mirror)
-description="Workspace bidirectional sync via rsync"
+# Bidir sync between /workspace (native qcow2) and /host-workspace (WebDAV mirror)
+# Uses unison -repeat watch with a marker-file guard: if the host-side mount
+# drops, the marker becomes inaccessible and unison waits rather than deleting.
+description="Workspace bidirectional sync via unison"
 
 depend() {
   need mount-share
@@ -20,43 +22,123 @@ start() {
     fi
   done
 
-  cat > /var/run/workspace-sync.sh << 'SYNC_SCRIPT'
+  # Clean up stale processes from an unclean shutdown or manual restart
+  pkill -f '/var/run/workspace-sync.sh' 2>/dev/null || true
+  pkill -f 'mount.davfs .* /host-workspace' 2>/dev/null || pkill -f mount.davfs 2>/dev/null || true
+  umount -l /host-workspace 2>/dev/null || true
+  rm -f /var/run/unison.pid
+
+cat > /var/run/workspace-sync.sh << 'SYNC_SCRIPT'
 #!/bin/sh
-EXCLUDES="--exclude=node_modules --exclude=.git --exclude=.DS_Store --exclude=.sync-tmp --exclude=lost+found"
+# OpenRC background processes don't inherit HOME — unison needs it for archives
+HOME=/root; export HOME
 
-host_ok() { mountpoint -q /host-workspace; }
+# Ensure unison archive directory exists (first run)
+mkdir -p /root/.unison /host-workspace
 
-# host→guest: poll every 2s
-(
-  while true; do
+# Fresh logs for each service start
+: > /var/log/unison.log
+: > /tmp/davfs-mount.log
+
+# Capture unison stderr for diagnostics: cat /var/log/unison.log
+exec 2>>/var/log/unison.log
+
+# The host writes .valence-sync-marker to the workspace dir after starting the
+# WebDAV server. If the davfs2 mount drops, the marker becomes inaccessible and
+# unison won't start — preventing catastrophic deletion of /workspace.
+
+UNISON_PID=""
+
+cleanup() {
+  [ -n "$UNISON_PID" ] && kill "$UNISON_PID" 2>/dev/null
+  exit 0
+}
+trap cleanup TERM INT
+
+mount_host_workspace() {
+  local share_url attempt davfs_pid timer_pid davfs_status
+  local davfs_timeout=180
+
+  share_url=$(cut -d' ' -f1 /etc/davfs2/secrets 2>/dev/null)
+  [ -n "$share_url" ] || return 1
+
+  attempt=0
+  while [ $attempt -lt 3 ]; do
+    mountpoint -q /host-workspace && return 0
+
+    attempt=$((attempt + 1))
+    printf '%s davfs attempt %s starting (%ss timeout)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$attempt" "$davfs_timeout" >> /tmp/davfs-mount.log
+    mount -t davfs "$share_url" /host-workspace >/dev/null 2>>/tmp/davfs-mount.log &
+    davfs_pid=$!
+    (
+      sleep "$davfs_timeout"
+      kill "$davfs_pid" 2>/dev/null
+    ) &
+    timer_pid=$!
+
+    wait "$davfs_pid" 2>/dev/null
+    davfs_status=$?
+
+    kill "$timer_pid" 2>/dev/null || true
+    wait "$timer_pid" 2>/dev/null || true
+
+    if [ $davfs_status -eq 0 ] && mountpoint -q /host-workspace; then
+      printf '%s davfs attempt %s succeeded\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$attempt" >> /tmp/davfs-mount.log
+      return 0
+    fi
+
+    printf '%s davfs attempt %s failed (status=%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$attempt" "$davfs_status" >> /tmp/davfs-mount.log
+    pkill -f 'mount.davfs .* /host-workspace' 2>/dev/null || pkill -f mount.davfs 2>/dev/null || true
+    umount -l /host-workspace 2>/dev/null || true
+    sleep 5
+  done
+
+  printf '%s davfs mounting exhausted retries\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> /tmp/davfs-mount.log
+  return 1
+}
+
+while true; do
+  if ! mountpoint -q /host-workspace; then
+    mount_host_workspace || {
+      sleep 5
+      continue
+    }
+  fi
+
+  if ! [ -f /host-workspace/.valence-sync-marker ]; then
     sleep 2
-    host_ok && rsync -a --delete $EXCLUDES /host-workspace/ /workspace/
-  done
-) &
-POLL_PID=$!
+    continue
+  fi
 
-# guest→host: inotify on local qcow2, restart on transient failure
-(
-  while true; do
-    inotifywait -r -q -e modify,create,delete,move --format '%w%f' /workspace \
-      --exclude 'node_modules|\.git|\.DS_Store|\.sync-tmp|lost\+found' 2>/dev/null | \
-      while IFS= read -r file; do
-        host_ok && rsync -a $EXCLUDES /workspace/ /host-workspace/
-      done
-  done
-) &
-INOTIFY_PID=$!
-
-wait $INOTIFY_PID
-kill $POLL_PID 2>/dev/null
+  # Poll every 2s. stdout >/dev/null avoids terminal spam; stderr is logged.
+  unison /host-workspace /workspace -batch -auto -prefer /host-workspace -repeat 2 \
+    -ignore 'Name node_modules' \
+    -ignore 'Name .git' \
+    -ignore 'Name .DS_Store' \
+    -ignore 'Name lost+found' \
+    -ignore 'Name .davfs2-cache' \
+    -ignore 'Name .valence-sync-marker' >/dev/null &
+  UNISON_PID=$!
+  wait "$UNISON_PID"
+  UNISON_PID=""
+  sleep 1
+done
 SYNC_SCRIPT
   chmod +x /var/run/workspace-sync.sh
   /var/run/workspace-sync.sh &
-  ebegin "Sync loop started (PID: $!)"
+  echo $! > /var/run/unison.pid
+  einfo "Unison sync loop started (PID: $!)"
 }
 
 stop() {
-  pkill -f '/var/run/workspace-sync.sh' 2>/dev/null || true
-  sleep 0.5
-  ebegin "Sync service stopped"
+  local pid
+  pid=$(cat /var/run/unison.pid 2>/dev/null)
+  if [ -n "$pid" ]; then
+    kill $pid 2>/dev/null
+    sleep 1
+    kill -0 $pid 2>/dev/null && kill -9 $pid 2>/dev/null
+    rm -f /var/run/unison.pid
+  fi
+  sleep 0.3
+  einfo "Sync service stopped"
 }

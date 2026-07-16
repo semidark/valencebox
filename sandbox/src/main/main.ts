@@ -82,6 +82,15 @@ async function startVm() {
   share = new HttpShare();
   const shareCfg = await share.start(workspaceDir);
   console.log(`[share] WebDAV on 127.0.0.1:${shareCfg.port}, fw_cfg at ${shareCfg.fwCfgPath}`);
+  console.log(`[share] workspace: ${workspaceDir}`);
+
+  // Write a marker file that unison on the guest checks before syncing.
+  // If the davfs2 mount drops, the marker becomes inaccessible and unison
+  // refuses to start — preventing the guest from deleting everything under
+  // the false assumption that the host workspace is empty.
+  const markerPath = path.join(workspaceDir, ".valence-sync-marker");
+  fs.writeFileSync(markerPath, "");
+  console.log(`[share] sync marker at ${markerPath}`);
 
   const workspaceImage = assetPaths.workspaceQcow2Path();
   if (!fs.existsSync(workspaceImage)) {

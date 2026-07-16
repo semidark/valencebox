@@ -44,14 +44,17 @@ rm -rf /tmp/sandbox-rootfs/boot/*
 # Root image size: 25% slack + 32 MiB headroom
 SZ=$(du -sm /tmp/sandbox-rootfs | cut -f1); SZ=$((SZ + SZ / 4 + 32))
 
-# Create raw ext4 image, then convert to qcow2
+# Create raw ext4 image via Docker (no host e2fsprogs needed), then convert to qcow2
 dd if=/dev/zero of=/tmp/sandbox-rootfs.img bs=1M count="$SZ" status=none
-mkfs.ext4 -q -d /tmp/sandbox-rootfs -L sandboxroot /tmp/sandbox-rootfs.img
+docker run --rm --platform=linux/amd64 \
+  -v /tmp/sandbox-rootfs:/rootfs:ro \
+  -v /tmp/sandbox-rootfs.img:/rootfs.img \
+  alpine:3.21 sh -c 'apk add --quiet e2fsprogs && mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img'
 qemu-img convert -f raw -O qcow2 /tmp/sandbox-rootfs.img images/root.qcow2
 rm -f /tmp/sandbox-rootfs.img
 
 # Workspace disk
-WSZ="${WORKSPACE_MB:-128}"
+WSZ="${WORKSPACE_MB:-1024}"
 rm -f images/workspace.qcow2
 qemu-img create -f qcow2 images/workspace.qcow2 "${WSZ}M"
 
