@@ -1,13 +1,22 @@
+import { app } from "electron";
 import * as fs from "fs";
 import * as net from "net";
 import * as path from "path";
 
-function rootDir(): string {
-  return path.resolve(__dirname, "..", "..");
+function isDev(): boolean {
+  return !app.isPackaged;
 }
 
 function resourceDir(): string {
-  return path.join(rootDir(), "resources");
+  // Packaged: process.resourcesPath is the app bundle Resources directory.
+  // Dev: <sandbox>/resources/
+  return isDev() ? path.resolve(__dirname, "..", "..", "resources") : process.resourcesPath;
+}
+
+export function imagesDir(): string {
+  // Packaged: flat under process.resourcesPath alongside qemu/.
+  // Dev: <sandbox>/images/
+  return isDev() ? path.resolve(__dirname, "..", "..", "images") : path.join(process.resourcesPath, "images");
 }
 
 export function qemuPlatformDir(): string {
@@ -28,10 +37,6 @@ export function qemuBinaryPath(): string {
   const bundledExe = path.join(qemuPlatformDir(), "qemu-system-x86_64.exe");
   if (fs.existsSync(bundledExe)) return bundledExe;
   return "qemu-system-x86_64";
-}
-
-export function imagesDir(): string {
-  return path.join(rootDir(), "images");
 }
 
 export function firmwareDir(): string {
