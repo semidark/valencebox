@@ -231,6 +231,7 @@ export class QemuProcess extends EventEmitter {
 
     const blkDev = useMicrovm ? "virtio-blk-device" : "virtio-blk-pci";
     const netDev = useMicrovm ? "virtio-net-device" : "virtio-net-pci";
+    const rngDev = useMicrovm ? "virtio-rng-device" : "virtio-rng-pci";
 
     const rootImg = opts.rootImage;
     if (rootImg) {
@@ -247,7 +248,10 @@ export class QemuProcess extends EventEmitter {
       );
     }
 
-    args.push("-netdev", "user,id=net0", "-device", `${netDev},netdev=net0`);
+    // SSH hostfwd on port 2222 for interactive debug; fast cipher config on client side
+    args.push("-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22`, "-device", `${netDev},netdev=net0`);
+
+    args.push("-device", rngDev);
 
     if (opts.fwCfgConfig) {
       args.push("-fw_cfg", `name=opt/org.valencebox.config,file=${opts.fwCfgConfig}`);
