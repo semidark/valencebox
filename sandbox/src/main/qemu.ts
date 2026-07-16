@@ -249,6 +249,7 @@ export class QemuProcess extends EventEmitter {
     }
 
     // SSH hostfwd on port 2222 for interactive debug; fast cipher config on client side
+    // TODO: gate SSH hostfwd behind a config flag before release (e.g. opts.debugSsh)
     args.push("-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22`, "-device", `${netDev},netdev=net0`);
 
     args.push("-device", rngDev);
