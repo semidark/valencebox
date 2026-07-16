@@ -116,15 +116,16 @@ Notes:
 Goal: boot the current guest on Apple Silicon macOS from source builds.
 
 - [x] Build the darwin QEMU bundle locally with `scripts/build-qemu.sh darwin`.
-- [ ] Ensure a fresh Apple Silicon checkout can build guest images without a
+- [x] Ensure a fresh Apple Silicon checkout can build guest images without a
   separately installed host `qemu-img` (bundled qemu-img needs to be resolved
   explicitly by build-guest.sh).
 - [x] Boot the existing `x86_64` guest to a serial login on Apple Silicon macOS.
 - [x] Verify QMP handshake and basic lifecycle control.
 - [x] Verify clean shutdown via QMP and process fallback.
-- [ ] Log boot timing to console for the TCG path (`bootMs` tracked in QemuProcess
-  but never printed).
-- [ ] Capture a repeatable source-build runbook for Apple Silicon developers.
+- [x] Log boot timing to console for the TCG path (`bootMs` tracked in QemuProcess
+  and printed at QMP handshake).
+- [x] Capture a repeatable source-build runbook for Apple Silicon developers
+  (`sandbox/docs/build-from-source.md`).
 
 Notes:
 - Phase 4 is complete when a developer can clone the repo, build the darwin
