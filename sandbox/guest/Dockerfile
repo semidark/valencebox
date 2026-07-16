@@ -66,6 +66,13 @@ RUN printf 'virtio_blk\nvirtio_net\nqemu_fw_cfg\nfuse\n' >> /etc/modules
 RUN echo 'ttyS0::respawn:/sbin/agetty -a root -s ttyS0 115200 vt100' >> /etc/inittab && \
     printf '\nsandbox login ready (x86-64, linux-virt)\n' > /etc/motd
 
+# SSH: lightweight host key (ed25519-only), fast ciphers, root key auth
+RUN ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N '' && \
+    printf 'HostKey /etc/ssh/ssh_host_ed25519_key\nPasswordAuthentication no\nPermitRootLogin prohibit-password\nClientAliveInterval 30\nCiphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\nMACs umac-64-etm@openssh.com\n' > /etc/ssh/sshd_config && \
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
+    echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoZlOBpFYYHSL2ZQzNABGxbs4P3DNmufyFiWG9EjJ03 vm-debug@valencebox' > /root/.ssh/authorized_keys && \
+    chmod 600 /root/.ssh/authorized_keys
+
 # DHCP on SLIRP eth0
 RUN printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' \
     > /etc/network/interfaces
@@ -86,4 +93,5 @@ RUN for i in devfs dmesg mdev; do rc-update add $i sysinit; done && \
     rc-update add networking default && \
     rc-update add mount-share default && \
     rc-update add workspace-sync default && \
+    rc-update add sshd default && \
     rc-update add killprocs shutdown
