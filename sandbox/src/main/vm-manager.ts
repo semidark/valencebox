@@ -20,6 +20,7 @@ export interface VmManagerOptions {
 export class VmManager extends EventEmitter {
   private qemu: QemuProcess;
   private serialClient: net.Socket | null = null;
+  private _serialLog = "";
 
   constructor(private opts: VmManagerOptions) {
     super();
@@ -62,6 +63,27 @@ export class VmManager extends EventEmitter {
     return this.qemu.bootMs;
   }
 
+  get serialLog(): string {
+    return this._serialLog;
+  }
+
+  /** Wait for a regex match in the serial log. Returns the full matched text. */
+  waitSerial(re: RegExp, timeoutMs: number, from?: number): Promise<string> {
+    const start = Date.now();
+    return new Promise((resolve, reject) => {
+      const poll = () => {
+        const haystack = from !== undefined ? this._serialLog.slice(from) : this._serialLog;
+        const m = haystack.match(re);
+        if (m) return resolve(m[0]);
+        if (Date.now() - start >= timeoutMs) {
+          return reject(new Error(`waitSerial timeout ${timeoutMs}ms for ${re}`));
+        }
+        setTimeout(poll, 200);
+      };
+      poll();
+    });
+  }
+
   private connectSerial(): void {
     const transport = this.qemu.serialTransport;
     if (!transport) return;
@@ -77,7 +99,12 @@ export class VmManager extends EventEmitter {
     });
 
     this.serialClient.on("data", (data: Buffer) => {
-      this.emit("serial:data", data.toString("utf8"));
+      const text = data.toString("utf8");
+      this._serialLog += text;
+      if (this._serialLog.length > 65536) {
+        this._serialLog = this._serialLog.slice(-65536);
+      }
+      this.emit("serial:data", text);
     });
 
     this.serialClient.on("close", () => {
