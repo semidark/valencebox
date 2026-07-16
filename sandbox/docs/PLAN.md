@@ -102,7 +102,7 @@ Goal: make the macOS runtime behavior explicit and stable for the current
 - [x] Keep machine selection on `pc` for the Apple Silicon macOS path.
 - [x] Keep `microvm` out of scope for phase 1 and avoid any partial support.
 - [x] Do not advertise HVF as available for the phase 1 Apple Silicon path.
-- [ ] Preserve the existing Linux and Windows accelerator behavior.
+- [x] Preserve the existing Linux and Windows accelerator behavior.
 - [x] Surface clear logs and status text that macOS is running the emulated
   `x86_64` path under TCG.
 
@@ -115,13 +115,15 @@ Notes:
 
 Goal: boot the current guest on Apple Silicon macOS from source builds.
 
-- [ ] Build the darwin QEMU bundle locally with `scripts/build-qemu.sh darwin`.
+- [x] Build the darwin QEMU bundle locally with `scripts/build-qemu.sh darwin`.
 - [ ] Ensure a fresh Apple Silicon checkout can build guest images without a
-  separately installed host `qemu-img`.
-- [ ] Boot the existing `x86_64` guest to a serial login on Apple Silicon macOS.
-- [ ] Verify QMP handshake and basic lifecycle control.
-- [ ] Verify clean shutdown via QMP and process fallback.
-- [ ] Record boot timing and rough performance characteristics for the TCG path.
+  separately installed host `qemu-img` (bundled qemu-img needs to be resolved
+  explicitly by build-guest.sh).
+- [x] Boot the existing `x86_64` guest to a serial login on Apple Silicon macOS.
+- [x] Verify QMP handshake and basic lifecycle control.
+- [x] Verify clean shutdown via QMP and process fallback.
+- [ ] Log boot timing to console for the TCG path (`bootMs` tracked in QemuProcess
+  but never printed).
 - [ ] Capture a repeatable source-build runbook for Apple Silicon developers.
 
 Notes:
@@ -134,11 +136,11 @@ Notes:
 Goal: verify that the already-implemented QEMU workflow behaves correctly on the
 new macOS runtime path.
 
-- [ ] Verify the host WebDAV share starts and the guest can mount it.
-- [ ] Verify `/workspace` mounts from the second virtio disk.
+- [x] Verify the host WebDAV share starts and the guest can mount it.
+- [x] Verify `/workspace` mounts from the second virtio disk.
 - [ ] Verify guest-to-host sync works.
 - [ ] Verify host-to-guest sync works.
-- [ ] Verify the Electron UI can send serial input and receive serial output.
+- [x] Verify the Electron UI can send serial input and receive serial output.
 - [ ] Verify the app can start, run, and stop cleanly on macOS from source.
 - [ ] Capture macOS-specific runtime bugs, workarounds, and remaining gaps.
 

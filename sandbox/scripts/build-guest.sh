@@ -4,6 +4,11 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# Resolve qemu-img: prefer bundled, fall back to PATH
+PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
+QEMU_IMG=./resources/qemu/$PLATFORM/qemu-img
+[ -x "$QEMU_IMG" ] || QEMU_IMG=qemu-img
+
 mkdir -p images
 
 echo "==> building guest docker image (x86-64 Alpine, linux-virt)"
@@ -50,13 +55,13 @@ docker run --rm --platform=linux/amd64 \
   -v /tmp/sandbox-rootfs:/rootfs:ro \
   -v /tmp/sandbox-rootfs.img:/rootfs.img \
   alpine:3.21 sh -c 'apk add --quiet e2fsprogs && mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img'
-qemu-img convert -f raw -O qcow2 /tmp/sandbox-rootfs.img images/root.qcow2
+"$QEMU_IMG" convert -f raw -O qcow2 /tmp/sandbox-rootfs.img images/root.qcow2
 rm -f /tmp/sandbox-rootfs.img
 
 # Workspace disk
 WSZ="${WORKSPACE_MB:-1024}"
 rm -f images/workspace.qcow2
-qemu-img create -f qcow2 images/workspace.qcow2 "${WSZ}M"
+"$QEMU_IMG" create -f qcow2 images/workspace.qcow2 "${WSZ}M"
 
 # Clean up
 rm -rf /tmp/sandbox-rootfs images/rootfs.tar
