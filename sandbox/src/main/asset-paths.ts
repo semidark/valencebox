@@ -10,7 +10,7 @@ function resourceDir(): string {
   return path.join(rootDir(), "resources");
 }
 
-function qemuPlatformDir(): string {
+export function qemuPlatformDir(): string {
   return path.join(resourceDir(), "qemu", process.platform);
 }
 

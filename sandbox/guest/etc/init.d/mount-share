@@ -1,6 +1,8 @@
 #!/sbin/openrc-run
-# Read fw_cfg config, mount workspace qcow2 at /workspace, mount WebDAV share at /host-workspace
-description="Mount workspace disk and WebDAV share"
+# Read fw_cfg config, mount workspace qcow2 at /workspace, and prepare WebDAV config.
+# The potentially slow davfs mount itself is deferred to workspace-sync so boot
+# is never blocked on host-share availability.
+description="Mount workspace disk and prepare WebDAV share"
 
 depend() {
   need modules
@@ -30,7 +32,7 @@ start() {
       return 1
     }
   fi
-  ebegin "Mounted /workspace"
+  einfo "Mounted /workspace"
 
   # Read fw_cfg config
   modprobe qemu_fw_cfg 2>/dev/null || true
@@ -51,21 +53,21 @@ start() {
       chown 0:0 /etc/davfs2/secrets 2>/dev/null || true
       chown 0:0 /etc/davfs2 2>/dev/null || true
 
-      # Mount WebDAV share (best-effort — workspace qcow2 mount is the critical part)
+      # Create davfs2 cache directory on workspace volume to avoid filling root fs
+      mkdir -p /workspace/.davfs2-cache
+      chmod 0700 /workspace/.davfs2-cache
+
       if mountpoint -q /host-workspace; then
-        ebegin "WebDAV already mounted at /host-workspace"
+        einfo "WebDAV already mounted at /host-workspace"
       else
-        mount -t davfs http://10.0.2.2:${port}/ /host-workspace 2>/dev/null || \
-          ebegin "WebDAV share not available (will retry in sync service)"
+        einfo "WebDAV mount deferred to workspace-sync"
       fi
     else
-      eerror "fw_cfg config missing port or token"
+      ewarn "fw_cfg config missing port or token; workspace-sync will keep waiting"
     fi
   else
-    eerror "fw_cfg entry opt/org.valencebox.config not found"
+    ewarn "fw_cfg entry opt/org.valencebox.config not found; workspace-sync will keep waiting"
   fi
-  
-  eend 0
 }
 
 stop() {

@@ -30,6 +30,13 @@ export class HttpShare {
     this.fwCfgPath = await writeFwCfg(this.port, this.token);
 
     const app = express();
+    // Log every WebDAV request method, path, and response status
+    app.use((req, res, next) => {
+      res.on("finish", () => {
+        console.log(`[share] ${req.method} ${req.originalUrl} -> ${res.statusCode}`);
+      });
+      next();
+    });
     app.use(
       "/",
       nepheleServer({

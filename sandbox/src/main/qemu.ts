@@ -1,8 +1,9 @@
 import { ChildProcess, spawn, execSync } from "child_process";
 import * as fs from "fs";
+import * as path from "path";
 import * as fsp from "fs/promises";
 import { EventEmitter } from "events";
-import { qemuBinaryPath, firmwareDir, allocSerialTransport, allocQmpTransport, VmTransport } from "./asset-paths";
+import { qemuBinaryPath, firmwareDir, qemuPlatformDir, allocSerialTransport, allocQmpTransport, VmTransport } from "./asset-paths";
 import { QmpClient } from "./qmp";
 
 export interface QemuOptions {
@@ -63,15 +64,30 @@ export class QemuProcess extends EventEmitter {
     this.emit("accel", hw);
 
     const args = this.buildArgs(opts);
-    console.log(`[qemu] machine: ${this.machineType}`);
     const binPath = qemuBinaryPath();
+    const fwDir = firmwareDir();
+    console.log(`[qemu] binary: ${binPath}`);
+    console.log(`[qemu] firmware: ${fwDir || "(none, using QEMU built-in search path)"}`);
+    console.log(`[qemu] machine: ${this.machineType}`);
 
-    if (!fs.existsSync(binPath)) {
+    // If binPath contains a path separator, it's a path — verify it exists.
+    // If it's just a name (bare executable, no separator), let the OS resolve via $PATH.
+    const isPath = binPath.includes("/") || (process.platform === "win32" && binPath.includes("\\"));
+    if (isPath && !fs.existsSync(binPath)) {
       throw new Error(`QEMU binary not found at ${binPath}`);
+    }
+
+    const spawnEnv: NodeJS.ProcessEnv = { ...process.env };
+    if (process.platform === "darwin") {
+      const libDir = path.join(qemuPlatformDir(), "lib");
+      if (fs.existsSync(libDir)) {
+        spawnEnv.DYLD_LIBRARY_PATH = [libDir, spawnEnv.DYLD_LIBRARY_PATH].filter(Boolean).join(":");
+      }
     }
 
     this.proc = spawn(binPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
+      env: spawnEnv,
     });
 
     const stderrChunks: Buffer[] = [];
@@ -267,8 +283,11 @@ export class QemuProcess extends EventEmitter {
       }
     }
     if (platform === "darwin") {
-      // HVF is built into macOS — just check we're on a supported version
-      return { name: "hvf", available: true };
+      // Phase 1: x86_64 guest on Apple Silicon = TCG only. HVF is not available
+      // for cross-arch virtualization on macOS (HVF only accelerates the same
+      // architecture as the host — aarch64). Will switch to HVF when we add
+      // qemu-system-aarch64 in a later phase.
+      return { name: "tcg", available: true };
     }
     if (platform === "win32") {
       const whpxAvailable = QemuProcess.checkWhpx();

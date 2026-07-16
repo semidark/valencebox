@@ -25,8 +25,4 @@ sandbox/workspace/
 sandbox/build/
 
 # QEMU bundled binary + firmware (regenerate: scripts/build-qemu.sh (Linux) or scripts/build-qemu.ps1 (Windows))
-sandbox/resources/qemu/linux/qemu-system-x86_64
-sandbox/resources/qemu/linux/pc-bios/*
-sandbox/resources/qemu/win32/qemu-system-x86_64.exe
-sandbox/resources/qemu/win32/*.dll
-sandbox/resources/qemu/win32/pc-bios/*
+sandbox/resources/qemu/*

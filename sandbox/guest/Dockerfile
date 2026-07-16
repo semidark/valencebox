@@ -16,6 +16,7 @@ RUN apk add --no-cache \
     dhcpcd \
     curl \
     davfs2 \
+    unison \
     rsync \
     inotify-tools \
     e2fsprogs
@@ -53,13 +54,13 @@ RUN KREL=$(cat /usr/share/kernel/$KERNEL/kernel.release) && \
            fs/ocfs2 fs/ocfs2_dlm fs/isofs fs/udf fs/exfat && \
     depmod $KREL
 
-# davfs2 config: no locking, no Expect:100 (SLIRP can be slow), short timeouts
+# davfs2 config: no locking, no Expect:100 (SLIRP), short timeouts, cache on workspace volume
 RUN mkdir -p /etc/davfs2 && \
-    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\n' >> /etc/davfs2/davfs2.conf && \
+    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\ncache_dir /workspace/.davfs2-cache\ncache_size 50\n' > /etc/davfs2/davfs2.conf && \
     chmod 0644 /etc/davfs2/davfs2.conf && chown 0:0 /etc/davfs2 /etc/davfs2/davfs2.conf
 
 # Ensure virtio modules load at boot
-RUN printf 'virtio_blk\nvirtio_net\nqemu_fw_cfg\n' >> /etc/modules
+RUN printf 'virtio_blk\nvirtio_net\nqemu_fw_cfg\nfuse\n' >> /etc/modules
 
 # Serial console: root auto-login on ttyS0 at 115200
 RUN echo 'ttyS0::respawn:/sbin/agetty -a root -s ttyS0 115200 vt100' >> /etc/inittab && \
