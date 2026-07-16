@@ -142,7 +142,7 @@ export class QemuProcess extends EventEmitter {
       throw e;
     }
     await this.qmp.execute("qmp_capabilities");
-    console.log(`[qemu] QMP handshake complete`);
+    console.log(`[qemu] QMP handshake complete (${this.bootMs}ms)`);
 
     this.qmp.on("event", (event: string) => {
       this.emit("qmp:event", event);
