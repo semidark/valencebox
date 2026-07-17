@@ -49,6 +49,10 @@ exec 2>>/var/log/unison.log
 
 UNISON_PID=""
 
+# Workspace qcow2 is a host-canonical cache; unison archive doesn't survive
+# unclean shutdowns and carries no authoritative data. Rebuild on each start.
+rm -f /root/.unison/* 2>/dev/null
+
 cleanup() {
   [ -n "$UNISON_PID" ] && kill "$UNISON_PID" 2>/dev/null
   exit 0
