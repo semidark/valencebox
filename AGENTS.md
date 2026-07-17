@@ -99,6 +99,23 @@ npm start
   guest serial). Add `ACCEL=tcg` to force software emulation in accel-agnostic
   tests.
 
+## SSH debug access
+
+When a VM is running (via `npm start` or `test:boot`), you can SSH in for
+interactive debugging. This is faster and more reliable than serial I/O for
+multi-command shell workflows.
+
+```sh
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p 2222 root@127.0.0.1
+```
+
+- Forwarded via `-netdev user,hostfwd=tcp:127.0.0.1:2222-:22`
+- Only Ed25519 host key; `chacha20-poly1305` cipher, `curve25519-sha256` kex
+- `vm-debug` SSH public key baked into `/root/.ssh/authorized_keys`
+- **TODO: gate behind a config flag before release** (currently always on)
+- Works as long as QEMU SSH hostfwd is active (i.e., the app is running)
+
 ## Cross-cutting constraints
 
 ### Target (QEMU) — enforce these
