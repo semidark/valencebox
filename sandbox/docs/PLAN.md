@@ -139,10 +139,10 @@ new macOS runtime path.
 
 - [x] Verify the host WebDAV share starts and the guest can mount it.
 - [x] Verify `/workspace` mounts from the second virtio disk.
-- [ ] Verify guest-to-host sync works.
-- [ ] Verify host-to-guest sync works.
+- [x] Verify guest-to-host sync works.
+- [x] Verify host-to-guest sync works.
 - [x] Verify the Electron UI can send serial input and receive serial output.
-- [ ] Verify the app can start, run, and stop cleanly on macOS from source.
+- [x] Verify the app can start, run, and stop cleanly on macOS from source.
 - [ ] Capture macOS-specific runtime bugs, workarounds, and remaining gaps.
 
 Notes:
