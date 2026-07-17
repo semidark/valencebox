@@ -52,13 +52,18 @@ Guest (Alpine x86-64)
  └─ getty login shell on ttyS0
 ```
 
+> **⚠️ Stale — x86_64-only design. To be rewritten in Phase 7 (multi-arch).**
+> The table below describes the x86_64 TCG guest only. On Apple Silicon the
+> default will switch to an aarch64 guest under HVF (Phase 8). HVF is **not**
+> available for x86_64 guests on macOS — see `macos-issues.md`.
+
 ### Confirmed decisions
 
 | Topic | Decision |
 |---|---|
 | Machine type | `pc` (i440fx, PCI/ACPI/HPET — microvm has no HPET, fails under TCG) |
 | Emulator | vanilla `qemu-system-x86_64`, bundled per-platform |
-| Acceleration | auto-detect: `kvm`/`hvf`/`whpx` if available, else `tcg,thread=multi` |
+| Acceleration | auto-detect: `kvm`/`whpx` if available, else `tcg,thread=multi` (HVF is aarch64-only) |
 | Guest | Alpine x86-64, `linux-virt` kernel, virtio devices |
 | Host↔guest share | **WebDAV over plain HTTP** (no TLS) over SLIRP — token-based auth for multi-user safety |
 | Working tree | native qcow2 (`/dev/vdb`), mirrored via in-guest rsync/inotify |
@@ -75,12 +80,16 @@ is available:
 
 | Accel | Machine | Rationale |
 |---|---|---|
-| KVM / HVF / WHPX | `microvm` | kvmclock provides reliable TSC — HPET not needed |
+| KVM / WHPX | `microvm` | kvmclock provides reliable TSC — HPET not needed |
 | TCG (fallback) | `pc` (i440fx) | microvm lacks HPET; guest cannot calibrate TSC under TCG |
+| HVF (aarch64-only, Phase 8) | `microvm` (or `virt`) | TBD — Phase 8 will determine microvm viability under HVF |
 
 Under hardware acceleration, the guest uses kvmclock (KVM) or analogous
 paravirtual clocksource, so microvm's missing HPET is irrelevant. Under TCG,
 `-machine pc` provides HPET + ACPI PM timer for working TSC calibration.
+
+> **Note on HVF:** On macOS, HVF only virtualizes aarch64 guests (same-arch as
+> Apple Silicon). The x86_64 guest always uses TCG. HVF for aarch64 is Phase 8.
 
 **Virtio transport** matches the machine type:
 - `microvm` → `virtio-*-device` (mmio)

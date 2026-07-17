@@ -288,10 +288,9 @@ export class QemuProcess extends EventEmitter {
       }
     }
     if (platform === "darwin") {
-      // Phase 1: x86_64 guest on Apple Silicon = TCG only. HVF is not available
-      // for cross-arch virtualization on macOS (HVF only accelerates the same
-      // architecture as the host — aarch64). Will switch to HVF when we add
-      // qemu-system-aarch64 in a later phase.
+      // x86_64 guest on Apple Silicon = TCG only. HVF cannot accelerate x86_64
+      // guests (HVF only virtualizes the host arch — aarch64). The aarch64
+      // guest (Phase 8) uses HVF; this x86_64 path is the TCG fallback.
       return { name: "tcg", available: true };
     }
     if (platform === "win32") {
