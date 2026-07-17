@@ -37,7 +37,8 @@ bash scripts/build-qemu.sh darwin
 
 What happens:
 - Fetches QEMU 9.2.4 source tarball to `build/qemu-9.2.4/src/`
-- Configures with `--enable-pie --disable-strip` and macOS-specific flags
+- Configures with `--target-list=x86_64-softmmu --enable-slirp --enable-zstd`
+  and macOS-specific flags
 - Builds `qemu-system-x86_64` and `qemu-img` with `make -j$(hw.logicalcpu)`
 - Bundles runtime dylibs (glib, pixman, etc.) into
   `sandbox/resources/qemu/darwin/lib/`

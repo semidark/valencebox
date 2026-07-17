@@ -1,27 +1,56 @@
 # PLAN
 
 This file tracks the execution plan for Apple Silicon macOS support and the
-follow-on Debian/aarch64/FEX work.
+follow-on aarch64/FEX work.
 
 `docs/qemu.md` remains the source of truth for the current QEMU rewrite
 architecture and invariants. This file is the working checklist for the next
 phases.
 
+## Execution order
+
+Phases 1-5 are complete (x86_64 guest on Apple Silicon under TCG). The remaining
+phases execute in numeric order:
+
+```
+Phase 6  — Tests And Cleanup (lock in the x86_64 TCG fallback)
+Phase 7  — Multi-Arch Build And Runtime Abstraction
+Phase 8  — Accelerated aarch64 Ubuntu Guest (HVF)
+Phase 9  — x86_64 Userspace Support Via FEX
+Phase 10 — Packaging Readiness (signing + notarization, last)
+```
+
+This is a reorder from an earlier draft: packaging/signing (previously Phase 7)
+now runs last, after FEX works. The old "Debian x86_64 migration" phases are
+folded into Phase 8 — there is no separate x86_64-Alpine-to-Debian step; the new
+accelerated guest is Ubuntu arm64 from the start.
+
 ## Decisions
 
 - Phase 1 target host is Apple Silicon macOS only.
 - Intel Macs are out of scope.
-- Phase 1 guest remains the current `x86_64` Linux guest.
-- Phase 1 macOS runtime uses `qemu-system-x86_64` with `-accel tcg,thread=multi`.
-- Phase 1 macOS runtime uses `-machine pc` only.
-- `microvm` is out of scope for phase 1.
+- The current `x86_64` guest under `-accel tcg,thread=multi` + `-machine pc`
+  becomes the **fallback** path once the aarch64 guest lands. It is kept working,
+  not deleted.
+- **The default guest on Apple Silicon is aarch64 under HVF**, falling back to the
+  emulated `x86_64` guest only when aarch64 assets or HVF are unavailable.
+- Prefer `-machine microvm` for the aarch64 guest if it works under HVF; otherwise
+  use `-machine virt`. Decide when Phase 8 reaches bring-up.
+- The aarch64 guest is **Ubuntu arm64** (glibc), chosen so FEX's official apt
+  packages install cleanly.
+- The aarch64 guest boots via **direct `-kernel`/`-initrd`** (no UEFI/pflash disk
+  boot), matching the current x86_64 approach.
+- **FEX runs at system level via `binfmt_misc`** — any x86_64 ELF is transparently
+  translated; no per-tool wrapping.
+- **The FEX x86_64 RootFS is bundled into the guest image at build time** (a few
+  hundred MB is acceptable). No first-boot `FEXRootFSFetcher` download.
 - End-user runtime must not depend on Homebrew or `$PATH`.
 - `scripts/build-qemu.sh darwin` builds QEMU from source on macOS and stages a
   portable dylib bundle into `sandbox/resources/qemu/darwin/`.
 - Fresh source builds on Apple Silicon must not require a separately installed
   host `qemu-img` binary.
 - Signing and notarization are deferred until packaged app distribution becomes
-  a real requirement.
+  a real requirement (Phase 10).
 
 ## Phase 0 - Baseline
 
@@ -143,138 +172,138 @@ new macOS runtime path.
 - [x] Verify host-to-guest sync works.
 - [x] Verify the Electron UI can send serial input and receive serial output.
 - [x] Verify the app can start, run, and stop cleanly on macOS from source.
-- [ ] Capture macOS-specific runtime bugs, workarounds, and remaining gaps.
+- [x] Capture macOS-specific runtime bugs, workarounds, and remaining gaps (`docs/macos-issues.md`).
 
 Notes:
 - Keep this phase limited to features that already exist in the current QEMU
   rewrite.
 - Do not make snapshot work a gate for macOS bring-up if snapshot support is
   still pending globally.
+- The x86_64 TCG path validated here becomes the fallback once the aarch64 guest
+  (Phase 8) lands.
 
 ## Phase 6 - Tests And Cleanup
 
-Goal: lock in the macOS path with focused tests and remove stale assumptions.
+Goal: lock in the x86_64 TCG path as a stable fallback with focused tests and
+remove stale assumptions before the multi-arch refactor.
 
-- [ ] Add tests for QEMU binary and firmware path resolution.
-- [ ] Add tests for darwin accelerator and machine-selection policy.
-- [ ] Add or rewrite a boot smoke test that exercises the `QemuProcess` /
-  `VmManager` path rather than the legacy `v86` VM path.
-- [ ] Verify the macOS path manually after a clean rebuild of QEMU assets.
-- [ ] Remove or update stale comments and docs that imply macOS uses HVF in the
-  current phase 1 design.
-- [ ] Update `docs/qemu.md` and related docs once the macOS behavior is real.
+The x86_64 TCG path is a **best-effort escape hatch** (not a first-class
+supported fallback). Tests against the current x86_64-hardcoded API are deferred
+to Phase 7 where they are written once against the abstracted `GuestProfile`
+API. Only doc-and-comment cleanup is done here.
+
+- [ ] ~~Add tests for QEMU binary and firmware path resolution (`asset-paths.ts`,
+  dev vs packaged, per-platform).~~ *(deferred to Phase 7 — will be written
+  against the parameterized API)*
+- [ ] ~~Add tests for accelerator and machine-selection policy (`resolveAccels`
+  and the inline `useMicrovm` machine logic in `qemu.ts`).~~ *(deferred to Phase
+  7 — logic being rewritten in that phase)*
+- [x] Add or rewrite a boot smoke test that exercises the `QemuProcess` /
+  `VmManager` path rather than the legacy `v86` VM path (`test/boot.test.ts`).
+- [ ] ~~Verify the macOS path manually after a clean rebuild of QEMU assets.~~ *(skip
+  — Phase 8 forces a full rebuild-and-verify cycle anyway)*
+- [x] Remove or update stale comments and docs that imply macOS uses HVF in the
+  current x86_64 design.
+- [x] Fix known doc drift: nonexistent `resolveMachine()` referenced in
+  `macos-issues.md` (logic is inline in `buildArgs`); configure-flag mismatch in
+  `build-from-source.md` vs `build-qemu.sh`.
+- [ ] ~~Update `docs/qemu.md` and related docs once the macOS behavior is real.~~ *(skip
+  — `qemu.md` gets a full rewrite in Phase 7 for the multi-arch world)*
 
 Notes:
 - Prefer small, targeted tests over large new harnesses.
 - Keep legacy `v86` paths out of new macOS validation work.
 
-## Phase 7 - Packaging Readiness
-
-Goal: prepare for packaged app testing without making signing a prerequisite for
-local development.
-
-- [ ] Ensure bundled QEMU assets are included in packaged app resources.
-- [ ] Ensure bundled QEMU assets remain outside `asar`.
-- [ ] Verify the packaged app can locate and spawn the bundled darwin QEMU tree.
-- [ ] Add signing of nested QEMU binaries and dylibs when packaged app
-  distribution becomes necessary.
-- [ ] Add notarization only when distributing packaged macOS builds externally.
-
-Notes:
-- This phase is intentionally after source-build bring-up.
-- Local development from a Git checkout should not wait on signing.
-
-## Phase 8 - Debian Guest Migration Prep
-
-Goal: prepare the current `x86_64` VM infrastructure for a later switch from
-Alpine to Debian.
-
-- [ ] Inventory Alpine-specific assumptions in the guest build and boot flow.
-- [ ] Inventory OpenRC- and busybox-specific assumptions in guest init and
-  service management.
-- [ ] Separate guest image naming and kernel/initrd path assumptions from host
-  runtime wiring where needed.
-- [ ] Decide the Debian guest build approach.
-- [ ] Decide the Debian init and service model.
-- [ ] Decide the minimum Debian package set needed to preserve the current
-  WebDAV and sync model.
-
-Notes:
-- Debian migration is a prerequisite for the later FEX-on-aarch64 plan.
-- Keep the current host-side WebDAV, fw_cfg, and sync design unless Debian
-  forces a concrete change.
-
-## Phase 9 - Debian x86_64 Guest Migration
-
-Goal: replace the Alpine guest with a Debian-based `x86_64` guest while keeping
-the current host-side `qemu-system-x86_64` design.
-
-- [ ] Replace the Alpine guest build with a Debian-based guest build.
-- [ ] Replace Alpine kernel and initramfs assumptions with Debian equivalents.
-- [ ] Replace Alpine package installation and guest provisioning steps.
-- [ ] Replace Alpine/OpenRC guest service wiring with the chosen Debian service
-  model.
-- [ ] Restore serial login, workspace disk mount, WebDAV mount, and sync.
-- [ ] Verify the Debian `x86_64` guest on Linux, Windows, and macOS.
-
-Notes:
-- Keep this phase on the existing `x86_64` guest architecture.
-- Do not mix the `aarch64` VM work into this phase.
-
-## Phase 10 - Multi-Arch Build And Runtime Abstraction
+## Phase 7 - Multi-Arch Build And Runtime Abstraction
 
 Goal: make both the build pipeline and the host runtime capable of selecting
-different QEMU binaries, machine profiles, firmware sets, and guest images.
+different QEMU binaries, machine profiles, firmware sets, and guest images, so an
+`aarch64` guest can be added without destabilizing the `x86_64` fallback.
 
+- [ ] Introduce a `GuestProfile` abstraction capturing every arch-specific value
+  (qemu binary name, machine type, `-cpu`, accel priority, firmware, console
+  device, virtio transport, kernel/initrd/root image paths).
+- [ ] Parameterize `asset-paths.ts` binary + firmware resolution by arch (drop
+  the hardcoded `qemu-system-x86_64` / `pc-bios` assumptions).
+- [ ] Refactor `qemu.ts` `buildArgs` to drive off the profile; add support for
+  `-cpu` selection and an arch-aware console/cmdline.
+- [ ] Refactor `checkAccel` so darwin+aarch64 returns `hvf` while darwin+x86_64
+  stays `tcg`.
+- [ ] Add a `guest: "aarch64" | "x86_64"` selector in `config.ts`, auto-selecting
+  aarch64 on Apple Silicon with x86_64 fallback.
 - [ ] Introduce a build-script abstraction for selecting and staging multiple
-  QEMU system binaries.
-- [ ] Introduce a resource-layout abstraction that can hold more than one QEMU
-  system binary and its matching firmware set.
-- [ ] Introduce a packaging abstraction for including multiple QEMU system
-  binaries and their resources.
-- [ ] Introduce a runtime abstraction for QEMU host binary selection.
-- [ ] Introduce a runtime abstraction for guest architecture and machine
-  profile.
-- [ ] Introduce a runtime abstraction for firmware, kernel, initrd, and image
-  paths.
+  QEMU system binaries and their matching firmware sets.
+- [ ] Introduce a resource-layout convention that holds more than one QEMU system
+  binary + firmware + guest image set.
 - [ ] Preserve the existing `x86_64` path while adding the new abstractions.
 - [ ] Verify the abstractions still keep Linux, Windows, and macOS `x86_64`
   working.
 
 Notes:
 - This phase must land before any `qemu-system-aarch64` implementation work.
-- This phase should make `qemu-system-aarch64` support possible without
-  destabilizing the current `x86_64` path.
-- Avoid premature generalization before the Debian guest migration lands.
+- Avoid premature generalization; only abstract the values the aarch64 path needs.
 
-## Phase 11 - Accelerated aarch64 VM Path
+## Phase 8 - Accelerated aarch64 Ubuntu Guest (HVF)
 
-Goal: add a new Apple Silicon path based on an `aarch64` guest VM.
+Goal: add a native, HVF-accelerated `aarch64` Ubuntu guest and make it the
+default on Apple Silicon. This folds in the former "Debian migration" phases —
+the new guest is Ubuntu arm64 from the start; there is no x86_64-guest migration.
 
-- [ ] Build and bundle the required `qemu-system-aarch64` host artifact.
-- [ ] Define the Apple Silicon `aarch64` machine, firmware, and device profile.
-- [ ] Boot a Debian arm64 guest on Apple Silicon with hardware acceleration.
-- [ ] Restore the host WebDAV share and `/workspace` sync model on the new arm64
-  guest path.
-- [ ] Keep the existing `x86_64` guest path available until the new arm64 path
-  is ready to replace it.
+- [ ] Add an `aarch64-softmmu` target and `--enable-hvf` to the darwin QEMU
+  build; stage `qemu-system-aarch64` alongside the existing x86_64 tree.
+- [ ] Build an Ubuntu arm64 guest image (`buildx --platform=linux/arm64`) with an
+  arm64 kernel + initrd for direct `-kernel` boot.
+- [ ] Select `-machine microvm` under HVF if viable; otherwise `-machine virt`.
+- [ ] Boot the Ubuntu arm64 guest to a serial login on Apple Silicon under HVF
+  (`console=ttyAMA0`, root on `/dev/vda`).
+- [ ] Restore the WebDAV share, fw_cfg config channel, `/workspace` mount, and
+  unison sync on the arm64 guest.
+- [ ] Verify QMP lifecycle and clean shutdown on the arm64 path.
+- [ ] Keep the emulated `x86_64` guest available as the documented fallback.
 
 Notes:
-- This phase is about the VM architecture change only.
-- Do not begin FEX integration until the accelerated arm64 VM path is stable.
+- Reuse the host-side WebDAV, fw_cfg, and sync design unchanged; only the guest
+  arch, kernel, console, and machine profile change.
+- Direct `-kernel`/`-initrd` boot only; no UEFI/pflash disk boot.
 
-## Phase 12 - x86_64 Userspace Support Via FEX
+## Phase 9 - x86_64 Userspace Support Via FEX
 
-Goal: support `x86_64` userspace workloads inside the new Debian arm64 guest.
+Goal: run `x86_64` userspace workloads transparently inside the aarch64 Ubuntu
+guest via system-level FEX.
 
-- [ ] Install and configure FEX in the Debian arm64 guest.
-- [ ] Define the guest-side workflow for running `x86_64` tools under FEX.
-- [ ] Verify the expected developer workflows still work in the new guest.
+- [ ] Install FEX from the official Ubuntu apt repository in the guest image
+  build.
+- [ ] Bundle the FEX x86_64 RootFS (SquashFS/EroFS) into the guest image at build
+  time; no first-boot download.
+- [ ] Register the FEX `binfmt_misc` handlers at guest boot so x86_64 ELFs run
+  transparently.
+- [ ] Verify an x86_64 binary executes inside the aarch64 guest without explicit
+  wrapping.
 - [ ] Measure performance and compatibility against the pure emulated `x86_64`
-  phase 1 path.
-- [ ] Decide when the old pure emulated `x86_64` VM path can be deprecated.
+  fallback path.
+- [ ] Decide when the emulated `x86_64` guest can be deprecated (kept as fallback
+  for now).
 
 Notes:
-- FEX support is the last step, not the first.
-- Keep an escape hatch to the pure emulated `x86_64` path until the arm64 + FEX
-  path is proven.
+- FEX is system-level via `binfmt_misc`, not per-tool.
+- Keep an escape hatch to the emulated `x86_64` path until aarch64 + FEX is proven.
+
+## Phase 10 - Packaging Readiness
+
+Goal: prepare for packaged app testing and distribution. This runs last, after
+the aarch64 + FEX path works, so packaging covers the final asset set.
+
+- [ ] Add electron-builder config (currently none) to bundle both QEMU trees,
+  firmware, and guest images.
+- [ ] Ensure bundled QEMU assets are included in packaged app resources.
+- [ ] Ensure bundled QEMU assets remain outside `asar` so binaries stay
+  executable and firmware stays directly readable.
+- [ ] Verify the packaged app can locate and spawn both the aarch64 and x86_64
+  QEMU trees.
+- [ ] Add signing of nested QEMU binaries and dylibs (both arches) for macOS
+  distribution.
+- [ ] Add notarization only when distributing packaged macOS builds externally.
+
+Notes:
+- Local development from a Git checkout should not wait on signing.
+- Packaging must cover both the default aarch64 assets and the x86_64 fallback.
