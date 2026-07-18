@@ -195,6 +195,48 @@ export class QemuProcess extends EventEmitter {
 
     if (opts.freeze) args.push("-S");
     for (const a of accels) args.push("-accel", a);
+
+    // QMP transport
+    const qmpTr = this.qmpTransport!;
+    const qmpArg = qmpTr.type === "unix"
+      ? `unix:${qmpTr.local},server,nowait`
+      : `tcp:127.0.0.1:${qmpTr.local},server,nowait`;
+    args.push("-qmp", qmpArg);
+
+    // Serial transport
+    const serialTr = this.serialTransport!;
+    const serialArg = serialTr.type === "unix"
+      ? `unix:${serialTr.local},server,nowait`
+      : `tcp:127.0.0.1:${serialTr.local},server,nowait`;
+    args.push("-serial", serialArg);
+
+    const fwDir = firmwareDir();
+    if (fwDir) args.push("-L", fwDir);
+
+    // Delegate pure-argument construction to the static method (testable)
+    args.push(...QemuProcess.buildArgs(opts, machineType));
+
+    return args;
+  }
+
+  /** Poll for a Unix socket to appear, then chmod 0600 to restrict access. */
+  private async chmodSocket(sockPath: string): Promise<void> {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      try {
+        await fsp.chmod(sockPath, 0o600);
+        return;
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    // Non-fatal — socket works, just less restrictive
+  }
+
+  static buildArgs(opts: QemuOptions, machineType: string): string[] {
+    const profile = opts.guestProfile;
+    const args: string[] = [];
+
     args.push(
       "-machine", machineType,
       "-m", `${opts.memoryMB}`,
@@ -205,23 +247,6 @@ export class QemuProcess extends EventEmitter {
       "-no-reboot",
     );
     if (profile.cpu) args.push("-cpu", profile.cpu);
-
-    // QMP transport (put before serial so monitor init happens first on Windows)
-    const qmpTr = this.qmpTransport!;
-    const qmpArg = qmpTr.type === "unix"
-      ? `unix:${qmpTr.local},server,nowait`
-      : `tcp:127.0.0.1:${qmpTr.local},server,nowait`;
-    args.push("-qmp", qmpArg);
-
-    // Serial transport arg
-    const serialTr = this.serialTransport!;
-    const serialArg = serialTr.type === "unix"
-      ? `unix:${serialTr.local},server,nowait`
-      : `tcp:127.0.0.1:${serialTr.local},server,nowait`;
-    args.push("-serial", serialArg);
-
-    const fwDir = firmwareDir();
-    if (fwDir) args.push("-L", fwDir);
 
     const kernel = opts.kernel ?? profile.kernel;
     if (kernel) args.push("-kernel", kernel);
@@ -257,27 +282,10 @@ export class QemuProcess extends EventEmitter {
       );
     }
 
-    // SSH hostfwd on port 2222 for interactive debug; fast cipher config on client side
-    // TODO: gate SSH hostfwd behind a config flag before release (e.g. opts.debugSsh)
     args.push("-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22`, "-device", `${netDev},netdev=net0`);
-
     args.push("-device", rngDev);
 
     return args;
-  }
-
-  /** Poll for a Unix socket to appear, then chmod 0600 to restrict access. */
-  private async chmodSocket(sockPath: string): Promise<void> {
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      try {
-        await fsp.chmod(sockPath, 0o600);
-        return;
-      } catch {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-    }
-    // Non-fatal — socket works, just less restrictive
   }
 
   static checkAccel(platform: string, arch?: string): { name: string; available: boolean; hint?: string } {
