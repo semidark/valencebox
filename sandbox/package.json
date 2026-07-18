@@ -14,7 +14,7 @@
     "test:boot": "tsx test/boot.test.ts",
     "test:ui": "electron test/ui-smoke.js",
     "images": "./scripts/build-guest.sh",
-"images:all": "./scripts/build-guest.sh && ./scripts/build-guest.sh --arch arm64",
+"images:all": "./scripts/build-guest.sh --arch amd64 && ./scripts/build-guest.sh --arch arm64",
     "build:qemu": "bash ../scripts/build-qemu.sh"
   },
   "dependencies": {
