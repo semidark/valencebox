@@ -1,8 +1,34 @@
 #!/bin/sh
-# Build the x86-64 Ubuntu guest: Docker image → root.qcow2 + workspace.qcow2
-# Extracts vmlinuz and initrd.img for direct kernel boot.
+# Build the Ubuntu guest rootfs for QEMU direct kernel boot.
+# Supports x86-64 (default) and arm64 (--arch arm64) targets.
+# Output: root.qcow2, vmlinuz.bin, initramfs.bin, workspace.qcow2
+# On arm64: root-arm64.qcow2, vmlinuz-arm64.bin, initramfs-arm64.bin, workspace-arm64.qcow2
 set -e
 cd "$(dirname "$0")/.."
+
+ARCH="amd64"
+SUFFIX=""
+PLATFORM_FLAG="linux/amd64"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --arch)
+      shift
+      if [ "$1" = "arm64" ]; then
+        ARCH="arm64"
+        SUFFIX="-arm64"
+        PLATFORM_FLAG="linux/arm64"
+      fi
+      shift
+      ;;
+    *)
+      echo "unknown option: $1"
+      echo "usage: $0 [--arch arm64]"
+      exit 1
+      ;;
+  esac
+done
+
+GUEST_ARCH_LABEL=$(echo "$ARCH" | sed 's/amd64/x86-64/')
 
 # Resolve qemu-img: prefer bundled, fall back to PATH
 PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -11,64 +37,72 @@ QEMU_IMG=./resources/qemu/$PLATFORM/qemu-img
 
 mkdir -p images
 
-echo "==> building guest docker image (x86-64 Ubuntu, linux-image-virtual)"
-docker build \
-  --platform=linux/amd64 \
-  -t sandbox-guest \
-  -f guest/Dockerfile guest
+echo "==> building guest docker image ($GUEST_ARCH_LABEL Ubuntu, linux-image-virtual)"
+if [ "$ARCH" = "arm64" ]; then
+  docker buildx build \
+    --platform="$PLATFORM_FLAG" \
+    -t sandbox-guest-"$ARCH" \
+    -f guest/Dockerfile \
+    --load \
+    guest
+else
+  docker build \
+    --platform="$PLATFORM_FLAG" \
+    -t sandbox-guest \
+    -f guest/Dockerfile guest
+fi
 
 echo "==> exporting rootfs"
-docker rm -f sandbox-export >/dev/null 2>&1 || true
-docker create --platform=linux/amd64 --name sandbox-export sandbox-guest >/dev/null
-docker export sandbox-export -o images/rootfs.tar
-docker rm sandbox-export >/dev/null
+docker rm -f sandbox-export-"$ARCH" >/dev/null 2>&1 || true
+docker create --platform="$PLATFORM_FLAG" --name sandbox-export-"$ARCH" \
+  $( [ "$ARCH" = "arm64" ] && echo "sandbox-guest-arm64" || echo "sandbox-guest" ) \
+  >/dev/null
+docker export sandbox-export-"$ARCH" -o images/rootfs"$SUFFIX".tar
+docker rm sandbox-export-"$ARCH" >/dev/null
 
-echo "==> creating root.qcow2"
-rm -f images/root.qcow2
-mkdir -p /tmp/sandbox-rootfs
-# --numeric-owner avoids issues with Docker-exported UIDs
-tar -xf images/rootfs.tar -C /tmp/sandbox-rootfs --numeric-owner
+echo "==> creating root${SUFFIX}.qcow2"
+rm -f "images/root${SUFFIX}.qcow2"
+mkdir -p /tmp/sandbox-rootfs"$SUFFIX"
+tar -xf "images/rootfs${SUFFIX}.tar" -C "/tmp/sandbox-rootfs${SUFFIX}" --numeric-owner
 
 # Set hostname and hosts
-echo sandbox > /tmp/sandbox-rootfs/etc/hostname
-printf "127.0.0.1\tlocalhost sandbox\n" > /tmp/sandbox-rootfs/etc/hosts
+echo sandbox > "/tmp/sandbox-rootfs${SUFFIX}/etc/hostname"
+printf "127.0.0.1\tlocalhost sandbox\n" > "/tmp/sandbox-rootfs${SUFFIX}/etc/hosts"
 
 # Remove unnecessary files before creating fs
-rm -f /tmp/sandbox-rootfs/.dockerenv 2>/dev/null || true
+rm -f "/tmp/sandbox-rootfs${SUFFIX}/.dockerenv" 2>/dev/null || true
 
 # Extract kernel + initramfs from exported rootfs
-# Ubuntu names them vmlinuz-<version> and initrd.img-<version>
-KREL=$(ls /tmp/sandbox-rootfs/lib/modules 2>/dev/null | head -1)
+KREL=$(ls "/tmp/sandbox-rootfs${SUFFIX}/lib/modules" 2>/dev/null | head -1)
 if [ -z "$KREL" ]; then
   echo "ERROR: no kernel modules found in exported rootfs" >&2
   exit 1
 fi
-cp "/tmp/sandbox-rootfs/boot/vmlinuz-$KREL" images/vmlinuz.bin
-cp "/tmp/sandbox-rootfs/boot/initrd.img-$KREL" images/initramfs.bin
-rm -rf /tmp/sandbox-rootfs/boot/*
+cp "/tmp/sandbox-rootfs${SUFFIX}/boot/vmlinuz-$KREL" "images/vmlinuz${SUFFIX}.bin"
+cp "/tmp/sandbox-rootfs${SUFFIX}/boot/initrd.img-$KREL" "images/initramfs${SUFFIX}.bin"
+rm -rf "/tmp/sandbox-rootfs${SUFFIX}/boot/*"
 
-# Root image size: at least 5 GiB for growth (qcow2 is sparse, so host
-# consumption tracks actual data). 25% slack above that for future upgrades.
+# Root image size: at least 5 GiB for growth (qcow2 is sparse). 25% slack.
 MIN_ROOT_MB=5120
-SZ=$(du -sm /tmp/sandbox-rootfs | cut -f1); SZ=$((SZ + SZ / 4))
+SZ=$(du -sm "/tmp/sandbox-rootfs${SUFFIX}" | cut -f1); SZ=$((SZ + SZ / 4))
 [ "$SZ" -lt "$MIN_ROOT_MB" ] && SZ=$MIN_ROOT_MB
 
 # Create raw ext4 image via Docker, then convert to qcow2
-dd if=/dev/zero of=/tmp/sandbox-rootfs.img bs=1M count="$SZ" status=none
-docker run --rm --platform=linux/amd64 \
-  -v /tmp/sandbox-rootfs:/rootfs:ro \
-  -v /tmp/sandbox-rootfs.img:/rootfs.img \
+dd if=/dev/zero of="/tmp/sandbox-rootfs${SUFFIX}.img" bs=1M count="$SZ" status=none
+docker run --rm --platform="$PLATFORM_FLAG" \
+  -v "/tmp/sandbox-rootfs${SUFFIX}:/rootfs:ro" \
+  -v "/tmp/sandbox-rootfs${SUFFIX}.img:/rootfs.img" \
   ubuntu:24.04 sh -c 'apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null && mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img'
-"$QEMU_IMG" convert -f raw -O qcow2 /tmp/sandbox-rootfs.img images/root.qcow2
-rm -f /tmp/sandbox-rootfs.img
+"$QEMU_IMG" convert -f raw -O qcow2 "/tmp/sandbox-rootfs${SUFFIX}.img" "images/root${SUFFIX}.qcow2"
+rm -f "/tmp/sandbox-rootfs${SUFFIX}.img"
 
 # Workspace disk
 WSZ="${WORKSPACE_MB:-1024}"
-rm -f images/workspace.qcow2
-"$QEMU_IMG" create -f qcow2 images/workspace.qcow2 "${WSZ}M"
+rm -f "images/workspace${SUFFIX}.qcow2"
+"$QEMU_IMG" create -f qcow2 "images/workspace${SUFFIX}.qcow2" "${WSZ}M"
 
 # Clean up
-rm -rf /tmp/sandbox-rootfs images/rootfs.tar
+rm -rf "/tmp/sandbox-rootfs${SUFFIX}" "images/rootfs${SUFFIX}.tar"
 
 echo "==> done"
-ls -lh images/
+ls -lh images/ | grep "${SUFFIX}" || ls -lh images/

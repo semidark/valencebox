@@ -1,7 +1,10 @@
-# ── Single-stage: x86-64 Ubuntu guest rootfs ──
-# Produces a bootable rootfs for QEMU microvm/pc with virtio-blk root,
-# workspace qcow2 mount, WebDAV host share, and bidir sync service.
+# ── Single-stage: Ubuntu guest rootfs (x86-64 or arm64) ──
+# Produces a bootable rootfs for QEMU pc/microvm (x86-64) or virt (aarch64)
+# with virtio-blk root, workspace qcow2 mount, WebDAV host share, bidir sync.
 FROM ubuntu:24.04
+
+# TARGETARCH is auto-populated by docker buildx (amd64 | arm64).
+ARG TARGETARCH
 
 ENV HOSTNAME=sandbox
 
@@ -30,11 +33,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     e2fsprogs && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# RTC driver for host-clock time on QEMU -machine virt (aarch64). QEMU's virt
+# machine exposes a PL031 RTC seeded with host UTC, but Ubuntu's linux-virt only
+# ships rtc-pl031 in linux-modules-extra. Install the extra-modules package whose
+# version is derived from the *installed* kernel, so apt version-locks the two:
+# a kernel upgrade forces a matching linux-modules-extra (apt refuses a mismatch).
+# This is the stable, apt-managed way to get an in-tree module that the base
+# linux-virtual metapackage omits — no hand-copied .ko, no version pinning, and
+# it survives kernel upgrades. The subsequent strip step trims the bulk we pulled
+# in. Without rtc-pl031 there is no /dev/rtc0, so the guest boots at the kernel
+# build epoch and the clock is wildly wrong. x86-64 (pc) uses the built-in
+# rtc_cmos, so this is only needed for arm64.
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      KREL=$(ls /lib/modules | head -1); \
+      apt-get update && \
+      apt-get install -y --no-install-recommends "linux-modules-extra-${KREL}" && \
+      apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Explicit initramfs module list. Docker containers have no virtio devices,
 # so initramfs-tools auto-detection finds nothing — we must list them here.
 # virtio_mmio is needed for -machine microvm (non-PCI transport);
 # virtio_blk/ virtio_net are built-in on x86_64 but listed for safety;
-# port/token passed via kernel cmdline (no fw_cfg needed).
+# rtc_pl031 provides host-clock time on aarch64 virt (harmless no-op on x86_64,
+# where it simply won't load); port/token passed via kernel cmdline.
 RUN printf '%s\n' \
     virtio_blk \
     virtio_net \
@@ -42,7 +64,15 @@ RUN printf '%s\n' \
     ext4 \
     virtio_console \
     virtio_rng \
+    rtc_pl031 \
     > /etc/initramfs-tools/modules
+
+# MODULES=list keeps only the modules named above in the initramfs. The default
+# (MODULES=most) bundles ~2300 modules — harmless on the base linux-virtual set,
+# but balloons the initramfs to ~48 MB once linux-modules-extra is installed for
+# rtc-pl031. Our device set is fixed (virtio + ext4 + rtc), so `list` is correct
+# and shrinks the initramfs back to a few MB.
+RUN sed -i 's/^MODULES=.*/MODULES=list/' /etc/initramfs-tools/initramfs.conf
 
 # Rebuild initramfs with the explicit module list baked in
 RUN KREL=$(ls /lib/modules | head -1) && \
@@ -84,17 +114,22 @@ RUN mkdir -p /etc/davfs2 && \
     chmod 0644 /etc/davfs2/davfs2.conf && chown 0:0 /etc/davfs2 /etc/davfs2/davfs2.conf
 
 # Serial console: systemd serial-getty generator creates
-# serial-getty@ttyS0.service when console=ttyS0 is on the kernel cmdline.
-# Override it to add -a root (auto-login). agetty positional args are
-# `baud_rate[,...] port [term]`, so the baud list comes first, then %I
-# (the systemd instance name = ttyS0). Putting the port second is critical —
-# `agetty --keep-baud 115200 115200 ttyS0` makes agetty treat the second
-# 115200 as the port and fail with "cannot open /dev/115200".
+# serial-getty@<device>.service based on console=<device> on the kernel cmdline.
+# We create drop-ins for both ttyS0 (x86_64 pc/microvm) and ttyAMA0 (aarch64
+# virt) so auto-login works regardless of which console is active. agetty
+# positional args are `baud_rate[,...] port [term]` — the baud list comes
+# first, then %I (systemd instance name = the tty device).
 RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d && \
     printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty -a root --keep-baud 115200,57600,38400,9600 %%I vt100\nType=idle\n' \
-    > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf && \
+    mkdir -p /etc/systemd/system/serial-getty@ttyAMA0.service.d && \
+    printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty -a root --keep-baud 115200,57600,38400,9600 %%I vt100\nType=idle\n' \
+    > /etc/systemd/system/serial-getty@ttyAMA0.service.d/autologin.conf
 
-# Mask unneeded systemd units that could stall in a VM with no hardware
+# Mask unneeded systemd units that could stall in a VM with no hardware.
+# systemd-timesyncd is masked: the guest gets correct wall-clock time from the
+# QEMU-provided RTC at boot (rtc_cmos on x86-64 pc, rtc-pl031 on aarch64 virt),
+# both seeded from the host clock. No NTP/network dependency for time.
 RUN systemctl mask \
     bluetooth.service \
     wpa_supplicant.service \
@@ -108,7 +143,7 @@ RUN systemctl mask \
 RUN echo sandbox > /etc/hostname
 
 # motd
-RUN printf '\nsandbox login ready (x86-64, Ubuntu 24.04)\n' > /etc/motd
+RUN printf '\nsandbox login ready (Ubuntu 24.04)\n' > /etc/motd
 
 # fstab: workspace qcow2 disk mounted at /workspace by systemd automagically
 RUN printf '/dev/vdb  /workspace  ext4  defaults,noatime,nofail  0  2\n' >> /etc/fstab

@@ -26,3 +26,5 @@ sandbox/build/
 
 # QEMU bundled binary + firmware (regenerate: scripts/build-qemu.sh (Linux) or scripts/build-qemu.ps1 (Windows))
 sandbox/resources/qemu/*
+# ...but keep source files (entitlements plist consumed by build-qemu.sh signing)
+!sandbox/resources/qemu/hvf-entitlement.plist
