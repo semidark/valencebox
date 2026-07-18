@@ -2,6 +2,9 @@ import { EventEmitter } from "events";
 import * as net from "net";
 import { VmTransport } from "./asset-paths";
 
+const MAX_FRAME_SIZE = 16 * 1024 * 1024; // 16 MB sanity cap
+const MAX_ACCUM = 65536;
+
 export class PtyChannel extends EventEmitter {
   private client: net.Socket | null = null;
   private accumBuffer = Buffer.alloc(0);
@@ -14,7 +17,7 @@ export class PtyChannel extends EventEmitter {
     return this.client !== null && !this.client.destroyed;
   }
 
-  connect(retries = 5, delayMs = 300) {
+  connect(retries = 60, delayMs = 1000) {
     if (this.client) return;
 
     const attempt = () => {
@@ -23,7 +26,6 @@ export class PtyChannel extends EventEmitter {
         : net.createConnection(Number(this.transport.connectPath), "127.0.0.1");
 
       const onError = (err: NodeJS.ErrnoException) => {
-        // EAGAIN / ENOENT: QEMU chardev backlog full or socket not ready yet
         if (retries > 0 && (err.code === "EAGAIN" || err.code === "ENOENT" || err.code === "ECONNREFUSED")) {
           client.destroy();
           retries--;
@@ -45,6 +47,11 @@ export class PtyChannel extends EventEmitter {
       });
       client.on("error", onError);
       client.on("data", (chunk: Buffer) => {
+        if (this.accumBuffer.length + chunk.length > MAX_ACCUM) {
+          this.emit("error", new Error("pty accumulator overflow"));
+          this.disconnect();
+          return;
+        }
         this.accumBuffer = Buffer.concat([this.accumBuffer, chunk]);
         this.processBuffer();
       });
@@ -81,6 +88,11 @@ export class PtyChannel extends EventEmitter {
     while (this.accumBuffer.length >= 5) {
       const payloadLen = this.accumBuffer.readUInt32BE(0);
       const type = this.accumBuffer.readUInt8(4);
+      if (payloadLen > MAX_FRAME_SIZE) {
+        this.emit("error", new Error(`pty frame too large: ${payloadLen}`));
+        this.disconnect();
+        return;
+      }
       const frameLen = 5 + payloadLen;
 
       if (this.accumBuffer.length < frameLen) {

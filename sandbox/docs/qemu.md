@@ -70,7 +70,8 @@ Guest (Ubuntu 24.04 x86-64)
 | Source of truth | **host dir is canonical**; qcow2 is a synced cache |
 | Egress | SLIRP user-mode, **open for now** (filtering deferred) |
 | Snapshots | QMP `migrate` to zstd file (RAM + device state only) |
-| Terminal | login shell on QEMU serial console |
+| Terminal | PTY channel over virtio-serial + Python daemon, serial fallback |
+| Guest PTY agent | `pty-daemon.py` — Python daemon using `pty.fork()`, `select()`, framed protocol over `/dev/virtio-ports/pty` |
 | Platforms | Linux + macOS + Windows from day one |
 
 ### Machine type: dynamic (microvm or pc)
@@ -497,6 +498,102 @@ working terminal; confirm hw-accel is used when available and TCG otherwise.
 - [ ] Final `AGENTS.md` pass against the shipped reality
 
 ---
+
+## PTY channel (virtio-serial)
+
+The terminal uses a dedicated PTY channel over **virtio-serial** (not SSH, not the
+serial console) to avoid crypto overhead under TCG and provide TIOCSWINSZ resize.
+
+### Architecture
+
+```
+Electron (PtyChannel)
+  │  Unix socket (pty.sock)
+  ▼
+QEMU (-chardev socket → -device virtserialport,chardev=pty,name=pty)
+  │  virtio-serial bus, port "pty"
+  ▼
+Guest (/dev/virtio-ports/pty → udev symlink)
+  │
+  ├─ pty-daemon.py (opens port, forks bash on PTY slave)
+  │    ├─ port_fd: reads frames from host via virtio-serial
+  │    └─ master_fd: reads bash output from PTY master
+  └─ bash --login (on /dev/pts/N, PTY slave)
+```
+
+### Framed protocol
+
+All data on the virtio-serial port is framed:
+
+```
+[u32:payload_len][u8:type][payload...]
+```
+
+| Type | Value | Direction | Payload |
+|---|---|---|---|
+| PTY_DATA | 1 | bidir | arbitrary bytes written to/from the PTY |
+| PTY_RESIZE | 2 | host→guest | `[u16:cols][u16:rows]` → TIOCSWINSZ |
+| PTY_CLOSE | 3 | host→guest | (empty) SIGTERM child shell |
+| PTY_EXITED | 4 | guest→host | (empty) child shell exited; peer should close |
+
+### Guest daemon
+
+**`guest/usr/local/libexec/pty-daemon.py`** — Python 3 only, no external deps.
+
+1. Opens `/dev/virtio-ports/pty` (created by udev rule based on `name=pty`)
+2. Calls `pty.fork()` — child execs `bash --login`, parent keeps master fd
+3. `select()` loop: reads host input from port_fd → writes to master_fd;
+   reads bash output from master_fd → wraps in frame → writes to port_fd
+4. Handles PTY_RESIZE via `TIOCSWINSZ`, PTY_CLOSE via `kill(pid, SIGTERM)`
+
+### Host channel
+
+**`src/main/pty-channel.ts`** — `PtyChannel` extends `EventEmitter`.
+
+- Connects to QEMU's chardev socket with retry (60 attempts, 1s interval = 60s
+  total — covers TCG slow boot, backlog races)
+- Framed protocol with 16 MB sanity cap and 64 KB accumulator cap
+- Emits `"data"` (guest→renderer), `"closed"` (disconnect), `"error"`
+- `sendInput()` / `resize()` methods for host→guest framing
+
+### Renderer integration
+
+**`src/renderer/renderer.ts`** — the terminal starts in serial mode and
+transitions to PTY mode on first `pty:data` event:
+
+- `onPtyData`: sets `usingPty = true`, resets terminal, sends resize,
+  flushes any keystrokes buffered before PTY was ready
+- `onPtyClosed`: reverts to serial fallback
+- `term.onData`: routes keystrokes to PTY or serial based on `usingPty`
+  (bypasses the `isReady` gate for PTY input)
+- Input during boot is buffered in `pendingPtyInput[]` and drained on PTY
+  connection
+
+### Systemd unit
+
+**`guest/etc/systemd/system/pty-daemon.service`** — `Restart=always` with 1s
+restart interval. No device dependency: the daemon retries `open()` internally
+(via systemd restart) if the virtio-serial port isn't ready yet.
+
+### Key decisions
+
+| Question | Decision | Rationale |
+|---|---|---|
+| `virtconsole` vs `virtserialport` | `virtserialport` | `virtconsole` creates a kernel-console-only port (`hvcX`) that requires kernel console binding for bidirectional data. `virtserialport` exposes a proper character device at `/dev/virtio-ports/pty` |
+| Device path | `/dev/virtio-ports/pty` | Stable udev symlink based on `name=pty` QEMU arg, not a hardcoded vport number (which depends on enumeration order) |
+| Python vs Go/C | Python | Ubuntu guest ships Python 3. stdlib has `pty`, `termios`, `select`. No compile step needed |
+| Retry duration | 60s | Under TCG, boot takes 60s+. The QEMU chardev socket exists early but the guest daemon only opens the port after `multi-user.target` is reached |
+| Framed protocol | No padding/CRC | Loopback virtio-serial within single host — no network errors to detect |
+
+### Findings (PTY implementation)
+
+| Issue | Root cause | Fix |
+|---|---|---|
+| `connect EAGAIN` | QEMU chardev socket uses `listen(fd, 1)` — backlog overflow from prior zombie connections | Add retry loop with `EAGAIN` detection |
+| No PTY data flow | `-device virtconsole` creates a console-only port. Guest `/dev/hvc0` open succeeds but QEMU bridges no data | Switch to `-device virtserialport`; daemon opens `/dev/virtio-ports/pty` |
+| PTY daemon inactive | Systemd unit had `Requires=dev-hvc0.device` — with `virtserialport`, hvc0 never appears, so daemon never starts | Remove device dependency; use `Restart=always` retry |
+| Renderer input blocked during boot | `isReady` gate on `term.onData` dropped all keystrokes until VM phase="ready" | PTY input bypasses `isReady`; boot keystrokes buffered in `pendingPtyInput` |
+| Frame OOM vulnerability | No upper bound on `payloadLen` in frame header — malformed frame could grow buffer indefinitely | 16 MB frame cap + 64 KB accumulator cap + disconnect on violation |
 
 ## Known risks / follow-ups
 

@@ -167,7 +167,7 @@ booting…
 ✓ boot to login prompt in 37.2s
 ✓ root login (bash)
 ✓ /workspace mounted from second disk (ext4)
-✓ /dev/hvc0 present
+✓ /dev/virtio-ports/pty present
 ✓ sync-agent service started
 ✓ guest HELLO: ...
 ✓ PING acked in ...ms
