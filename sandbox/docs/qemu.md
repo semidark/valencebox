@@ -185,21 +185,20 @@ No other local user, no network, no admin privileges needed.
 
 ## What gets deleted vs. kept
 
-**Delete**
-- `v86/` submodule, `scripts/build-v86.sh`, `assets/v86/`, the `max_cache_bytes` fork
-- `src/main/bridge.ts`, `src/main/data-plane.ts`, `src/main/manifest.ts`, `src/main/sync-manager.ts`
-- `src/main/wisp.ts`, `src/main/doh.ts` (WISP relay / DoH egress gate — deferred)
+**Deleted (Phase 9)**
+- `v86/` submodule, `scripts/build-v86.sh`, `scripts/Dockerfile.v86`, the `max_cache_bytes` fork
+- `src/main/vm.ts`, `bridge.ts`, `data-plane.ts`, `manifest.ts`, `sync-manager.ts`
+- `src/main/snapshot.ts`, `sandbox.ts`, `wisp.ts`, `doh.ts`, `terminal.ts`
 - `src/shared/protocol.ts` (framed dual-channel protocol)
-- `guest/sync-agent-rust/`, `guest/rust-agent/`, `guest/sync-agent.bin`, `guest/blake2sum.bin`
-- Tests: `bridge.test.ts`, `dataplane.test.ts`, `sync.test.ts`, `manifest.unit.ts`, `hydrate-channel-switch.unit.ts`
-- Deps: `@mercuryworkshop/wisp-js`, `blakejs`, `ws` (once wisp/bridge are gone)
-- `PROTOCOL.md`, `docs/data-plane-architecture.md`
+- Tests: `manifest.unit.ts`, `hydrate-channel-switch.unit.ts`, `sync.test.ts`, `dataplane.test.ts`, `net.test.ts`, `memcheck.adhoc.ts`
+- `PROTOCOL.md`, `docs/data-plane-architecture.md`, `docs/switch-to-v86-fork.md`
+- Deps: `@mercuryworkshop/wisp-js`, `blakejs`, `ws` (no longer imported)
 
-**Rewrite**
-- `src/main/vm.ts` (QEMU subprocess + QMP instead of v86 in-process)
-- `src/main/snapshot.ts` (QMP migrate instead of v86 state blobs)
-- `src/main/sandbox.ts`, `src/main/main.ts` (simplified orchestration)
-- `guest/Dockerfile`, `scripts/build-guest.sh` (x86-64, virtio, sync service)
+**Rewritten (Phase 9)**
+- `src/main/vm-manager.ts` (QEMU subprocess + QMP, replaces `vm.ts`)
+- `src/main/main.ts` (simplified orchestration, uses VmManager directly)
+- `guest/Dockerfile`, `scripts/build-guest.sh` (x86-64 + arm64, virtio, unison sync)
+- `guest/usr/local/libexec/mount-share.sh`, `workspace-sync.sh`
 
 **Keep / adapt**
 - Electron shell, `src/main/preload.ts`, `src/main/terminal.ts`, `src/shared/ipc.ts`

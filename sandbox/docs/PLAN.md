@@ -216,7 +216,7 @@ API. Only doc-and-comment cleanup is done here.
   and the inline `useMicrovm` machine logic in `qemu.ts`).~~ *(deferred to Phase
   7 — logic being rewritten in that phase)*
 - [x] Add or rewrite a boot smoke test that exercises the `QemuProcess` /
-  `VmManager` path rather than the legacy `v86` VM path (`test/boot.test.ts`).
+  `VmManager` path (`test/boot.test.ts`).
 - [ ] ~~Verify the macOS path manually after a clean rebuild of QEMU assets.~~ *(skip
   — Phase 8 forces a full guest-image rebuild-and-verify cycle anyway)*
 - [x] Remove or update stale comments and docs that imply macOS uses HVF in the
@@ -229,7 +229,7 @@ API. Only doc-and-comment cleanup is done here.
 
 Notes:
 - Prefer small, targeted tests over large new harnesses.
-- Keep legacy `v86` paths out of new macOS validation work.
+- All v86 paths have been removed.
 
 ## Phase 7 - Multi-Arch Build And Runtime Abstraction
 
