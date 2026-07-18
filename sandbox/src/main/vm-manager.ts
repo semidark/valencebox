@@ -3,6 +3,7 @@ import * as fsp from "fs/promises";
 import * as net from "net";
 import { QemuProcess, QemuOptions } from "./qemu";
 import { GuestProfile } from "./guest-profile";
+import { PtyChannel } from "./pty-channel";
 
 
 export interface VmManagerOptions {
@@ -25,6 +26,7 @@ export class VmManager extends EventEmitter {
   private qemu: QemuProcess;
   private serialClient: net.Socket | null = null;
   private _serialLog = "";
+  private ptyChannel: PtyChannel | null = null;
 
   constructor(private opts: VmManagerOptions) {
     super();
@@ -36,6 +38,7 @@ export class VmManager extends EventEmitter {
     this.qemu.on("accel", (info: { name: string; available: boolean }) => this.emit("accel", info));
     await this.qemu.start(this.opts as QemuOptions);
     this.connectSerial();
+    this.connectPty();
   }
 
   get qemuProcess(): QemuProcess {
@@ -43,6 +46,8 @@ export class VmManager extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.ptyChannel?.disconnect();
+    this.ptyChannel = null;
     this.serialClient?.destroy();
     this.serialClient = null;
     await this.qemu.stop();
@@ -81,6 +86,14 @@ export class VmManager extends EventEmitter {
     await this.qemu.qmp?.setBalloon(clamped);
   }
 
+  sendPtyInput(data: Uint8Array): void {
+    this.ptyChannel?.sendInput(data);
+  }
+
+  resizePty(cols: number, rows: number): void {
+    this.ptyChannel?.resize(cols, rows);
+  }
+
   /** Query current balloon state. Returns { currentMB, ceilingMB, minMB } or null. */
   async getBalloon(): Promise<{ currentMB: number; ceilingMB: number; minMB: number } | null> {
     if (!this.qemu.qmp?.connected) return null;
@@ -103,6 +116,16 @@ export class VmManager extends EventEmitter {
       };
       poll();
     });
+  }
+
+  private connectPty(): void {
+    const transport = this.qemu.ptyTransport;
+    if (!transport) return;
+    this.ptyChannel = new PtyChannel(transport);
+    this.ptyChannel.on("data", (chunk: Uint8Array) => this.emit("pty:data", chunk));
+    this.ptyChannel.on("closed", () => this.emit("pty:closed"));
+    this.ptyChannel.on("error", (err) => console.error("[pty] channel error:", err));
+    this.ptyChannel.connect();
   }
 
   private connectSerial(): void {

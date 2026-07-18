@@ -1,0 +1,16 @@
+[Unit]
+Description=ValenceBox PTY Daemon
+After=dev-hvc0.device
+Requires=dev-hvc0.device
+
+[Service]
+ExecStart=/usr/local/libexec/pty-daemon.py
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=1
+User=root
+
+[Install]
+WantedBy=multi-user.target

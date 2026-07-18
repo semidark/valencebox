@@ -166,15 +166,17 @@ RUN systemctl enable dhcpcd
 # Enable SSH
 RUN systemctl enable ssh
 
-# Copy systemd unit files for mount-share and workspace-sync
+# Copy systemd unit files for mount-share, workspace-sync, and pty-daemon
 COPY etc/systemd/system/mount-share.service /etc/systemd/system/mount-share.service
 COPY etc/systemd/system/workspace-sync.service /etc/systemd/system/workspace-sync.service
-RUN systemctl enable mount-share && systemctl enable workspace-sync
+COPY etc/systemd/system/pty-daemon.service /etc/systemd/system/pty-daemon.service
+RUN systemctl enable mount-share && systemctl enable workspace-sync && systemctl enable pty-daemon
 
 # Copy helper scripts
 COPY usr/local/libexec/mount-share.sh /usr/local/libexec/mount-share.sh
 COPY usr/local/libexec/workspace-sync.sh /usr/local/libexec/workspace-sync.sh
-RUN chmod +x /usr/local/libexec/mount-share.sh /usr/local/libexec/workspace-sync.sh
+COPY usr/local/libexec/pty-daemon.py /usr/local/libexec/pty-daemon.py
+RUN chmod +x /usr/local/libexec/mount-share.sh /usr/local/libexec/workspace-sync.sh /usr/local/libexec/pty-daemon.py
 
 # Strip bloat
 RUN rm -rf /usr/share/man /usr/share/doc /usr/share/info /usr/share/i18n \
