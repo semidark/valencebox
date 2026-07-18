@@ -4,22 +4,17 @@ import nepheleServer from "nephele";
 import FileSystemAdapter from "@nephele/adapter-file-system";
 import CustomAuthenticator, { User } from "@nephele/authenticator-custom";
 import { randomBytes } from "crypto";
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
 import { getRandomFreePort } from "./asset-paths";
 
 export interface ShareConfig {
   port: number;
   token: string;
-  fwCfgPath: string;
 }
 
 export class HttpShare {
   private server: Server | null = null;
   public readonly token: string;
   public port = 0;
-  public fwCfgPath = "";
 
   constructor() {
     this.token = randomBytes(16).toString("hex");
@@ -27,7 +22,6 @@ export class HttpShare {
 
   async start(workspaceDir: string): Promise<ShareConfig> {
     this.port = await getRandomFreePort();
-    this.fwCfgPath = await writeFwCfg(this.port, this.token);
 
     const app = express();
     // Log every WebDAV request method, path, and response status
@@ -57,7 +51,7 @@ export class HttpShare {
     return new Promise((resolve, reject) => {
       this.server = createServer(app);
       this.server.listen(this.port, "127.0.0.1", () => {
-        resolve({ port: this.port, token: this.token, fwCfgPath: this.fwCfgPath });
+        resolve({ port: this.port, token: this.token });
       });
       this.server.on("error", reject);
     });
@@ -70,10 +64,4 @@ export class HttpShare {
   }
 }
 
-async function writeFwCfg(port: number, token: string): Promise<string> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "valence-"));
-  const cfgPath = path.join(tmpDir, "config.json");
-  fs.writeFileSync(cfgPath, JSON.stringify({ port, token }), "utf8");
-  fs.chmodSync(cfgPath, 0o600);
-  return cfgPath;
-}
+

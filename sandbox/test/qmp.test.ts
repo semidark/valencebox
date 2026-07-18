@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { QemuProcess } from "../src/main/qemu";
+import { x86_64Profile } from "../src/main/guest-profile";
 
 const VERBOSE = !!process.env.VERBOSE;
 const SCRATCH = process.env.SCRATCH ?? fs.mkdtempSync(path.join(os.tmpdir(), "qmp-"));
@@ -15,12 +16,15 @@ async function main() {
   qemu.on("stderr", (msg: string) => VERBOSE && console.error("[qemu:stderr]", msg));
   qemu.on("qmp:event", (event: string) => VERBOSE && console.log("[qmp:event]", event));
 
+  const profile = x86_64Profile("", "");
+
   await qemu.start({
     memoryMB: 128,
     smp: 1,
     tmpDir,
     accel: (ACCEL as any) ?? "tcg",
     freeze: true,
+    guestProfile: profile,
   });
 
   // query-status while frozen at prelaunch

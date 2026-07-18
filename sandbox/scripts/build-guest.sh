@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build the x86-64 Alpine guest: Docker image → root.qcow2 + workspace.qcow2
-# Extracts vmlinuz-virt and initramfs-virt for microvm direct kernel boot.
+# Build the x86-64 Ubuntu guest: Docker image → root.qcow2 + workspace.qcow2
+# Extracts vmlinuz and initrd.img for direct kernel boot.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -11,7 +11,7 @@ QEMU_IMG=./resources/qemu/$PLATFORM/qemu-img
 
 mkdir -p images
 
-echo "==> building guest docker image (x86-64 Alpine, linux-virt)"
+echo "==> building guest docker image (x86-64 Ubuntu, linux-image-virtual)"
 docker build \
   --platform=linux/amd64 \
   -t sandbox-guest \
@@ -26,9 +26,7 @@ docker rm sandbox-export >/dev/null
 echo "==> creating root.qcow2"
 rm -f images/root.qcow2
 mkdir -p /tmp/sandbox-rootfs
-# --numeric-owner avoids issues with Docker-exported UIDs (e.g. bbsuid busybox
-# symlink with non-matching ownership) causing mkfs.ext4 -d to fail with
-# "Permission denied" on the copy.
+# --numeric-owner avoids issues with Docker-exported UIDs
 tar -xf images/rootfs.tar -C /tmp/sandbox-rootfs --numeric-owner
 
 # Set hostname and hosts
@@ -37,24 +35,30 @@ printf "127.0.0.1\tlocalhost sandbox\n" > /tmp/sandbox-rootfs/etc/hosts
 
 # Remove unnecessary files before creating fs
 rm -f /tmp/sandbox-rootfs/.dockerenv 2>/dev/null || true
-# bbsuid is ---s--x--x owned by root — mkfs.ext4 -d can't create it as non-root.
-# Relax to 755; the guest doesn't need suid binaries.
-chmod 0755 /tmp/sandbox-rootfs/bin/bbsuid 2>/dev/null || true
 
 # Extract kernel + initramfs from exported rootfs
-cp /tmp/sandbox-rootfs/boot/vmlinuz-virt images/vmlinuz.bin
-cp /tmp/sandbox-rootfs/boot/initramfs-virt images/initramfs.bin
+# Ubuntu names them vmlinuz-<version> and initrd.img-<version>
+KREL=$(ls /tmp/sandbox-rootfs/lib/modules 2>/dev/null | head -1)
+if [ -z "$KREL" ]; then
+  echo "ERROR: no kernel modules found in exported rootfs" >&2
+  exit 1
+fi
+cp "/tmp/sandbox-rootfs/boot/vmlinuz-$KREL" images/vmlinuz.bin
+cp "/tmp/sandbox-rootfs/boot/initrd.img-$KREL" images/initramfs.bin
 rm -rf /tmp/sandbox-rootfs/boot/*
 
-# Root image size: 25% slack + 32 MiB headroom
-SZ=$(du -sm /tmp/sandbox-rootfs | cut -f1); SZ=$((SZ + SZ / 4 + 32))
+# Root image size: at least 5 GiB for growth (qcow2 is sparse, so host
+# consumption tracks actual data). 25% slack above that for future upgrades.
+MIN_ROOT_MB=5120
+SZ=$(du -sm /tmp/sandbox-rootfs | cut -f1); SZ=$((SZ + SZ / 4))
+[ "$SZ" -lt "$MIN_ROOT_MB" ] && SZ=$MIN_ROOT_MB
 
-# Create raw ext4 image via Docker (no host e2fsprogs needed), then convert to qcow2
+# Create raw ext4 image via Docker, then convert to qcow2
 dd if=/dev/zero of=/tmp/sandbox-rootfs.img bs=1M count="$SZ" status=none
 docker run --rm --platform=linux/amd64 \
   -v /tmp/sandbox-rootfs:/rootfs:ro \
   -v /tmp/sandbox-rootfs.img:/rootfs.img \
-  alpine:3.21 sh -c 'apk add --quiet e2fsprogs && mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img'
+  ubuntu:24.04 sh -c 'apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null && mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img'
 "$QEMU_IMG" convert -f raw -O qcow2 /tmp/sandbox-rootfs.img images/root.qcow2
 rm -f /tmp/sandbox-rootfs.img
 

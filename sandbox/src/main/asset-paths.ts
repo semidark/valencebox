@@ -2,6 +2,7 @@ import { app } from "electron";
 import * as fs from "fs";
 import * as net from "net";
 import * as path from "path";
+import { GuestArch } from "./guest-profile";
 
 function isDev(): boolean {
   if (typeof app === "undefined" || app === null) return true;
@@ -32,12 +33,13 @@ export interface VmTransport {
   connectPath: string;
 }
 
-export function qemuBinaryPath(): string {
-  const bundled = path.join(qemuPlatformDir(), "qemu-system-x86_64");
+export function qemuBinaryPath(arch?: GuestArch): string {
+  const binary = arch === "aarch64" ? "qemu-system-aarch64" : "qemu-system-x86_64";
+  const bundled = path.join(qemuPlatformDir(), binary);
   if (fs.existsSync(bundled)) return bundled;
-  const bundledExe = path.join(qemuPlatformDir(), "qemu-system-x86_64.exe");
+  const bundledExe = path.join(qemuPlatformDir(), `${binary}.exe`);
   if (fs.existsSync(bundledExe)) return bundledExe;
-  return "qemu-system-x86_64";
+  return binary;
 }
 
 export function firmwareDir(): string {

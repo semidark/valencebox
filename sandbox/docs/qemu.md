@@ -54,7 +54,7 @@ Guest (Alpine x86-64)
 
 > **⚠️ Stale — x86_64-only design. To be rewritten in Phase 7 (multi-arch).**
 > The table below describes the x86_64 TCG guest only. On Apple Silicon the
-> default will switch to an aarch64 guest under HVF (Phase 8). HVF is **not**
+> default will switch to an aarch64 guest under HVF (Phase 9). HVF is **not**
 > available for x86_64 guests on macOS — see `macos-issues.md`.
 
 ### Confirmed decisions
@@ -82,14 +82,14 @@ is available:
 |---|---|---|
 | KVM / WHPX | `microvm` | kvmclock provides reliable TSC — HPET not needed |
 | TCG (fallback) | `pc` (i440fx) | microvm lacks HPET; guest cannot calibrate TSC under TCG |
-| HVF (aarch64-only, Phase 8) | `microvm` (or `virt`) | TBD — Phase 8 will determine microvm viability under HVF |
+| HVF (aarch64-only, Phase 9) | `microvm` (or `virt`) | TBD — Phase 9 will determine microvm viability under HVF |
 
 Under hardware acceleration, the guest uses kvmclock (KVM) or analogous
 paravirtual clocksource, so microvm's missing HPET is irrelevant. Under TCG,
 `-machine pc` provides HPET + ACPI PM timer for working TSC calibration.
 
 > **Note on HVF:** On macOS, HVF only virtualizes aarch64 guests (same-arch as
-> Apple Silicon). The x86_64 guest always uses TCG. HVF for aarch64 is Phase 8.
+> Apple Silicon). The x86_64 guest always uses TCG. HVF for aarch64 is Phase 9.
 
 **Virtio transport** matches the machine type:
 - `microvm` → `virtio-*-device` (mmio)
@@ -273,7 +273,7 @@ Current boot command (x86-64 qcow2, verified with root auto-login + read-write r
   -M pc -accel tcg,thread=multi -m 512 -smp 2 \
   -kernel sandbox/images/vmlinuz.bin \
   -initrd sandbox/images/initramfs.bin \
-  -append "console=ttyS0 root=/dev/vda rootfstype=ext4 rootflags=rw modules=virtio_blk,ext4" \
+  -append "console=ttyS0 root=/dev/vda rootfstype=ext4 rw quiet systemd.show_status=0" \
   -nodefaults -no-user-config -nographic -no-reboot \
   -drive id=root,file=sandbox/images/root.qcow2,format=qcow2,if=none \
   -device virtio-blk-pci,drive=root \
@@ -287,9 +287,9 @@ Current boot command (x86-64 qcow2, verified with root auto-login + read-write r
 |---|---|---|
 | No serial output with `-nodefaults -serial stdio` | microvm with `-nodefaults` omits the ISA serial device. `-serial stdio` attaches to it and produces nothing. | Use `-serial unix:...,server,nowait` + `nc -U` to read (what the app does). |
 | KVM not available on this machine | No `/dev/kvm` access | `-accel tcg,thread=multi` fallback works, guest boots in ~8s |
-| Read-only root filesystem | Alpine's initramfs `init` defaults `mount -o ${KOPT_rootflags:-ro}` — even when kernel cmdline has `rw`, it's ignored unless `rootflags=rw` is explicit | Add `rootflags=rw` to `-append` |
-| Kernels need `modules=` param | `virtio_blk.ko` and `ext4.ko` are kernel modules in `linux-virt`, not built-in. Initramfs must load them before mounting root. | Add `modules=virtio_blk,ext4` to `-append` |
-| No boot at all without initramfs | `ext4.ko` is a module, not built-in. Kernel can't mount root without loading it. | Keep `-initrd` — initramfs provides busybox + kmod + modules and performs `switch_root` to `/dev/vda` |
+| Read-only root filesystem | Ubuntu's initramfs `init` uses kernel's built-in mount logic which defaults to `ro`. `rootflags=rw` appends to mount options but doesn't override the kernel's `ro` default — the bare `rw` token is required | Add bare `rw` to `-append` (not just `rootflags=rw`) |
+| Kernels need initramfs with virtio modules | Ubuntu's generic kernel has `virtio_blk` built-in, but `virtio_mmio` (for microvm) is a module. Initramfs must include it. | Explicit module list in `/etc/initramfs-tools/modules` at build time |
+| No boot at all without initramfs | `ext4` is a module, not built-in on Ubuntu's generic kernel. Kernel can't mount root without loading it. | Keep `-initrd` — initramfs provides kmod + modules and performs `switch_root` to `/dev/vda` |
 
 Result: boots to `sandbox login:` prompt with root auto-login on serial, full OpenRC, networking, writable root.
 

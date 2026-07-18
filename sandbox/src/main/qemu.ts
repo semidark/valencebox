@@ -5,6 +5,7 @@ import * as fsp from "fs/promises";
 import { EventEmitter } from "events";
 import { qemuBinaryPath, firmwareDir, qemuPlatformDir, allocSerialTransport, allocQmpTransport, VmTransport } from "./asset-paths";
 import { QmpClient } from "./qmp";
+import { GuestProfile } from "./guest-profile";
 
 export interface QemuOptions {
   memoryMB: number;
@@ -12,12 +13,14 @@ export interface QemuOptions {
   tmpDir: string;
   accel?: "auto" | "kvm" | "hvf" | "whpx" | "tcg";
   freeze?: boolean;
+  guestProfile: GuestProfile;
   kernel?: string;
   initrd?: string;
   kernelCmdline?: string;
   rootImage?: string;
   workspaceImage?: string;
-  fwCfgConfig?: string;
+  sharePort?: number;
+  shareToken?: string;
 }
 
 export interface QemuStats {
@@ -32,7 +35,7 @@ export class QemuProcess extends EventEmitter {
   private qmp: QmpClient | null = null;
   public serialTransport: VmTransport | null = null;
   public qmpTransport: VmTransport | null = null;
-  public machineType: "microvm" | "pc" = "pc";
+  public machineType: "microvm" | "pc" | "virt" = "pc";
 
   get running(): boolean {
     return this.proc !== null && this.proc.exitCode === null;
@@ -55,7 +58,7 @@ export class QemuProcess extends EventEmitter {
     this.serialTransport = await allocSerialTransport(opts.tmpDir);
     this.qmpTransport = await allocQmpTransport(opts.tmpDir);
 
-    const detected = QemuProcess.checkAccel(process.platform);
+    const detected = QemuProcess.checkAccel(process.platform, opts.guestProfile.arch);
     const hw = opts.accel && opts.accel !== "auto" && opts.accel !== "tcg"
       ? { name: opts.accel, available: opts.accel === detected.name && detected.available, hint: detected.hint }
       : detected;
@@ -64,7 +67,7 @@ export class QemuProcess extends EventEmitter {
     this.emit("accel", hw);
 
     const args = this.buildArgs(opts);
-    const binPath = qemuBinaryPath();
+    const binPath = qemuBinaryPath(opts.guestProfile.arch);
     const fwDir = firmwareDir();
     console.log(`[qemu] binary: ${binPath}`);
     console.log(`[qemu] firmware: ${fwDir || "(none, using QEMU built-in search path)"}`);
@@ -183,11 +186,9 @@ export class QemuProcess extends EventEmitter {
   }
 
   private buildArgs(opts: QemuOptions): string[] {
-    const accels = this.resolveAccels(opts.accel);
-    // Use microvm when hardware acceleration is available (first accel isn't TCG);
-    // fall back to pc (i440fx) under TCG so the guest has HPET for TSC calibration.
-    const useMicrovm = accels[0] !== "tcg,thread=multi";
-    const machineType = useMicrovm ? "microvm" : "pc";
+    const profile = opts.guestProfile;
+    const accels = this.resolveAccels(opts.accel, profile);
+    const machineType = profile.machineFor(accels[0]);
     this.machineType = machineType;
 
     const args: string[] = [];
@@ -203,6 +204,7 @@ export class QemuProcess extends EventEmitter {
       "-nographic",
       "-no-reboot",
     );
+    if (profile.cpu) args.push("-cpu", profile.cpu);
 
     // QMP transport (put before serial so monitor init happens first on Windows)
     const qmpTr = this.qmpTransport!;
@@ -221,19 +223,25 @@ export class QemuProcess extends EventEmitter {
     const fwDir = firmwareDir();
     if (fwDir) args.push("-L", fwDir);
 
-    if (opts.kernel) args.push("-kernel", opts.kernel);
-    if (opts.initrd) args.push("-initrd", opts.initrd);
+    const kernel = opts.kernel ?? profile.kernel;
+    if (kernel) args.push("-kernel", kernel);
+    const initrd = opts.initrd ?? profile.initrd;
+    if (initrd) args.push("-initrd", initrd);
     if (opts.kernelCmdline) {
-      // microvm needs reboot=t (triple-fault reboot) for -no-reboot to work
-      const cmdline = useMicrovm ? `${opts.kernelCmdline} reboot=t` : opts.kernelCmdline;
+      const extra = profile.extraCmdline(machineType);
+      let cmdline = extra ? `${opts.kernelCmdline} ${extra}` : opts.kernelCmdline;
+      if (opts.sharePort && opts.shareToken) {
+        cmdline += ` valencebox.port=${opts.sharePort} valencebox.token=${opts.shareToken}`;
+      }
       args.push("-append", cmdline);
     }
 
-    const blkDev = useMicrovm ? "virtio-blk-device" : "virtio-blk-pci";
-    const netDev = useMicrovm ? "virtio-net-device" : "virtio-net-pci";
-    const rngDev = useMicrovm ? "virtio-rng-device" : "virtio-rng-pci";
+    const suffix = profile.virtioSuffix(machineType);
+    const blkDev = `virtio-blk${suffix}`;
+    const netDev = `virtio-net${suffix}`;
+    const rngDev = `virtio-rng${suffix}`;
 
-    const rootImg = opts.rootImage;
+    const rootImg = opts.rootImage ?? profile.rootImage;
     if (rootImg) {
       args.push(
         "-drive", `id=root,file=${rootImg},format=qcow2,if=none`,
@@ -241,9 +249,10 @@ export class QemuProcess extends EventEmitter {
       );
     }
 
-    if (opts.workspaceImage) {
+    const wsImg = opts.workspaceImage ?? profile.workspaceImage;
+    if (wsImg) {
       args.push(
-        "-drive", `id=ws,file=${opts.workspaceImage},format=qcow2,if=none`,
+        "-drive", `id=ws,file=${wsImg},format=qcow2,if=none`,
         "-device", `${blkDev},drive=ws`,
       );
     }
@@ -253,10 +262,6 @@ export class QemuProcess extends EventEmitter {
     args.push("-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22`, "-device", `${netDev},netdev=net0`);
 
     args.push("-device", rngDev);
-
-    if (opts.fwCfgConfig) {
-      args.push("-fw_cfg", `name=opt/org.valencebox.config,file=${opts.fwCfgConfig}`);
-    }
 
     return args;
   }
@@ -275,7 +280,7 @@ export class QemuProcess extends EventEmitter {
     // Non-fatal — socket works, just less restrictive
   }
 
-  static checkAccel(platform: string): { name: string; available: boolean; hint?: string } {
+  static checkAccel(platform: string, arch?: string): { name: string; available: boolean; hint?: string } {
     if (platform === "linux") {
       try {
         fs.accessSync("/dev/kvm", fs.constants.R_OK | fs.constants.W_OK);
@@ -288,9 +293,11 @@ export class QemuProcess extends EventEmitter {
       }
     }
     if (platform === "darwin") {
-      // x86_64 guest on Apple Silicon = TCG only. HVF cannot accelerate x86_64
-      // guests (HVF only virtualizes the host arch — aarch64). The aarch64
-      // guest (Phase 8) uses HVF; this x86_64 path is the TCG fallback.
+      // HVF can accelerate aarch64 guests only on Apple Silicon hosts.
+      // On Intel Macs, HVF is unavailable for any guest (not aarch64-capable).
+      if (arch === "aarch64" && process.arch === "arm64") {
+        return { name: "hvf", available: true };
+      }
       return { name: "tcg", available: true };
     }
     if (platform === "win32") {
@@ -312,10 +319,10 @@ export class QemuProcess extends EventEmitter {
     }
   }
 
-  private resolveAccels(override?: string): string[] {
+  private resolveAccels(override: string | undefined, profile: GuestProfile): string[] {
     if (override && override !== "auto") {
       if (override === "tcg") return ["tcg,thread=multi"];
-      const accelInfo = QemuProcess.checkAccel(process.platform);
+      const accelInfo = QemuProcess.checkAccel(process.platform, profile.arch);
       if (accelInfo.name === override && accelInfo.available) {
         return [override, "tcg,thread=multi"];
       }
@@ -323,7 +330,7 @@ export class QemuProcess extends EventEmitter {
     }
     const accels: string[] = [];
     {
-      const info = QemuProcess.checkAccel(process.platform);
+      const info = QemuProcess.checkAccel(process.platform, profile.arch);
       if (info.available) accels.push(info.name);
     }
     accels.push("tcg,thread=multi");

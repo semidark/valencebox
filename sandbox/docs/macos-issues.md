@@ -14,7 +14,7 @@ fails with `"HVF is not supported on this machine"`.
 **Impact.** The x86_64 guest runs under **TCG, thread=multi** (pure emulation)
 on macOS. Boot is ~10-15s to serial login vs ~2s under KVM on Linux.
 
-**Status.** Accepted. The aarch64 guest VM (Phase 8) uses HVF for acceleration.
+**Status.** Accepted. The aarch64 guest VM (Phase 9) uses HVF for acceleration.
 The x86_64 host emulation path is inherently limited and is the TCG fallback.
 
 ---

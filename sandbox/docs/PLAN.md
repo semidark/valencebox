@@ -15,15 +15,20 @@ phases execute in numeric order:
 ```
 Phase 6  — Tests And Cleanup (lock in the x86_64 TCG fallback)
 Phase 7  — Multi-Arch Build And Runtime Abstraction
-Phase 8  — Accelerated aarch64 Ubuntu Guest (HVF)
-Phase 9  — x86_64 Userspace Support Via FEX
-Phase 10 — Packaging Readiness (signing + notarization, last)
+Phase 8  — Ubuntu Guest Migration (all platforms, x86_64)
+Phase 9  — Accelerated aarch64 Ubuntu Guest (HVF, Apple Silicon)
+Phase 10 — x86_64 Userspace Support Via FEX
+Phase 11 — Packaging Readiness (signing + notarization, last)
 ```
 
-This is a reorder from an earlier draft: packaging/signing (previously Phase 7)
-now runs last, after FEX works. The old "Debian x86_64 migration" phases are
-folded into Phase 8 — there is no separate x86_64-Alpine-to-Debian step; the new
-accelerated guest is Ubuntu arm64 from the start.
+This is a reorder from earlier drafts:
+- Packaging/signing (once Phase 7) runs last, after FEX works.
+- The Alpine→Ubuntu migration is split back out of the aarch64 work into its own
+  **Phase 8**, targeting **all platforms** (not just macOS). Ubuntu becomes the
+  default guest OS for every QEMU target — replacing Alpine on the x86_64 TCG
+  path first, before any aarch64 work begins.
+- The accelerated aarch64 guest (**Phase 9**) then builds on the already-migrated
+  Ubuntu base as a `linux/arm64` variant, rather than introducing a new distro.
 
 ## Decisions
 
@@ -32,14 +37,20 @@ accelerated guest is Ubuntu arm64 from the start.
 - The current `x86_64` guest under `-accel tcg,thread=multi` + `-machine pc`
   becomes the **fallback** path once the aarch64 guest lands. It is kept working,
   not deleted.
-- **The default guest on Apple Silicon is aarch64 under HVF**, falling back to the
-  emulated `x86_64` guest only when aarch64 assets or HVF are unavailable.
+- **The guest OS is Ubuntu on every platform**, replacing Alpine 3.21. Ubuntu
+  (glibc) is chosen so FEX's official apt packages install cleanly on the aarch64
+  path — FEX-Emu publishes prebuilt apt repos for Ubuntu, not Debian. Accept the
+  extra bloat vs. Alpine/Debian as the cost of a supported FEX install.
+- **Ubuntu x86_64 is the default guest for all targets** (Linux, Windows, macOS)
+  under the existing TCG/KVM/WHPX paths. This migration (Phase 8) lands before
+  any aarch64 work.
+- **On Apple Silicon the default becomes aarch64 Ubuntu under HVF** (Phase 9),
+  falling back to the emulated `x86_64` Ubuntu guest only when aarch64 assets or
+  HVF are unavailable.
 - Prefer `-machine microvm` for the aarch64 guest if it works under HVF; otherwise
-  use `-machine virt`. Decide when Phase 8 reaches bring-up.
-- The aarch64 guest is **Ubuntu arm64** (glibc), chosen so FEX's official apt
-  packages install cleanly.
-- The aarch64 guest boots via **direct `-kernel`/`-initrd`** (no UEFI/pflash disk
-  boot), matching the current x86_64 approach.
+  use `-machine virt`. Decide when Phase 9 reaches bring-up.
+- The guest boots via **direct `-kernel`/`-initrd`** (no UEFI/pflash disk boot)
+  on both arches, matching the current approach.
 - **FEX runs at system level via `binfmt_misc`** — any x86_64 ELF is transparently
   translated; no per-tool wrapping.
 - **The FEX x86_64 RootFS is bundled into the guest image at build time** (a few
@@ -50,7 +61,7 @@ accelerated guest is Ubuntu arm64 from the start.
 - Fresh source builds on Apple Silicon must not require a separately installed
   host `qemu-img` binary.
 - Signing and notarization are deferred until packaged app distribution becomes
-  a real requirement (Phase 10).
+  a real requirement (Phase 11).
 
 ## Phase 0 - Baseline
 
@@ -180,7 +191,7 @@ Notes:
 - Do not make snapshot work a gate for macOS bring-up if snapshot support is
   still pending globally.
 - The x86_64 TCG path validated here becomes the fallback once the aarch64 guest
-  (Phase 8) lands.
+  (Phase 9) lands.
 
 ## Phase 6 - Tests And Cleanup
 
@@ -201,7 +212,7 @@ API. Only doc-and-comment cleanup is done here.
 - [x] Add or rewrite a boot smoke test that exercises the `QemuProcess` /
   `VmManager` path rather than the legacy `v86` VM path (`test/boot.test.ts`).
 - [ ] ~~Verify the macOS path manually after a clean rebuild of QEMU assets.~~ *(skip
-  — Phase 8 forces a full rebuild-and-verify cycle anyway)*
+  — Phase 8 forces a full guest-image rebuild-and-verify cycle anyway)*
 - [x] Remove or update stale comments and docs that imply macOS uses HVF in the
   current x86_64 design.
 - [x] Fix known doc drift: nonexistent `resolveMachine()` referenced in
@@ -218,41 +229,255 @@ Notes:
 
 Goal: make both the build pipeline and the host runtime capable of selecting
 different QEMU binaries, machine profiles, firmware sets, and guest images, so an
-`aarch64` guest can be added without destabilizing the `x86_64` fallback.
+`aarch64` guest can be added in Phase 9 without destabilizing the `x86_64`
+fallback. This phase is **pure refactor + plumbing** — no aarch64 assets are
+produced yet, and the observable x86_64 behavior on all three platforms must be
+byte-for-byte unchanged.
 
-- [ ] Introduce a `GuestProfile` abstraction capturing every arch-specific value
-  (qemu binary name, machine type, `-cpu`, accel priority, firmware, console
-  device, virtio transport, kernel/initrd/root image paths).
-- [ ] Parameterize `asset-paths.ts` binary + firmware resolution by arch (drop
-  the hardcoded `qemu-system-x86_64` / `pc-bios` assumptions).
-- [ ] Refactor `qemu.ts` `buildArgs` to drive off the profile; add support for
-  `-cpu` selection and an arch-aware console/cmdline.
-- [ ] Refactor `checkAccel` so darwin+aarch64 returns `hvf` while darwin+x86_64
-  stays `tcg`.
-- [ ] Add a `guest: "aarch64" | "x86_64"` selector in `config.ts`, auto-selecting
-  aarch64 on Apple Silicon with x86_64 fallback.
-- [ ] Introduce a build-script abstraction for selecting and staging multiple
-  QEMU system binaries and their matching firmware sets.
-- [ ] Introduce a resource-layout convention that holds more than one QEMU system
-  binary + firmware + guest image set.
-- [ ] Preserve the existing `x86_64` path while adding the new abstractions.
-- [ ] Verify the abstractions still keep Linux, Windows, and macOS `x86_64`
-  working.
+### Design decisions (settled)
+
+- **Flat binary layout.** Both QEMU system binaries live directly in
+  `resources/qemu/<platform>/` (`qemu-system-x86_64`, `qemu-system-aarch64`),
+  sharing one `pc-bios/` firmware dir and one `lib/` dylib bundle. This matches
+  QEMU's own build output, where a multi-target build stages every
+  `qemu-system-*` into the same directory. No per-arch subdirectories.
+- **One multi-target build.** The darwin build uses a single
+  `--target-list=x86_64-softmmu,aarch64-softmmu` configure+make, producing both
+  binaries with shared common objects (smaller than two separate builds). Phase 7
+  wires the *plumbing* to accept a target list; the aarch64 target is only
+  actually added in Phase 9.
+- **`GuestProfile` is a plain data object, not a class.** The arch differences
+  here are values, not behavior (binary name, machine type, `-cpu`, accel
+  priority, virtio transport suffix, cmdline extras, image paths). `buildArgs`
+  reads fields off the profile. No methods, no per-arch subclasses — promote a
+  value to a function later only if real behavioral divergence appears.
+
+### Target resource layout
+
+```
+resources/qemu/<platform>/
+  qemu-system-x86_64          # existing
+  qemu-system-aarch64         # added in Phase 9 (path reserved now)
+  qemu-img
+  pc-bios/                    # shared firmware blobs
+  lib/                        # shared dylib bundle (darwin)
+```
+
+### The `GuestProfile` shape
+
+A plain interface (proposed home: `src/main/guest-profile.ts`) holding every
+value that differs by guest arch:
+
+```ts
+type GuestArch = "x86_64" | "aarch64";
+
+interface GuestProfile {
+  arch: GuestArch;
+  qemuBinary: string;              // "qemu-system-x86_64" | "qemu-system-aarch64"
+  // Machine type is accel-dependent, so it stays a small function of the
+  // resolved accel rather than a static field:
+  machineFor(accel: string): "microvm" | "pc" | "virt";
+  cpu?: string;                    // undefined for x86_64 today; aarch64 sets one in Phase 9
+  accelPriority: string[];         // e.g. ["kvm","tcg,thread=multi"] / ["hvf","tcg,thread=multi"]
+  virtioSuffix(machine: string): "-device" | "-pci";  // mmio (microvm/virt) vs pci (pc)
+  extraCmdline(machine: string): string;              // e.g. "reboot=t" for microvm
+  rootImage: string;               // resolved qcow2 path
+  workspaceImage: string;
+  kernel?: string;
+  initrd?: string;
+}
+```
+
+Note: `machineFor`, `virtioSuffix`, and `extraCmdline` are unavoidably tiny
+functions because they depend on the *resolved* accel/machine at call time, not
+on a static per-arch constant. Everything else is a plain field. This keeps the
+"plain data" spirit while not lying about the machine/accel coupling.
+
+### Tasks
+
+- [x] Add `src/main/guest-profile.ts`: the `GuestArch` type, the `GuestProfile`
+  interface, and a `x86_64Profile()` factory that reproduces today's exact
+  behavior (binary `qemu-system-x86_64`, `microvm` under hw-accel / `pc` under
+  TCG, `-pci` vs `-device` suffix, `reboot=t` on microvm, no `-cpu`).
+- [x] Add a `selectGuest(config)` resolver: honor an explicit
+  `config.guest`; otherwise auto-select — **x86_64 everywhere in Phase 7** (the
+  aarch64 branch is added in Phase 9 and gated on Apple Silicon + assets present
+  + HVF). It must never pick an arch whose binary/images aren't staged.
+- [x] Parameterize `asset-paths.ts`: `qemuBinaryPath(arch)` and image-path
+  helpers take an arch; `firmwareDir()` and `qemuPlatformDir()` stay shared.
+  Keep the existing no-arg call sites working via an `x86_64` default so the
+  change is mechanical.
+- [x] Refactor `qemu.ts` `buildArgs` to read the machine type, virtio suffix,
+  cmdline extras, `-cpu`, and binary from a `GuestProfile` passed via
+  `QemuOptions`, instead of the inline `useMicrovm` constants. Add optional
+  `-cpu` emission (skipped when `profile.cpu` is undefined → identical x86_64
+  args).
+- [x] Refactor `checkAccel`/`resolveAccels` to take the guest arch (or the
+  profile's `accelPriority`) so darwin+aarch64 can return `hvf` in Phase 9 while
+  darwin+x86_64 stays `tcg`. In Phase 7 the x86_64 answers are unchanged.
+- [x] Add `guest?: "x86_64" | "aarch64"` to `SandboxAppConfig` in
+  `src/config.ts` (optional; absent → auto-select).
+- [x] Generalize `scripts/build-qemu.sh` to accept a target list (default
+  `x86_64-softmmu`) and stage every produced `qemu-system-*` binary + `qemu-img`
+  into the flat platform dir. Do not add `aarch64-softmmu` yet.
+- [x] Reserve the multi-binary resource layout: the copy/stage and dylib-bundle
+  loops iterate over whatever `qemu-system-*` binaries exist rather than the
+  hardcoded `qemu-system-x86_64`.
+- [x] Write focused unit tests against the new API (these are the tests deferred
+  from Phase 6): `guest-profile` field/behavior for x86_64, `selectGuest`
+  fallback logic, `asset-paths` arch parameterization, and a `buildArgs`
+  golden-args test asserting the x86_64 arg vector is unchanged.
+- [x] Verify the existing boot smoke test still passes on macOS x86_64, and that
+  Linux/Windows x86_64 arg construction is unchanged (golden-args test covers
+  the latter without needing those hosts).
 
 Notes:
 - This phase must land before any `qemu-system-aarch64` implementation work.
 - Avoid premature generalization; only abstract the values the aarch64 path needs.
+- Success criterion: with no `config.guest` set, every platform still resolves to
+  the x86_64 profile and produces the identical QEMU command line as before.
 
-## Phase 8 - Accelerated aarch64 Ubuntu Guest (HVF)
+## Phase 8 - Ubuntu Guest Migration (all platforms, x86_64)
+
+Goal: replace the Alpine 3.21 guest with Ubuntu x86_64 as the default guest for
+**every** QEMU target (Linux, Windows, macOS) on the existing TCG/KVM/WHPX paths.
+No aarch64 or HVF work here — this is a pure guest-OS swap that keeps the current
+host-side design (WebDAV share, fw_cfg config channel, `/workspace` disk, unison
+sync) intact. Landing this before Phase 9 means the aarch64 guest is just a
+`linux/arm64` rebuild of an already-proven Ubuntu image, not a new distro.
+
+### Design decisions (settled)
+
+- **Init: systemd.** OpenRC is not packaged for Ubuntu 24.04 (does not exist in
+  apt, universe or otherwise). Building from source would fight Ubuntu's
+  systemd-first ecosystem at every level. systemd is the pragmatic choice:
+  familiar to users and agents, well-supported under direct `-kernel` boot,
+  and cleanly decomposable via `Type=oneshot` + mount units.
+- **Kernel cmdline owned by GuestProfile.** The Alpine-specific
+  `modules=virtio_blk,ext4` parameter is removed (it's an Alpine `mkinitfs`
+  feature — Ubuntu's `initramfs-tools` has no runtime equivalent). Modules must
+  be baked into the initramfs at build time via `/etc/initramfs-tools/modules`.
+  The cmdline moves from a hardcoded string in `main.ts` and `boot.test.ts`
+  into the `x86_64Profile` factory (new `kernelCmdline` field), with the
+  `GuestProfile` interface gaining the field for both arches.
+- **Initramfs module list is explicit.** Docker containers have no virtio
+  devices, so `initramfs-tools` auto-detection finds nothing. We explicitly
+  list `virtio_blk`, `virtio_net`, `virtio_mmio`, `ext4`, `qemu_fw_cfg` in
+  `/etc/initramfs-tools/modules` before running `mkinitramfs`.
+- **Three-unit systemd decomposition.** The two OpenRC scripts become:
+  1. `mount-share.service` — `Type=oneshot`, `RemainAfterExit=yes`. Waits for
+     `/dev/vdb`, formats if needed, reads fw_cfg, writes WebDAV secrets. Does
+     **not** mount `/workspace` — that is handled by systemd's auto-generated
+     mount unit from `/etc/fstab`.
+  2. `workspace.mount` — systemd-autogenerated from
+     `/dev/vdb /workspace ext4 defaults,nofail 0 2`. No custom unit file needed.
+  3. `workspace-sync.service` — `Type=simple`, `Restart=on-failure`. Wrapper
+     script `exec`s `unison -repeat 2` in the foreground. systemd tracks the
+     process directly, no PID file.
+- **Serial auto-login** via systemd drop-in
+  `/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf` (`-a root`).
+  systemd's getty-generator creates `serial-getty@ttyS0.service` (not
+  `getty@ttyS0.service`) when `console=ttyS0` is on the kernel cmdline, so the
+  drop-in must target `serial-getty@`. agetty positional args are
+  `baud[,...] port [term]` — the port (`%I` = `ttyS0`) must come *after* the
+  baud list, else agetty tries to open `/dev/115200` and crash-loops.
+- **`-machine pc` under TCG** unchanged. Under microvm (KVM/HVF) the initramfs
+  must load `virtio_mmio` (a module, not built-in on Ubuntu's generic kernel).
+
+### Tasks
+
+- [x] Rewrite `sandbox/guest/Dockerfile` from `amd64/alpine:3.21` to
+  `ubuntu:24.04` base with systemd, `linux-image-virtual`, initramfs-tools,
+  explicit module list, davfs2, unison, rsync, inotify-tools, openssh-server,
+  and serial auto-login drop-in.
+- [x] Add systemd units: `mount-share.service` (oneshot),
+  `workspace-sync.service` (simple+restart), helper scripts at
+  `/usr/local/libexec/mount-share.sh` and `/usr/local/libexec/workspace-sync.sh`.
+- [x] Add `/etc/fstab` entry for workspace disk (`/dev/vdb /workspace ext4
+  defaults,nofail 0 2`).
+- [x] Add `/etc/initramfs-tools/modules` with `virtio_blk`, `virtio_net`,
+  `virtio_mmio`, `ext4`, `qemu_fw_cfg`, `virtio_console`, `virtio_rng`.
+- [x] Switch kernel from Alpine `linux-virt` to Ubuntu `linux-image-virtual`
+  (the generic kernel; `linux-image-kvm` is a transitional meta-package that
+  just depends on `linux-image-virtual`). Extract `vmlinuz`/`initrd.img` for
+  direct `-kernel`/`-initrd` boot.
+- [x] Adapt `sandbox/scripts/build-guest.sh` for Ubuntu paths (kernel/initrd
+  filenames under `/boot`, larger rootfs slack, `mkfs.ext4 -d` staging).
+- [x] Strip docs/man/locales and unused kernel modules to keep image size sane.
+- [x] Add `kernelCmdline` to `GuestProfile` interface and set Ubuntu-appropriate
+  cmdline in `x86_64Profile()`.
+- [x] Update `main.ts` — source `kernelCmdline` from the profile instead of
+  hardcoded string.
+- [x] Update `test/boot.test.ts` — change service-status greps from
+  `rc-service mount-share status` to `systemctl is-active mount-share`,
+  drop `modules=virtio_blk,ext4` from cmdline, update login-banner expectation.
+- [x] Boot the Ubuntu x86_64 guest to serial login and re-run Phase 5 parity
+  checks (share mount, `/workspace`, bi-directional sync, serial I/O, clean
+  shutdown). Verified on macOS x86_64 TCG; Linux/Windows deferred to a later
+  hardware pass (per Phase 7 policy, golden-args covers arg-vector parity).
+- [x] Remove or archive the Alpine Dockerfile once the Ubuntu image passes.
+  Archived as `guest/Dockerfile.alpine`.
+
+Notes:
+- Host-side code (`http-share.ts`, fw_cfg, `vm-manager.ts`) should not need
+  changes — only the guest image and its init.
+- systemd on a direct-kernel boot needs `console=ttyS0` on the cmdline and a
+  serial getty drop-in; mask unneeded units (`bluetooth`, `wpa_supplicant`,
+  `systemd-timesyncd`) to avoid boot stalls.
+- Boot smoke-test assertions that change: `rc-service ...` → `systemctl`,
+  login banner, prompt regex `:~#` still works (bash on Ubuntu).
+- The Phase 7 unit tests (`guest-profile.unit.ts`, `golden-args.unit.ts`) need
+  to be updated for the new `kernelCmdline` field. The golden-args test already
+  passes `kernelCmdline` as an option so no arg-vector breakage, but the
+  profile test needs to assert the new field.
+- This migration used to be folded into the aarch64 phase; it now stands alone
+  and covers all platforms.
+
+### Bugs found & fixed during bring-up (2026-07-18, macOS x86_64 TCG)
+
+1. **Read-only root.** `rootflags=rw` alone leaves `/` mounted `ro` on Ubuntu
+   (kernel defaults to `ro` unless the bare `rw` token is present). Symptom:
+   `systemd-logind` crash-loops with `Failed to set up special execution
+   directory in /var/lib: Read-only file system`. Fix: bare `rw` in
+   `x86_64Profile().kernelCmdline` (kept `rootflags=rw` removed).
+2. **`/workspace` mount point missing.** The Dockerfile never created
+   `/workspace` (or `/host-workspace`), so the fstab-generated `workspace.mount`
+   failed with `mount point does not exist`, cascading a `DEPEND` failure onto
+   `workspace-sync.service`. Fix: `RUN mkdir -p /workspace /host-workspace`.
+3. **agetty autologin crash-loop.** The drop-in had
+   `agetty -a root --keep-baud 115200 115200 ttyS0 vt100` — agetty read the
+   second `115200` as the port and failed opening `/dev/115200`, so no serial
+   login prompt ever appeared (boot test hung on `waitSerial(/login:/)`). Fix:
+   `agetty -a root --keep-baud 115200,57600,38400,9600 %I vt100` (port `%I`
+   after the baud list).
+4. **Boot-test output parsing.** Ubuntu's interactive shell aliases
+   `grep` → `grep --color=auto`, injecting ANSI escapes that broke the mount
+   assertion; switched to `findmnt -no SOURCE,FSTYPE /workspace`. Also,
+   `is-active` output is `\r\nactive\r\n`, so the regex must tolerate `\r` and
+   bound `active` with CR/LF to avoid matching `activating`. `workspace-sync`
+   legitimately oscillates active/activating without a host share (Type=simple
+   script loops on the missing WebDAV marker), so the test polls until it
+   catches `active`.
+
+**Verification:** `npm run test:boot` passes end-to-end (login ~10s, `/workspace`
+ext4 mount, `mount-share` active, `workspace-sync` active), stable across 3 runs.
+`npx tsc --noEmit` clean; `guest-profile.unit.ts` + `golden-args.unit.ts` pass.
+Host↔guest file-sync round-trip to be validated separately by the user.
+
+## Phase 9 - Accelerated aarch64 Ubuntu Guest (HVF)
 
 Goal: add a native, HVF-accelerated `aarch64` Ubuntu guest and make it the
-default on Apple Silicon. This folds in the former "Debian migration" phases —
-the new guest is Ubuntu arm64 from the start; there is no x86_64-guest migration.
+default on Apple Silicon. Builds directly on the Phase 8 Ubuntu image as an
+arm64 variant — same init, packages, and host-side design; only arch, kernel,
+console, and machine profile change.
 
 - [ ] Add an `aarch64-softmmu` target and `--enable-hvf` to the darwin QEMU
   build; stage `qemu-system-aarch64` alongside the existing x86_64 tree.
 - [ ] Build an Ubuntu arm64 guest image (`buildx --platform=linux/arm64`) with an
   arm64 kernel + initrd for direct `-kernel` boot.
+- [ ] Add an `aarch64Profile()` factory and wire `selectGuest` to auto-pick
+  aarch64 on Apple Silicon when assets + HVF are present (x86_64 fallback
+  otherwise).
 - [ ] Select `-machine microvm` under HVF if viable; otherwise `-machine virt`.
 - [ ] Boot the Ubuntu arm64 guest to a serial login on Apple Silicon under HVF
   (`console=ttyAMA0`, root on `/dev/vda`).
@@ -265,8 +490,11 @@ Notes:
 - Reuse the host-side WebDAV, fw_cfg, and sync design unchanged; only the guest
   arch, kernel, console, and machine profile change.
 - Direct `-kernel`/`-initrd` boot only; no UEFI/pflash disk boot.
+- **Phase 7 regressions to finish wiring here:**
+  - `checkAccel` darwin+aarch64 already gated on `process.arch === "arm64"`.
+  - `machineType` field already widened to `"microvm" | "pc" | "virt"`.
 
-## Phase 9 - x86_64 Userspace Support Via FEX
+## Phase 10 - x86_64 Userspace Support Via FEX
 
 Goal: run `x86_64` userspace workloads transparently inside the aarch64 Ubuntu
 guest via system-level FEX.
@@ -286,9 +514,11 @@ guest via system-level FEX.
 
 Notes:
 - FEX is system-level via `binfmt_misc`, not per-tool.
+- FEX-Emu ships official apt packages for **Ubuntu** — this is the reason the
+  guest OS is Ubuntu rather than Debian/Alpine.
 - Keep an escape hatch to the emulated `x86_64` path until aarch64 + FEX is proven.
 
-## Phase 10 - Packaging Readiness
+## Phase 11 - Packaging Readiness
 
 Goal: prepare for packaged app testing and distribution. This runs last, after
 the aarch64 + FEX path works, so packaging covers the final asset set.
