@@ -24,13 +24,13 @@ host_ws_ok() {
   mountpoint -q /host-workspace && ls /host-workspace >/dev/null 2>&1
 }
 
-# If davfs left /host-workspace stale, force-unmount. Regular `umount` cannot
-# detach a broken FUSE endpoint — use fusermount -u (davfs2 FUSE helper) with
-# lazy umount as fallback.
+# If davfs left /host-workspace stale ("Transport endpoint not connected"),
+# force-unmount it. Regular `umount` cannot detach a broken FUSE endpoint;
+# `umount -l` (lazy) detaches the namespace entry. Also remove davfs's stale
+# pidfile which blocks remount ("already mounted" error).
 if mountpoint -q /host-workspace && ! ls /host-workspace >/dev/null 2>&1; then
-  fusermount -u /host-workspace 2>/dev/null \
-    || umount -l /host-workspace 2>/dev/null \
-    || true
+  umount -l /host-workspace 2>/dev/null || true
+  rm -f /var/run/mount.davfs/host-workspace.pid
 fi
 
 for attempt in 1 2 3; do
@@ -48,7 +48,9 @@ done
 # Rebuild unison archive on each start (qcow2 is a host-canonical cache)
 rm -f /root/.unison/*
 
-# Repeat sync loop — exec replaces shell so systemd tracks unison directly
+# Repeat sync loop — exec replaces shell so systemd tracks unison directly.
+# NOTE: &> is a bashism; this script runs under dash (#!/bin/sh). Use POSIX
+# redirect: >/var/log/unison.log 2>&1
 exec unison /host-workspace /workspace \
   -batch -auto -prefer /host-workspace -repeat 2 \
   -ignore 'Name node_modules' \
@@ -56,4 +58,4 @@ exec unison /host-workspace /workspace \
   -ignore 'Name .DS_Store' \
   -ignore 'Name lost+found' \
   -ignore 'Name .valence-sync-marker' \
-  &>/var/log/unison.log
+  >/var/log/unison.log 2>&1
