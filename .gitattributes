@@ -1,0 +1,29 @@
+# Normalize all text files to LF in the repo regardless of platform.
+# On checkout, Windows gets CRLF; Linux/macOS get LF.
+* text=auto
+
+# Platform-specific scripts — keep LF even on Windows
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.service text eol=lf
+
+# Batch/PowerShell — keep CRLF on Windows, LF elsewhere
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Lockfile — binary to prevent spurious merge conflicts from platform deps
+sandbox/package-lock.json binary
+
+# Generated / vendored — binary prevents accidental normalization
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.qcow2 binary
+*.fd binary
+*.rom binary
+*.img binary
+*.bin binary
+*.elf binary
+*.dll binary
+*.exe binary

@@ -1,4 +1,4 @@
-import { ChildProcess, spawn, execSync } from "child_process";
+import { ChildProcess, spawn, spawnSync, execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as fsp from "fs/promises";
@@ -322,6 +322,10 @@ export class QemuProcess extends EventEmitter {
       return { name: "tcg", available: true };
     }
     if (platform === "win32") {
+      // WHPX is x86_64-only; aarch64 guests always use TCG on Windows.
+      if (arch === "aarch64") {
+        return { name: "tcg", available: true };
+      }
       const whpxAvailable = QemuProcess.checkWhpx();
       return whpxAvailable
         ? { name: "whpx", available: true }
@@ -330,11 +334,19 @@ export class QemuProcess extends EventEmitter {
     return { name: "tcg", available: true };
   }
 
-  /** Check if WHPX (Windows Hypervisor Platform) is available. */
+  /** Probe WHPX by briefly starting QEMU with `-accel whpx`. */
   private static checkWhpx(): boolean {
     try {
-      execSync("sc.exe query whpx", { stdio: "pipe", windowsHide: true });
-      return true;
+      const qemu = qemuBinaryPath("x86_64");
+      // Spawn QEMU with WHPX + minimal config.
+      // If WHPX is available and working, QEMU will start running and time out (ETIMEDOUT).
+      // If WHPX is not available, QEMU will exit immediately with an error (status !== 0).
+      const res = spawnSync(
+        qemu,
+        ["-accel", "whpx", "-machine", "none", "-display", "none"],
+        { timeout: 300, windowsHide: true }
+      );
+      return (res.error as any)?.code === "ETIMEDOUT" || res.status === 0;
     } catch {
       return false;
     }
