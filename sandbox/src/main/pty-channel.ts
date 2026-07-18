@@ -14,26 +14,43 @@ export class PtyChannel extends EventEmitter {
     return this.client !== null && !this.client.destroyed;
   }
 
-  connect() {
+  connect(retries = 5, delayMs = 300) {
     if (this.client) return;
 
-    if (this.transport.type === "unix") {
-      this.client = net.createConnection(this.transport.connectPath);
-    } else {
-      this.client = net.createConnection(Number(this.transport.connectPath), "127.0.0.1");
-    }
+    const attempt = () => {
+      const client = this.transport.type === "unix"
+        ? net.createConnection(this.transport.connectPath)
+        : net.createConnection(Number(this.transport.connectPath), "127.0.0.1");
 
-    this.client.on("connect", () => this.emit("connected"));
-    this.client.on("close", () => {
-      this.emit("closed");
-      this.client = null;
-    });
-    this.client.on("error", (err) => this.emit("error", err));
+      const onError = (err: NodeJS.ErrnoException) => {
+        // EAGAIN / ENOENT: QEMU chardev backlog full or socket not ready yet
+        if (retries > 0 && (err.code === "EAGAIN" || err.code === "ENOENT" || err.code === "ECONNREFUSED")) {
+          client.destroy();
+          retries--;
+          setTimeout(attempt, delayMs);
+          return;
+        }
+        this.emit("error", err);
+      };
 
-    this.client.on("data", (chunk: Buffer) => {
-      this.accumBuffer = Buffer.concat([this.accumBuffer, chunk]);
-      this.processBuffer();
-    });
+      client.on("connect", () => {
+        client.removeListener("error", onError);
+        this.client = client;
+        this.emit("connected");
+      });
+      client.on("close", () => {
+        if (this.client !== client) return;
+        this.emit("closed");
+        this.client = null;
+      });
+      client.on("error", onError);
+      client.on("data", (chunk: Buffer) => {
+        this.accumBuffer = Buffer.concat([this.accumBuffer, chunk]);
+        this.processBuffer();
+      });
+    };
+
+    attempt();
   }
 
   disconnect() {
