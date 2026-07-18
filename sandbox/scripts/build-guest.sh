@@ -62,12 +62,27 @@ docker rm sandbox-export-"$ARCH" >/dev/null
 
 echo "==> creating root${SUFFIX}.qcow2"
 rm -f "images/root${SUFFIX}.qcow2"
-mkdir -p /tmp/sandbox-rootfs"$SUFFIX"
+# Clean stale root-owned .ssh from previous failed builds
+docker run --rm --platform=linux/amd64 \
+  -v /tmp:/tmproot \
+  ubuntu:24.04 sh -c "rm -rf /tmproot/sandbox-rootfs${SUFFIX} 2>/dev/null || true"
+mkdir -p "/tmp/sandbox-rootfs${SUFFIX}"
 tar -xf "images/rootfs${SUFFIX}.tar" -C "/tmp/sandbox-rootfs${SUFFIX}" --numeric-owner
 
 # Set hostname and hosts
 echo sandbox > "/tmp/sandbox-rootfs${SUFFIX}/etc/hostname"
 printf "127.0.0.1\tlocalhost sandbox\n" > "/tmp/sandbox-rootfs${SUFFIX}/etc/hosts"
+
+# Generate vm-debug SSH keypair and inject the public key into the guest.
+# The private key is saved to images/vm-debug for host-side SSH access.
+mkdir -p images
+if [ ! -f images/vm-debug ]; then
+  ssh-keygen -t ed25519 -f images/vm-debug -N '' -q -C 'vm-debug@valencebox'
+fi
+mkdir -p "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh"
+cp images/vm-debug.pub "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh/authorized_keys"
+chmod 700 "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh"
+chmod 600 "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh/authorized_keys"
 
 # Remove unnecessary files before creating fs
 rm -f "/tmp/sandbox-rootfs${SUFFIX}/.dockerenv" 2>/dev/null || true
@@ -87,12 +102,18 @@ MIN_ROOT_MB=5120
 SZ=$(du -sm "/tmp/sandbox-rootfs${SUFFIX}" | cut -f1); SZ=$((SZ + SZ / 4))
 [ "$SZ" -lt "$MIN_ROOT_MB" ] && SZ=$MIN_ROOT_MB
 
-# Create raw ext4 image via Docker, then convert to qcow2
+# Create raw ext4 image via Docker, then convert to qcow2.
+# The mkfs container runs as root and fixes ownership of SSH authorized_keys
+# (created by the build user) inline before embedding them in the image.
 dd if=/dev/zero of="/tmp/sandbox-rootfs${SUFFIX}.img" bs=1M count="$SZ" status=none
 docker run --rm --platform="$PLATFORM_FLAG" \
-  -v "/tmp/sandbox-rootfs${SUFFIX}:/rootfs:ro" \
+  -v "/tmp/sandbox-rootfs${SUFFIX}:/rootfs" \
   -v "/tmp/sandbox-rootfs${SUFFIX}.img:/rootfs.img" \
-  ubuntu:24.04 sh -c 'apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null && mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img'
+  ubuntu:24.04 sh -c '
+    apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null
+    chown -R root:root /rootfs/root/.ssh
+    mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img
+  '
 "$QEMU_IMG" convert -f raw -O qcow2 "/tmp/sandbox-rootfs${SUFFIX}.img" "images/root${SUFFIX}.qcow2"
 rm -f "/tmp/sandbox-rootfs${SUFFIX}.img"
 
@@ -101,8 +122,9 @@ WSZ="${WORKSPACE_MB:-1024}"
 rm -f "images/workspace${SUFFIX}.qcow2"
 "$QEMU_IMG" create -f qcow2 "images/workspace${SUFFIX}.qcow2" "${WSZ}M"
 
-# Clean up
-rm -rf "/tmp/sandbox-rootfs${SUFFIX}" "images/rootfs${SUFFIX}.tar"
+# Clean up (root-owned .ssh from prior build may block host rm; ignore errors)
+rm -rf "/tmp/sandbox-rootfs${SUFFIX}" 2>/dev/null || true
+rm -f "images/rootfs${SUFFIX}.tar"
 
 echo "==> done"
 ls -lh images/ | grep "${SUFFIX}" || ls -lh images/

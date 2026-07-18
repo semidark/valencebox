@@ -153,12 +153,11 @@ RUN printf '\nsandbox login ready (Ubuntu 24.04)\n' > /etc/motd
 # would fail permanently on first boot when the disk has no filesystem.
 
 # SSH: lightweight host key (ed25519-only), fast ciphers, root key auth
+# authorized_keys is injected at build time (build-guest.sh) so the same
+# keypair works for host SSH access without manual setup.
 RUN rm -f /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub && \
     ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N '' && \
-    printf 'HostKey /etc/ssh/ssh_host_ed25519_key\nPasswordAuthentication no\nPermitRootLogin prohibit-password\nClientAliveInterval 30\nCiphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\nMACs umac-64-etm@openssh.com\n' > /etc/ssh/sshd_config && \
-    mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
-    echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoZlOBpFYYHSL2ZQzNABGxbs4P3DNmufyFiWG9EjJ03 vm-debug@valencebox' > /root/.ssh/authorized_keys && \
-    chmod 600 /root/.ssh/authorized_keys
+    printf 'HostKey /etc/ssh/ssh_host_ed25519_key\nPasswordAuthentication no\nPermitRootLogin prohibit-password\nClientAliveInterval 30\nCiphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\nMACs umac-64-etm@openssh.com\n' > /etc/ssh/sshd_config
 
 # DHCP on eth0 via dhcpcd (systemd-networkd is masked)
 RUN systemctl enable dhcpcd
