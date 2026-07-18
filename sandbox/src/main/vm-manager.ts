@@ -18,6 +18,7 @@ export interface VmManagerOptions {
   workspaceImage?: string;
   sharePort?: number;
   shareToken?: string;
+  balloonMinMb?: number;
 }
 
 export class VmManager extends EventEmitter {
@@ -68,6 +69,23 @@ export class VmManager extends EventEmitter {
 
   get serialLog(): string {
     return this._serialLog;
+  }
+
+  private get balloonMinMb(): number {
+    return this.opts.balloonMinMb ?? 2048;
+  }
+
+  /** Set balloon target in MB. Clamped to [balloonMinMb, memoryMB]. */
+  async setBalloon(mb: number): Promise<void> {
+    const clamped = Math.max(this.balloonMinMb, Math.min(this.opts.memoryMB, mb));
+    await this.qemu.qmp?.setBalloon(clamped);
+  }
+
+  /** Query current balloon state. Returns { currentMB, ceilingMB, minMB } or null. */
+  async getBalloon(): Promise<{ currentMB: number; ceilingMB: number; minMB: number } | null> {
+    if (!this.qemu.qmp?.connected) return null;
+    const result = await this.qemu.qmp.queryBalloon();
+    return { currentMB: Math.round(result.actual / (1024 * 1024)), ceilingMB: this.opts.memoryMB, minMB: this.balloonMinMb };
   }
 
   /** Wait for a regex match in the serial log. Returns the full matched text. */

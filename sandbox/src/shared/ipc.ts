@@ -26,6 +26,12 @@ export interface ConflictRecordDTO {
   at: number;
 }
 
+export interface BalloonStatus {
+  currentMB: number;
+  ceilingMB: number;
+  minMB: number;
+}
+
 export const IPC = {
   getStatus: "sandbox:getStatus",
   onStatus: "sandbox:status",
@@ -38,4 +44,7 @@ export const IPC = {
   onPtyClosed: "sandbox:pty:closed", // guest→renderer: PTY session ended
   ptyInput: "sandbox:pty:input", // renderer→guest: keystrokes (fire-and-forget)
   ptyResize: "sandbox:pty:resize", // renderer→guest: {cols, rows}
+  // Memory balloon control
+  setBalloon: "sandbox:setBalloon", // renderer→main: set balloon to N MB
+  getBalloon: "sandbox:getBalloon", // renderer→main: get current balloon status → BalloonStatus
 } as const;

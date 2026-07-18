@@ -32,7 +32,10 @@ export interface QemuStats {
 export class QemuProcess extends EventEmitter {
   private proc: ChildProcess | null = null;
   private startedAt = 0;
-  private qmp: QmpClient | null = null;
+  private _qmp: QmpClient | null = null;
+
+  /** Expose QMP client for balloon control and other direct QMP calls. */
+  get qmp(): QmpClient | null { return this._qmp; }
   public serialTransport: VmTransport | null = null;
   public qmpTransport: VmTransport | null = null;
   public machineType: "microvm" | "pc" | "virt" = "pc";
@@ -130,12 +133,13 @@ export class QemuProcess extends EventEmitter {
       : `127.0.0.1:${this.qmpTransport.connectPath}`;
     console.log(`[qemu] spawned PID ${proc.pid}, waiting for QMP on ${qmpLabel}`);
 
-    this.qmp = new QmpClient();
+    const qmp = new QmpClient();
+    this._qmp = qmp;
     try {
       if (this.qmpTransport.type === "unix") {
-        await this.qmp.connectPath(this.qmpTransport.connectPath, 15_000);
+        await qmp.connectPath(this.qmpTransport.connectPath, 15_000);
       } else {
-        await this.qmp.connect(Number(this.qmpTransport.connectPath), "127.0.0.1", 15_000);
+        await qmp.connect(Number(this.qmpTransport.connectPath), "127.0.0.1", 15_000);
       }
     } catch (e) {
       if (this.proc?.exitCode !== null && stderrChunks.length > 0) {
@@ -144,10 +148,10 @@ export class QemuProcess extends EventEmitter {
       }
       throw e;
     }
-    await this.qmp.execute("qmp_capabilities");
+    await qmp.execute("qmp_capabilities");
     console.log(`[qemu] QMP handshake complete (${this.bootMs}ms)`);
 
-    this.qmp.on("event", (event: string) => {
+    qmp.on("event", (event: string) => {
       this.emit("qmp:event", event);
     });
   }
@@ -172,8 +176,8 @@ export class QemuProcess extends EventEmitter {
     } catch {
       // QMP failed — fall through to kill
     }
-    this.qmp?.disconnect();
-    this.qmp = null;
+    this._qmp?.disconnect();
+    this._qmp = null;
 
     if (proc.exitCode === null) {
       proc.kill("SIGTERM");
@@ -292,6 +296,7 @@ export class QemuProcess extends EventEmitter {
 
     args.push("-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22`, "-device", `${netDev},netdev=net0`);
     args.push("-device", rngDev);
+    args.push("-device", `virtio-balloon${suffix}`);
 
     return args;
   }

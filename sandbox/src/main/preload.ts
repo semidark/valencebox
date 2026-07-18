@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { IPC, SandboxStatus, ConflictRecordDTO } from "../shared/ipc";
+import { IPC, SandboxStatus, ConflictRecordDTO, BalloonStatus } from "../shared/ipc";
 
 contextBridge.exposeInMainWorld("sandbox", {
   getStatus: (): Promise<SandboxStatus> => ipcRenderer.invoke(IPC.getStatus),
@@ -20,4 +20,7 @@ contextBridge.exposeInMainWorld("sandbox", {
     ipcRenderer.send(IPC.ptyInput, data),
   sendPtyResize: (cols: number, rows: number): void =>
     ipcRenderer.send(IPC.ptyResize, cols, rows),
+  // Memory balloon
+  setBalloon: (mb: number): Promise<void> => ipcRenderer.invoke(IPC.setBalloon, mb),
+  getBalloon: (): Promise<BalloonStatus | null> => ipcRenderer.invoke(IPC.getBalloon),
 });

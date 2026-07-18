@@ -64,6 +64,11 @@ function registerIpc() {
     };
   });
   ipcMain.on(IPC.serialInput, (_e, data: string) => vm?.sendInput(data));
+  ipcMain.handle(IPC.setBalloon, (_e, mb: number) => {
+    if (typeof mb !== "number" || !Number.isFinite(mb)) return;
+    return vm?.setBalloon(mb);
+  });
+  ipcMain.handle(IPC.getBalloon, () => vm ? vm.getBalloon() : null);
   // Stub handlers for legacy IPC channels — renderer may still call them
   ipcMain.handle(IPC.saveSnapshot, () => {});
 }
@@ -121,7 +126,7 @@ async function startVm() {
       );
 
   vm = new VmManager({
-    memoryMB: appCfg.memMb ?? 512,
+    memoryMB: appCfg.memMb ?? 4096,
     smp: appCfg.smp ?? 2,
     tmpDir,
     accel: appCfg.accel,
@@ -131,6 +136,7 @@ async function startVm() {
     workspaceImage,
     sharePort: shareCfg.port,
     shareToken: shareCfg.token,
+    balloonMinMb: appCfg.balloonMinMb,
   });
 
   vm.on("serial:data", (chunk: string) => sendToWindow(IPC.onSerial, chunk));

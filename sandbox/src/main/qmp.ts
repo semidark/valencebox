@@ -102,6 +102,16 @@ export class QmpClient extends EventEmitter {
     }
   }
 
+  /** Set balloon target in MB. QEMU expects bytes. */
+  async setBalloon(mb: number): Promise<void> {
+    await this.execute("balloon", { value: mb * 1024 * 1024 });
+  }
+
+  /** Query current balloon size. Returns actual guest RAM in bytes. */
+  async queryBalloon(): Promise<{ actual: number }> {
+    return this.execute("query-balloon") as Promise<{ actual: number }>;
+  }
+
   disconnect(): void {
     this.sock?.destroy();
     this.sock = null;
