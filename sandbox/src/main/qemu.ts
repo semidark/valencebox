@@ -301,7 +301,7 @@ export class QemuProcess extends EventEmitter {
     args.push("-device", rngDev);
     args.push("-device", `virtio-balloon${suffix}`);
 
-    // PTY channel via virtio-serial / virtconsole
+    // PTY channel via virtio-serial / virtserialport
     if (ptyTransport) {
       const ptyTr = ptyTransport;
       const ptyArg = ptyTr.type === "unix"

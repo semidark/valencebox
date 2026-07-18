@@ -82,7 +82,7 @@ export async function allocQmpTransport(tmpDir: string): Promise<VmTransport> {
 }
 
 /**
- * Allocate a platform-appropriate PTY transport for virtio-console.
+ * Allocate a platform-appropriate PTY transport for virtio-serial (virtserialport).
  *
  * - Linux / macOS: Unix domain socket inside tmpDir, chmod 0600 after creation.
  * - Windows: TCP on 127.0.0.1 (same reason as serial).
