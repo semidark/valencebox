@@ -78,9 +78,9 @@ RUN KREL=$(ls /lib/modules | head -1) && \
 # Create mount points for fstab-generated workspace.mount and WebDAV mount-share
 RUN mkdir -p /workspace /host-workspace
 
-# davfs2 config: no locking, no Expect:100 (SLIRP), short timeouts, cache on workspace volume
+# davfs2 config: no locking, no Expect:100 (SLIRP), short timeouts, cache on root fs
 RUN mkdir -p /etc/davfs2 && \
-    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\ncache_dir /workspace/.davfs2-cache\ncache_size 50\n' > /etc/davfs2/davfs2.conf && \
+    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\ncache_dir /var/cache/davfs2\ncache_size 50\n' > /etc/davfs2/davfs2.conf && \
     chmod 0644 /etc/davfs2/davfs2.conf && chown 0:0 /etc/davfs2 /etc/davfs2/davfs2.conf
 
 # Serial console: systemd serial-getty generator creates

@@ -39,6 +39,5 @@ exec unison /host-workspace /workspace \
   -ignore 'Name .git' \
   -ignore 'Name .DS_Store' \
   -ignore 'Name lost+found' \
-  -ignore 'Name .davfs2-cache' \
   -ignore 'Name .valence-sync-marker' \
-  >/dev/null 2>/var/log/unison.log
+  &>/var/log/unison.log

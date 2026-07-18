@@ -21,6 +21,6 @@ if [ -n "$port" ] && [ -n "$token" ]; then
   chown 0:0 /etc/davfs2/secrets 2>/dev/null || true
   chown 0:0 /etc/davfs2 2>/dev/null || true
 
-  mkdir -p /workspace/.davfs2-cache
-  chmod 0700 /workspace/.davfs2-cache
+  mkdir -p /var/cache/davfs2
+  chmod 0700 /var/cache/davfs2
 fi
