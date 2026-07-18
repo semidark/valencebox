@@ -56,7 +56,7 @@ RUN KREL=$(cat /usr/share/kernel/$KERNEL/kernel.release) && \
 
 # davfs2 config: no locking, no Expect:100 (SLIRP), short timeouts, cache on workspace volume
 RUN mkdir -p /etc/davfs2 && \
-    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\ncache_dir /workspace/.davfs2-cache\ncache_size 50\n' > /etc/davfs2/davfs2.conf && \
+    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\ngui_optimize 1\ncache_dir /workspace/.davfs2-cache\ncache_size 50\n' > /etc/davfs2/davfs2.conf && \
     chmod 0644 /etc/davfs2/davfs2.conf && chown 0:0 /etc/davfs2 /etc/davfs2/davfs2.conf
 
 # Ensure virtio modules load at boot
