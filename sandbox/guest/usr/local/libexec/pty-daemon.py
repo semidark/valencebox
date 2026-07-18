@@ -8,12 +8,17 @@ import termios
 import fcntl
 import errno
 
-def main():
+VPORT_PATH = '/dev/virtio-ports/pty'
+
+def open_port():
     try:
-        hvc0 = os.open('/dev/hvc0', os.O_RDWR | os.O_NOCTTY)
+        return os.open(VPORT_PATH, os.O_RDWR)
     except Exception as e:
-        sys.stderr.write(f"pty-daemon: failed to open /dev/hvc0: {e}\n")
+        sys.stderr.write(f"pty-daemon: failed to open {VPORT_PATH}: {e}\n")
         sys.exit(1)
+
+def main():
+    port_fd = open_port()
 
     pid, master_fd = pty.fork()
     if pid == 0:
@@ -25,25 +30,25 @@ def main():
             sys.stderr.write(f"pty-daemon: failed to exec bash: {e}\n")
             sys.exit(1)
 
-    hvc_buf = bytearray()
+    port_buf = bytearray()
 
     try:
         while True:
-            r, _, _ = select.select([hvc0, master_fd], [], [])
+            r, _, _ = select.select([port_fd, master_fd], [], [])
 
-            if hvc0 in r:
-                chunk = os.read(hvc0, 4096)
+            if port_fd in r:
+                chunk = os.read(port_fd, 4096)
                 if not chunk:
                     break
-                hvc_buf.extend(chunk)
+                port_buf.extend(chunk)
 
-                while len(hvc_buf) >= 5:
-                    payload_len, msg_type = struct.unpack('>IB', hvc_buf[:5])
+                while len(port_buf) >= 5:
+                    payload_len, msg_type = struct.unpack('>IB', port_buf[:5])
                     frame_len = 5 + payload_len
-                    if len(hvc_buf) < frame_len:
+                    if len(port_buf) < frame_len:
                         break
-                    payload = hvc_buf[5:frame_len]
-                    del hvc_buf[:frame_len]
+                    payload = port_buf[5:frame_len]
+                    del port_buf[:frame_len]
 
                     if msg_type == 1:
                         os.write(master_fd, payload)
@@ -70,7 +75,7 @@ def main():
                     raise
 
                 header = struct.pack('>IB', len(data), 1)
-                os.write(hvc0, header + data)
+                os.write(port_fd, header + data)
 
     finally:
         try:
@@ -78,7 +83,7 @@ def main():
         except:
             pass
         try:
-            os.close(hvc0)
+            os.close(port_fd)
         except:
             pass
 

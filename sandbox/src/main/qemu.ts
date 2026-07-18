@@ -305,11 +305,11 @@ export class QemuProcess extends EventEmitter {
     if (ptyTransport) {
       const ptyTr = ptyTransport;
       const ptyArg = ptyTr.type === "unix"
-        ? `unix:${ptyTr.local},server,nowait`
-        : `tcp:127.0.0.1:${ptyTr.local},server,nowait`;
+        ? `socket,id=pty,path=${ptyTr.local},server=on,wait=off`
+        : `socket,id=pty,host=127.0.0.1,port=${ptyTr.local},server=on,wait=off`;
       args.push("-chardev", ptyArg);
       args.push("-device", `virtio-serial${suffix}`);
-      args.push("-device", `virtconsole,chardev=pty,name=pty`);
+      args.push("-device", `virtserialport,chardev=pty,name=pty`);
     }
 
     return args;
