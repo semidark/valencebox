@@ -57,6 +57,7 @@ testCase("full x86_64 TCG", buildOpts(pFull, {
   assert(!args[appendIdx + 1].includes("reboot=t"), "no reboot=t under pc");
   assert(args[appendIdx + 1].includes("valencebox.port=12345"), "port on cmdline");
   assert(args[appendIdx + 1].includes("valencebox.token=abc123def456"), "token on cmdline");
+  assert(args.some(a => a === "virtio-balloon-pci"), "virtio-balloon-pci for pc");
 });
 
 // Case 3: no kernel, no cmdline (still works)
@@ -81,6 +82,7 @@ testCase("microvm x86_64 TCG", buildOpts(pFull, {
   assert(args.some(a => a.startsWith(`virtio-blk${microSuffix}`)), "virtio-blk-device for microvm");
   assert(args.some(a => a.startsWith(`virtio-net${microSuffix}`)), "virtio-net-device for microvm");
   assert(args.some(a => a.startsWith(`virtio-rng${microSuffix}`)), "virtio-rng-device for microvm");
+  assert(args.some(a => a.startsWith(`virtio-balloon${microSuffix}`)), "virtio-balloon-device for microvm");
 });
 
 // ---- aarch64 profile tests ----
@@ -102,6 +104,7 @@ testCase("aarch64 virt HVF", buildOpts(pa, {
   assert(args[appendIdx + 1].includes("console=ttyAMA0"), "ARM serial console");
   assert(!args[appendIdx + 1].includes("reboot=t"), "no reboot=t for virt");
   assert(args.some(a => a.startsWith("virtio-blk-pci")), "virtio-blk-pci for virt");
+  assert(args.some(a => a.startsWith("virtio-balloon-pci")), "virtio-balloon-pci for virt");
 }, "hvf");
 
 // Case 6: aarch64 virt under TCG (resolvedAccel = "tcg,thread=multi")

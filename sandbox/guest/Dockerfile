@@ -66,6 +66,7 @@ RUN printf '%s\n' \
     ext4 \
     virtio_console \
     virtio_rng \
+    virtio_balloon \
     rtc_pl031 \
     > /etc/initramfs-tools/modules
 

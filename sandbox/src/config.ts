@@ -6,4 +6,5 @@ export interface SandboxAppConfig {
   workspaceDir?: string;
   memMb?: number;
   smp?: number;
+  balloonMinMb?: number;
 }
