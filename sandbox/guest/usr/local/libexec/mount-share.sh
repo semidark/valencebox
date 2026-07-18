@@ -1,13 +1,25 @@
 #!/bin/sh
-# Format workspace qcow2 if needed, write WebDAV secrets from kernel cmdline.
+# Format workspace qcow2 if needed, write WebDAV secrets from kernel cmdline,
+# and mount /workspace.
 set -e
 
-# Always ensure /host-workspace mount point exists
-mkdir -p /host-workspace
+mkdir -p /workspace /host-workspace
 
-# Format workspace disk if not already formatted
+# Format workspace disk safely ONLY if not already formatted (prevents data
+# loss on reboot). blkid exits non-zero when no filesystem is detected.
 if [ -b /dev/vdb ]; then
-  mkfs.ext4 -F -q /dev/vdb 2>/dev/null || true
+  if ! blkid /dev/vdb >/dev/null 2>&1; then
+    echo "Formatting /dev/vdb as ext4..."
+    mkfs.ext4 -F -q /dev/vdb
+  fi
+fi
+
+# Explicitly mount /workspace if not already mounted. On a subsequent boot
+# systemd may mount it early via the fstab-generated workspace.mount, but on
+# the very first boot (disk unformatted at fstab parse time) we must handle it.
+if [ -b /dev/vdb ] && ! mountpoint -q /workspace; then
+  echo "Mounting /dev/vdb on /workspace..."
+  mount -o noatime /dev/vdb /workspace
 fi
 
 # Read port/token from kernel cmdline (set by host in qemu.ts -append)

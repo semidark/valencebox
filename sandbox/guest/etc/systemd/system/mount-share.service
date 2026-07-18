@@ -1,5 +1,9 @@
-# Format workspace disk if needed, write WebDAV secrets from kernel cmdline.
-# Leaves /workspace mounting to systemd's auto-generated workspace.mount from /etc/fstab.
+# Format workspace disk if needed, mount /workspace, write WebDAV secrets.
+# mount-share.sh manages /workspace lifecycle deterministically (formats only
+# if blkid finds no filesystem, then mounts explicitly). workspace-sync.service
+# depends on mount-share.service, not a systemd-fstab mount unit, eliminating
+# a race where an unformatted first-boot disk would cause workspace.mount to
+# fail permanently.
 [Unit]
 Description=Mount workspace disk and prepare WebDAV share
 DefaultDependencies=no
