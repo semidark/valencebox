@@ -20,7 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dbus \
     openssh-server \
     dhcpcd5 \
+    apt-utils \
     curl \
+    ripgrep \
+    vim-tiny \
+    iproute2 \
     ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -28,8 +32,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     davfs2 \
     unison \
-    rsync \
-    inotify-tools \
     e2fsprogs && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
