@@ -22,7 +22,7 @@ function assert(cond: boolean, msg: string): void {
   assert(p.initrd === undefined, "no initrd");
   assert(typeof p.kernelCmdline === "string", "kernelCmdline is string");
   assert(p.kernelCmdline.includes("console=ttyS0"), "kernelCmdline has console");
-  assert(!p.kernelCmdline.includes("modules="), "no Alpine modules= param");
+  assert(!p.kernelCmdline.includes("modules="), "no modules= param (Alpine-ism removed in Ubuntu migration)");
   console.log("✓ x86_64Profile: basic fields");
 }
 
@@ -127,7 +127,7 @@ function assert(cond: boolean, msg: string): void {
   assert(p.initrd === undefined, "no initrd");
   assert(typeof p.kernelCmdline === "string", "kernelCmdline is string");
   assert(p.kernelCmdline.includes("console=ttyAMA0"), "kernelCmdline has ARM console");
-  assert(!p.kernelCmdline.includes("modules="), "no Alpine modules= param");
+  assert(!p.kernelCmdline.includes("modules="), "no modules= param (Alpine-ism removed in Ubuntu migration)");
   console.log("✓ aarch64Profile: basic fields");
 }
 
