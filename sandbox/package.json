@@ -9,7 +9,7 @@
     "build": "tsc -p . && node scripts/copy-renderer.js",
     "start": "npm run build && electron .",
     "start:no-sandbox": "npm run build && electron . --no-sandbox",
-    "test:unit": "tsx test/manifest.unit.ts && tsx test/hydrate-channel-switch.unit.ts",
+    "test:unit": "tsx test/manifest.unit.ts && tsx test/hydrate-channel-switch.unit.ts && tsx test/guest-profile.unit.ts && tsx test/golden-args.unit.ts",
     "test:qmp": "tsx test/qmp.test.ts",
     "test:boot": "tsx test/boot.test.ts",
     "test:bridge": "tsx test/bridge.test.ts",

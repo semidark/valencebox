@@ -26,6 +26,7 @@ QEMU_URL="https://download.qemu.org/${QEMU_TARBALL}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 BUILD_DIR="build/qemu"
 RESOURCE_DIR="sandbox/resources/qemu"
+TARGET_LIST="${TARGET_LIST:-x86_64-softmmu}"
 
 TARGET="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 
@@ -44,10 +45,11 @@ fetch_qemu() {
 install_bin() {
     local platform="$1"
     local src="$2"
+    local name="${3:-$(basename "$src")}"
     mkdir -p "${RESOURCE_DIR}/${platform}"
-    cp "${src}" "${RESOURCE_DIR}/${platform}/qemu-system-x86_64"
-    chmod 755 "${RESOURCE_DIR}/${platform}/qemu-system-x86_64"
-    echo "=> ${RESOURCE_DIR}/${platform}/qemu-system-x86_64"
+    cp "${src}" "${RESOURCE_DIR}/${platform}/${name}"
+    chmod 755 "${RESOURCE_DIR}/${platform}/${name}"
+    echo "=> ${RESOURCE_DIR}/${platform}/${name} ($(du -h "${RESOURCE_DIR}/${platform}/${name}" | cut -f1))"
 }
 
 build_linux() {
@@ -55,18 +57,20 @@ build_linux() {
     fetch_qemu
 
     # Build inside a Debian bookworm container with static deps.
-    # The heredoc is NOT quoted so shell expands ${QEMU_VERSION} before shipping
-    # to docker build. ARG QEMU_VERSION serves as a fallback default inside.
+    # The heredoc is NOT quoted so shell expands ${QEMU_VERSION} (and
+    # ${TARGET_LIST}) before shipping to docker build.
 docker build \
         -f - \
         -t "valencebox-qemu-linux:${QEMU_VERSION}" \
         --build-arg "QEMU_VERSION=${QEMU_VERSION}" \
         --build-arg "JOBS=${JOBS}" \
+        --build-arg "TARGET_LIST=${TARGET_LIST}" \
         "${BUILD_DIR}" << DOCKERFILE
 FROM alpine:3.20 AS build
 
 ARG QEMU_VERSION
 ARG JOBS
+ARG TARGET_LIST
 
 RUN apk add --no-cache \
         autoconf \
@@ -110,7 +114,7 @@ RUN tar -xf "qemu-\${QEMU_VERSION}.tar.xz"
 
 WORKDIR /src/build
 RUN /src/qemu-\${QEMU_VERSION}/configure \
-    --target-list=x86_64-softmmu \
+    --target-list="\${TARGET_LIST}" \
     --enable-kvm \
     --enable-slirp \
     --enable-zstd \
@@ -122,12 +126,14 @@ RUN /src/qemu-\${QEMU_VERSION}/configure \
     --disable-werror \
     --static
 
-RUN make -j"\${JOBS}" qemu-system-x86_64
+RUN make -j"\${JOBS}"
 
-RUN file qemu-system-x86_64 | grep -q -E "statically linked|static-pie" || { echo "NOT STATIC!"; file qemu-system-x86_64; exit 1; }
+RUN for f in /src/build/qemu-system-*; do \
+        file "\$f" | grep -q -E "statically linked|static-pie" || { echo "NOT STATIC: \$f"; exit 1; }; \
+    done
 
 FROM alpine:3.20
-COPY --from=build /src/build/qemu-system-x86_64 /qemu-system-x86_64
+COPY --from=build /src/build/qemu-system-* /
 COPY --from=build /src/qemu-9.2.4/pc-bios/bios-256k.bin /
 COPY --from=build /src/qemu-9.2.4/pc-bios/bios-microvm.bin /
 COPY --from=build /src/qemu-9.2.4/pc-bios/vgabios-stdvga.bin /
@@ -143,7 +149,9 @@ DOCKERFILE
     tmpd="$(mktemp -d)"
     docker rm -f valencebox-qemu-extract 2>/dev/null || true
     docker create --name valencebox-qemu-extract "valencebox-qemu-linux:${QEMU_VERSION}" >/dev/null
-    docker cp valencebox-qemu-extract:/qemu-system-x86_64 "${tmpd}/qemu-system-x86_64"
+    for _bin in $(docker export valencebox-qemu-extract | tar -t 2>/dev/null | grep '^qemu-system-' || true); do
+        docker cp "valencebox-qemu-extract:/${_bin}" "${tmpd}/${_bin}"
+    done
     # Also copy firmware blobs
     mkdir -p "${tmpd}/pc-bios"
     docker cp valencebox-qemu-extract:/bios-256k.bin "${tmpd}/pc-bios/" 2>/dev/null || true
@@ -155,11 +163,14 @@ DOCKERFILE
     docker cp valencebox-qemu-extract:/kvmvapic.bin "${tmpd}/pc-bios/" 2>/dev/null || true
     docker rm valencebox-qemu-extract >/dev/null
 
-    # Verify it's actually statically linked
-    file "${tmpd}/qemu-system-x86_64"
-    ldd "${tmpd}/qemu-system-x86_64" 2>&1 | head -5 || true
+    # Verify all extracted binaries are statically linked
+    for _bin in "${tmpd}"/qemu-system-*; do
+        [ -f "$_bin" ] || continue
+        file "$_bin"
+        ldd "$_bin" 2>&1 | head -5 || true
+        install_bin "linux" "$_bin"
+    done
 
-    install_bin "linux" "${tmpd}/qemu-system-x86_64"
     if [ -d "${tmpd}/pc-bios" ]; then
         cp -r "${tmpd}/pc-bios" "${RESOURCE_DIR}/linux/"
     fi
@@ -169,7 +180,7 @@ DOCKERFILE
 }
 
 build_darwin() {
-    echo "==> building for darwin (macOS, TCG-only x86_64-softmmu)"
+    echo "==> building for darwin (macOS, target list: ${TARGET_LIST})"
 
     # macOS may lack wget; use curl as fallback
     if ! command -v wget >/dev/null 2>&1; then
@@ -204,11 +215,11 @@ build_darwin() {
     rm -rf "${build_dir}"
     mkdir -p "${build_dir}"
 
-    echo "==> configuring QEMU (x86_64-softmmu, TCG, slirp, zstd)"
+    echo "==> configuring QEMU (${TARGET_LIST}, slirp, zstd)"
     (
         cd "${build_dir}"
         ../configure \
-            --target-list=x86_64-softmmu \
+            --target-list="${TARGET_LIST}" \
             --enable-slirp \
             --enable-zstd \
             --disable-cocoa \
@@ -219,8 +230,8 @@ build_darwin() {
             --disable-werror
     )
 
-    echo "==> building qemu-system-x86_64 (${jobs} jobs)"
-    make -C "${build_dir}" -j"${jobs}" qemu-system-x86_64
+    echo "==> building all system targets (${jobs} jobs)"
+    make -C "${build_dir}" -j"${jobs}"
 
     echo "==> building qemu-img"
     make -C "${build_dir}" -j"${jobs}" qemu-img
@@ -228,9 +239,10 @@ build_darwin() {
     # ── Stage output ──
     mkdir -p "${out_dir}"
 
-    cp "${build_dir}/qemu-system-x86_64" "${out_dir}/"
-    chmod 755 "${out_dir}/qemu-system-x86_64"
-    echo "=> ${out_dir}/qemu-system-x86_64 ($(du -h "${out_dir}/qemu-system-x86_64" | cut -f1))"
+    for bin in "${build_dir}"/qemu-system-*; do
+        [ -f "$bin" ] || continue
+        install_bin darwin "$bin"
+    done
 
     cp "${build_dir}/qemu-img" "${out_dir}/"
     chmod 755 "${out_dir}/qemu-img"
@@ -255,7 +267,7 @@ build_darwin() {
     echo "  bundling dylibs..."
     local deps_file="/tmp/qemu-darwin-deps-$$.txt"
 
-    for binary in "${out_dir}/qemu-system-x86_64" "${out_dir}/qemu-img"; do
+    for binary in "${out_dir}"/qemu-system-* "${out_dir}/qemu-img"; do
         [ -f "$binary" ] || continue
         otool -L "$binary" 2>/dev/null | tail -n +2 | awk '{print $1}' > "$deps_file"
         while IFS= read -r dylib; do
@@ -293,8 +305,9 @@ build_darwin() {
 
     # ── Ad-hoc sign (install_name_tool invalidates code signatures on Apple Silicon) ──
     echo "  signing..."
-    codesign --force --sign - --timestamp=none "${out_dir}/qemu-system-x86_64" 2>/dev/null
-    codesign --force --sign - --timestamp=none "${out_dir}/qemu-img" 2>/dev/null
+    for bin in "${out_dir}"/qemu-system-* "${out_dir}/qemu-img"; do
+        [ -f "$bin" ] && codesign --force --sign - --timestamp=none "$bin" 2>/dev/null
+    done
     for lib in "${lib_dir}"/*.dylib; do
         [ -f "$lib" ] && codesign --force --sign - --timestamp=none "$lib" 2>/dev/null
     done
@@ -305,8 +318,10 @@ build_darwin() {
     [ -z "$cellar" ] && [ -d "/usr/local/Cellar" ] && cellar="/usr/local/Cellar"
     local leak=0
     if [ -n "$cellar" ]; then
-        otool -L "${out_dir}/qemu-system-x86_64" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
-        otool -L "${out_dir}/qemu-img" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
+        for _bin in "${out_dir}"/qemu-system-* "${out_dir}/qemu-img"; do
+            [ -f "$_bin" ] || continue
+            otool -L "$_bin" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
+        done
         for lib in "${lib_dir}"/*.dylib; do
             [ -f "$lib" ] || continue
             otool -L "$lib" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1

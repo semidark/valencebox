@@ -7,6 +7,7 @@ import { HttpShare } from "./http-share";
 import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
 import { SandboxAppConfig } from "../config";
+import { GuestArch, selectGuest, x86_64Profile } from "./guest-profile";
 
 function loadAppConfig(root: string): SandboxAppConfig {
   const p = path.join(root, "sandbox.config.json");
@@ -81,7 +82,7 @@ async function startVm() {
   const workspaceDir = resolveWorkspaceDir(appCfg, tmpDir);
   share = new HttpShare();
   const shareCfg = await share.start(workspaceDir);
-  console.log(`[share] WebDAV on 127.0.0.1:${shareCfg.port}, fw_cfg at ${shareCfg.fwCfgPath}`);
+  console.log(`[share] WebDAV on 127.0.0.1:${shareCfg.port}, token=${shareCfg.token.slice(0, 8)}...`);
   console.log(`[share] workspace: ${workspaceDir}`);
 
   // Write a marker file that unison on the guest checks before syncing.
@@ -98,17 +99,29 @@ async function startVm() {
     return;
   }
 
+  const guestArch = selectGuest(appCfg.guest);
+  if (guestArch !== "x86_64") {
+    console.error(`[qemu] guest architecture '${guestArch}' is not yet supported — falling back to x86_64 TCG (Phase 8 will add it)`);
+    // TODO(phase-8): remove this guard once aarch64 guest assets exist
+  }
+  const profile = x86_64Profile(
+    rootImage,
+    workspaceImage,
+    path.join(assetPaths.imagesDir(), "vmlinuz.bin"),
+    path.join(assetPaths.imagesDir(), "initramfs.bin"),
+  );
+
   vm = new VmManager({
     memoryMB: appCfg.memMb ?? 512,
     smp: appCfg.smp ?? 2,
     tmpDir,
     accel: appCfg.accel,
-    kernel: path.join(assetPaths.imagesDir(), "vmlinuz.bin"),
-    initrd: path.join(assetPaths.imagesDir(), "initramfs.bin"),
-    kernelCmdline: "console=ttyS0 root=/dev/vda rootfstype=ext4 rootflags=rw modules=virtio_blk,ext4",
+    guestProfile: profile,
+    kernelCmdline: profile.kernelCmdline,
     rootImage,
     workspaceImage,
-    fwCfgConfig: shareCfg.fwCfgPath,
+    sharePort: shareCfg.port,
+    shareToken: shareCfg.token,
   });
 
   vm.on("serial:data", (chunk: string) => sendToWindow(IPC.onSerial, chunk));
@@ -163,8 +176,5 @@ app.on("before-quit", (e) => {
     } catch (err) {
       console.error("[qemu] failed to stop cleanly:", err);
     }
-    if (share?.fwCfgPath) {
-      fs.rmSync(path.dirname(share.fwCfgPath), { recursive: true, force: true });
-    }
-  })().finally(() => app.quit());
+    })().finally(() => app.quit());
 });

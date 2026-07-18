@@ -1,0 +1,18 @@
+# Bidir sync between /workspace (native qcow2) and /host-workspace (WebDAV mirror)
+[Unit]
+Description=Workspace bidirectional sync via unison
+Requires=workspace.mount network-online.target
+After=workspace.mount network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/workspace-sync.sh
+ExecStop=/bin/sh -c 'pkill unison 2>/dev/null || true'
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

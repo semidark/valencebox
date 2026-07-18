@@ -2,6 +2,7 @@ import { EventEmitter } from "events";
 import * as fsp from "fs/promises";
 import * as net from "net";
 import { QemuProcess, QemuOptions } from "./qemu";
+import { GuestProfile } from "./guest-profile";
 
 
 export interface VmManagerOptions {
@@ -9,12 +10,14 @@ export interface VmManagerOptions {
   smp: number;
   tmpDir: string;
   accel?: "auto" | "kvm" | "hvf" | "whpx" | "tcg";
+  guestProfile: GuestProfile;
   kernel?: string;
   initrd?: string;
   kernelCmdline?: string;
   rootImage?: string;
   workspaceImage?: string;
-  fwCfgConfig?: string;
+  sharePort?: number;
+  shareToken?: string;
 }
 
 export class VmManager extends EventEmitter {
@@ -30,7 +33,7 @@ export class VmManager extends EventEmitter {
   async start(): Promise<void> {
     this.qemu.on("qmp:event", (event: string) => this.emit("qmp:event", event));
     this.qemu.on("accel", (info: { name: string; available: boolean }) => this.emit("accel", info));
-    await this.qemu.start(this.opts);
+    await this.qemu.start(this.opts as QemuOptions);
     this.connectSerial();
   }
 

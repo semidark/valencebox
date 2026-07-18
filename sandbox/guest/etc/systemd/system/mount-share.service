@@ -1,0 +1,17 @@
+# Read fw_cfg config, format workspace disk if needed, write WebDAV secrets.
+# Leaves /workspace mounting to systemd's auto-generated workspace.mount from /etc/fstab.
+[Unit]
+Description=Mount workspace disk and prepare WebDAV share
+DefaultDependencies=no
+After=dev-vdb.device
+Requires=dev-vdb.device
+Before=workspace-sync.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/mount-share.sh
+ExecStop=/bin/sh -c 'umount /workspace 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
