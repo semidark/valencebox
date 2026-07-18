@@ -30,6 +30,12 @@ done
 
 GUEST_ARCH_LABEL=$(echo "$ARCH" | sed 's/amd64/x86-64/')
 
+# Register QEMU user-mode emulators for cross-arch Docker builds (e.g., arm64 on
+# x86-64 host). Idempotent — safe to run every build.
+if [ "$ARCH" != "amd64" ]; then
+  docker run --privileged --rm tonistiigi/binfmt --install "$ARCH" 2>/dev/null || true
+fi
+
 # Resolve qemu-img: prefer bundled, fall back to PATH
 PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
 QEMU_IMG=./resources/qemu/$PLATFORM/qemu-img
