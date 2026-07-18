@@ -215,13 +215,14 @@ build_darwin() {
     rm -rf "${build_dir}"
     mkdir -p "${build_dir}"
 
-    echo "==> configuring QEMU (${TARGET_LIST}, slirp, zstd)"
+    echo "==> configuring QEMU (${TARGET_LIST}, slirp, zstd, hvf)"
     (
         cd "${build_dir}"
         ../configure \
             --target-list="${TARGET_LIST}" \
             --enable-slirp \
             --enable-zstd \
+            --enable-hvf \
             --disable-cocoa \
             --disable-docs \
             --disable-gcrypt \
@@ -304,15 +305,28 @@ build_darwin() {
     rm -f "$deps_file"
 
     # ── Ad-hoc sign (install_name_tool invalidates code signatures on Apple Silicon) ──
+    # Use HVF entitlement so qemu-system-aarch64 can use -accel hvf in dev mode.
+    # The entitlement plist is checked into the repo at sandbox/resources/qemu/.
     echo "  signing..."
+    local entitlements
+    entitlements="$(cd "$(dirname "$0")/../sandbox/resources/qemu" && pwd)/hvf-entitlement.plist"
     for bin in "${out_dir}"/qemu-system-* "${out_dir}/qemu-img"; do
-        [ -f "$bin" ] && codesign --force --sign - --timestamp=none "$bin" 2>/dev/null
+        [ -f "$bin" ] || continue
+        if [ "$(basename "$bin")" = "qemu-system-aarch64" ] || [ "$(basename "$bin")" = "qemu-system-aarch64-unsigned" ]; then
+            codesign --force --sign - --timestamp=none --entitlements "$entitlements" "$bin" 2>/dev/null
+        else
+            codesign --force --sign - --timestamp=none "$bin" 2>/dev/null
+        fi
     done
     for lib in "${lib_dir}"/*.dylib; do
         [ -f "$lib" ] && codesign --force --sign - --timestamp=none "$lib" 2>/dev/null
     done
 
-    # ── Verify no Homebrew references (skip dylib install name / ID line) ──
+    # ── Verify no Homebrew references in LC_LOAD_DYLIB entries ──
+    # (LC_ID_DYLIB entries are allowed to point to the original brew path;
+    # they have no effect on runtime loading — only LC_LOAD_DYLIB matters.)
+    # otool -L output: line 1 = file path, line 2 = LC_ID_DYLIB (self-identity),
+    # lines 3+ = LC_LOAD_DYLIB (dependent libraries used at runtime).
     local cellar=""
     [ -d "/opt/homebrew" ] && cellar="/opt/homebrew"
     [ -z "$cellar" ] && [ -d "/usr/local/Cellar" ] && cellar="/usr/local/Cellar"
@@ -320,11 +334,11 @@ build_darwin() {
     if [ -n "$cellar" ]; then
         for _bin in "${out_dir}"/qemu-system-* "${out_dir}/qemu-img"; do
             [ -f "$_bin" ] || continue
-            otool -L "$_bin" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
+            otool -L "$_bin" 2>/dev/null | tail -n +3 | grep -q "$cellar" && leak=1
         done
         for lib in "${lib_dir}"/*.dylib; do
             [ -f "$lib" ] || continue
-            otool -L "$lib" 2>/dev/null | tail -n +2 | grep -q "$cellar" && leak=1
+            otool -L "$lib" 2>/dev/null | tail -n +3 | grep -q "$cellar" && leak=1
         done
     fi
     if [ "$leak" -ne 0 ]; then

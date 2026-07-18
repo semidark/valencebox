@@ -7,7 +7,7 @@ import { HttpShare } from "./http-share";
 import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
 import { SandboxAppConfig } from "../config";
-import { GuestArch, selectGuest, x86_64Profile } from "./guest-profile";
+import { GuestArch, selectGuest, x86_64Profile, aarch64Profile } from "./guest-profile";
 
 function loadAppConfig(root: string): SandboxAppConfig {
   const p = path.join(root, "sandbox.config.json");
@@ -72,9 +72,16 @@ async function startVm() {
   const appCfg = loadAppConfig(app.getPath("userData"));
   const tmpDir = fs.mkdtempSync(path.join(app.getPath("userData"), "qemu-"));
 
-  const rootImage = assetPaths.rootQcow2Path();
+  // Resolve guest architecture before checking images (paths differ by arch)
+  const guestArch = selectGuest(
+    appCfg.guest,
+    (arch) => fs.existsSync(assetPaths.qemuBinaryPath(arch)),
+    (arch) => fs.existsSync(assetPaths.rootQcow2Path(arch)),
+  );
+
+  const rootImage = assetPaths.rootQcow2Path(guestArch);
   if (!fs.existsSync(rootImage)) {
-    sendToWindow(IPC.onStatus, { phase: "error", error: "root.qcow2 not found — run `npm run images` first" });
+    sendToWindow(IPC.onStatus, { phase: "error", error: `${path.basename(rootImage)} not found — run \`npm run images\` first` });
     return;
   }
 
@@ -93,23 +100,25 @@ async function startVm() {
   fs.writeFileSync(markerPath, "");
   console.log(`[share] sync marker at ${markerPath}`);
 
-  const workspaceImage = assetPaths.workspaceQcow2Path();
+  const workspaceImage = assetPaths.workspaceQcow2Path(guestArch);
   if (!fs.existsSync(workspaceImage)) {
-    sendToWindow(IPC.onStatus, { phase: "error", error: "workspace.qcow2 not found — run `npm run images` first" });
+    sendToWindow(IPC.onStatus, { phase: "error", error: `${path.basename(workspaceImage)} not found — run \`npm run images\` first` });
     return;
   }
 
-  const guestArch = selectGuest(appCfg.guest);
-  if (guestArch !== "x86_64") {
-    console.error(`[qemu] guest architecture '${guestArch}' is not yet supported — falling back to x86_64 TCG (Phase 8 will add it)`);
-    // TODO(phase-8): remove this guard once aarch64 guest assets exist
-  }
-  const profile = x86_64Profile(
-    rootImage,
-    workspaceImage,
-    path.join(assetPaths.imagesDir(), "vmlinuz.bin"),
-    path.join(assetPaths.imagesDir(), "initramfs.bin"),
-  );
+  const profile = guestArch === "aarch64"
+    ? aarch64Profile(
+        rootImage,
+        workspaceImage,
+        assetPaths.kernelPath(guestArch),
+        assetPaths.initrdPath(guestArch),
+      )
+    : x86_64Profile(
+        rootImage,
+        workspaceImage,
+        path.join(assetPaths.imagesDir(), "vmlinuz.bin"),
+        path.join(assetPaths.imagesDir(), "initramfs.bin"),
+      );
 
   vm = new VmManager({
     memoryMB: appCfg.memMb ?? 512,

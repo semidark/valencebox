@@ -92,10 +92,22 @@ export function getRandomFreePort(): Promise<number> {
   });
 }
 
-export function rootQcow2Path(): string {
-  return path.join(imagesDir(), "root.qcow2");
+function archSuffix(arch?: GuestArch): string {
+  return arch === "aarch64" ? "-arm64" : "";
 }
 
-export function workspaceQcow2Path(): string {
-  return path.join(imagesDir(), "workspace.qcow2");
+export function rootQcow2Path(arch?: GuestArch): string {
+  return path.join(imagesDir(), `root${archSuffix(arch)}.qcow2`);
+}
+
+export function workspaceQcow2Path(arch?: GuestArch): string {
+  return path.join(imagesDir(), `workspace${archSuffix(arch)}.qcow2`);
+}
+
+export function kernelPath(arch?: GuestArch): string {
+  return path.join(imagesDir(), `vmlinuz${archSuffix(arch)}.bin`);
+}
+
+export function initrdPath(arch?: GuestArch): string {
+  return path.join(imagesDir(), `initramfs${archSuffix(arch)}.bin`);
 }

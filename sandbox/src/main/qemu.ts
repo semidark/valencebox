@@ -188,7 +188,8 @@ export class QemuProcess extends EventEmitter {
   private buildArgs(opts: QemuOptions): string[] {
     const profile = opts.guestProfile;
     const accels = this.resolveAccels(opts.accel, profile);
-    const machineType = profile.machineFor(accels[0]);
+    const resolvedAccel = accels[0];
+    const machineType = profile.machineFor(resolvedAccel);
     this.machineType = machineType;
 
     const args: string[] = [];
@@ -214,7 +215,7 @@ export class QemuProcess extends EventEmitter {
     if (fwDir) args.push("-L", fwDir);
 
     // Delegate pure-argument construction to the static method (testable)
-    args.push(...QemuProcess.buildArgs(opts, machineType));
+    args.push(...QemuProcess.buildArgs(opts, machineType, resolvedAccel));
 
     return args;
   }
@@ -233,20 +234,27 @@ export class QemuProcess extends EventEmitter {
     // Non-fatal — socket works, just less restrictive
   }
 
-  static buildArgs(opts: QemuOptions, machineType: string): string[] {
+  static buildArgs(opts: QemuOptions, machineType: string, resolvedAccel?: string): string[] {
     const profile = opts.guestProfile;
     const args: string[] = [];
 
+    const accel = resolvedAccel ?? "tcg,thread=multi";
+    const machineArg = machineType === "virt" && profile.arch === "aarch64"
+      ? `${machineType},gic-version=3`
+      : machineType;
     args.push(
-      "-machine", machineType,
+      "-machine", machineArg,
       "-m", `${opts.memoryMB}`,
       "-smp", `${opts.smp}`,
-      "-nodefaults",
       "-no-user-config",
       "-nographic",
       "-no-reboot",
     );
-    if (profile.cpu) args.push("-cpu", profile.cpu);
+    // -nodefaults is safe for pc and microvm (built-in serial devices survive)
+    // but strips the PL011 UART from -machine virt (aarch64). Skip it for virt.
+    if (machineType !== "virt") args.push("-nodefaults");
+    const cpuModel = profile.cpuFor(accel);
+    if (cpuModel) args.push("-cpu", cpuModel);
 
     const kernel = opts.kernel ?? profile.kernel;
     if (kernel) args.push("-kernel", kernel);

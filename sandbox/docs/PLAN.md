@@ -47,8 +47,14 @@ This is a reorder from earlier drafts:
 - **On Apple Silicon the default becomes aarch64 Ubuntu under HVF** (Phase 9),
   falling back to the emulated `x86_64` Ubuntu guest only when aarch64 assets or
   HVF are unavailable.
-- Prefer `-machine microvm` for the aarch64 guest if it works under HVF; otherwise
-  use `-machine virt`. Decide when Phase 9 reaches bring-up.
+- **`-machine virt` only** for the aarch64 guest (no microvm — microvm lacks proven
+  GICv3 support and adds no benefit over `virt` with HVF). `gic-version=3` for
+  standard aarch64 GIC.
+- Guest arm64 images live in `images/` with arch prefix (`root-arm64.qcow2`,
+  `vmlinuz-arm64.bin`, `initrd-arm64.bin`, `workspace-arm64.qcow2`).
+- aarch64 guest uses `ttyAMA0` (ARM PL011) as the serial console.
+- `cpuFor(accel)`: `"host"` under HVF pass-through, `"max"` under TCG fallback,
+  `undefined` for x86_64 (no change).
 - The guest boots via **direct `-kernel`/`-initrd`** (no UEFI/pflash disk boot)
   on both arches, matching the current approach.
 - **FEX runs at system level via `binfmt_misc`** — any x86_64 ELF is transparently
@@ -471,25 +477,58 @@ default on Apple Silicon. Builds directly on the Phase 8 Ubuntu image as an
 arm64 variant — same init, packages, and host-side design; only arch, kernel,
 console, and machine profile change.
 
-- [ ] Add an `aarch64-softmmu` target and `--enable-hvf` to the darwin QEMU
+### Design decisions (settled)
+
+| Decision | Choice |
+|---|---|
+| Image layout | `images/` with arch prefix: `vmlinuz-arm64.bin`, `initramfs-arm64.bin`, `root-arm64.qcow2`, `workspace-arm64.qcow2` |
+| Machine type | **`virt` only** — no microvm on aarch64 (simpler, proven GICv3 support) |
+| Guest build | `docker buildx --platform=linux/arm64` with the same Dockerfile |
+| Auto-select | Pick aarch64 automatically on Apple Silicon when assets exist; x86_64 fallback otherwise |
+| Console device | `ttyAMA0` (ARM PL011 UART on `-machine virt`) |
+| CPU | `host` under HVF pass-through; `max` under TCG fallback (handled via `cpuFor(accel)` on the profile) |
+| ARM GIC | `-machine virt,gic-version=3` (GICv3 is the standard for aarch64 VMs) |
+
+### Tasks
+
+- [x] Add `aarch64-softmmu` target and `--enable-hvf` to the darwin QEMU
   build; stage `qemu-system-aarch64` alongside the existing x86_64 tree.
-- [ ] Build an Ubuntu arm64 guest image (`buildx --platform=linux/arm64`) with an
+- [x] Build an Ubuntu arm64 guest image (`buildx --platform=linux/arm64`) with an
   arm64 kernel + initrd for direct `-kernel` boot.
-- [ ] Add an `aarch64Profile()` factory and wire `selectGuest` to auto-pick
-  aarch64 on Apple Silicon when assets + HVF are present (x86_64 fallback
-  otherwise).
-- [ ] Select `-machine microvm` under HVF if viable; otherwise `-machine virt`.
-- [ ] Boot the Ubuntu arm64 guest to a serial login on Apple Silicon under HVF
-  (`console=ttyAMA0`, root on `/dev/vda`).
-- [ ] Restore the WebDAV share, fw_cfg config channel, `/workspace` mount, and
-  unison sync on the arm64 guest.
-- [ ] Verify QMP lifecycle and clean shutdown on the arm64 path.
-- [ ] Keep the emulated `x86_64` guest available as the documented fallback.
+- [x] Add `aarch64Profile()` factory: `-machine virt,gic-version=3`,
+  `console=ttyAMA0`, `virtioSuffix: "-pci"`, `extraCmdline: ""`,
+  `cpuFor(accel): "host"|"max"`.
+- [x] Add `cpuFor(accel): string | undefined` to `GuestProfile` interface
+  (undefined for x86_64; aarch64 returns `"host"` under HVF, `"max"` under TCG).
+- [x] Wire `selectGuest()` to auto-pick aarch64 on Apple Silicon when
+  `qemu-system-aarch64` binary + arm64 guest images exist (x86_64 fallback otherwise).
+- [x] Add arch-aware image paths to `asset-paths.ts` (`root-arm64.qcow2` etc.).
+- [x] Update `main.ts` to select the correct profile (`aarch64Profile()` vs `x86_64Profile()`) based on the resolved guest arch.
+- [x] Update `qemu.ts` `buildArgs` to emit `-cpu` via `cpuFor(accel)`, skip `-nodefaults` for `-machine virt` (preserves PL011), emit `gic-version=3`.
+- [x] Update `Dockerfile` to create both `serial-getty@ttyS0` and `serial-getty@ttyAMA0` autologin drop-ins.
+- [x] Update `build-guest.sh` with an `--arch arm64` flag using `docker buildx`.
+- [x] Boot the Ubuntu arm64 guest to a serial login on Apple Silicon (TCG — HVF needs app signing entitlement).
+- [x] Verify QMP lifecycle and clean shutdown on the arm64 path.
+- [x] Verify x86_64 TCG fallback is unchanged (`npm run test:boot` passes).
+- [x] Update unit tests: `guest-profile.unit.ts` (aarch64 profile, cpuFor), `golden-args.unit.ts` (aarch64 arg vectors), `selectGuest` with asset checks.
+- [ ] Write aarch64 boot smoke test (`test:boot:arm64` or parameterized `test:boot`).
 
 Notes:
 - Reuse the host-side WebDAV, fw_cfg, and sync design unchanged; only the guest
   arch, kernel, console, and machine profile change.
 - Direct `-kernel`/`-initrd` boot only; no UEFI/pflash disk boot.
+- `virtio_mmio` not needed on `-machine virt` (which has a PCIe root port). The
+  virtio transport is PCI.
+- **HVF requires app signing entitlement.** On macOS, `-accel hvf` fails with
+  `HV_DENIED` from `qemu-system-aarch64` when spawned directly from terminal in
+  dev mode. The QEMU binary must be signed with `com.apple.security.hypervisor`
+  entitlement. Electron's main process inherits this entitlement from the packaged
+  app. For dev, TCG works (boots in ~25s); HVF will be available in the packaged
+  build. See `docs/macos-issues.md` for the tracking entry.
+- **`-nodefaults` is unsafe for `-machine virt`.** On x86_64 `pc`/`microvm`,
+  `-nodefaults` keeps the ISA serial / virtio-mmio devices. On aarch64 `virt`,
+  `-nodefaults` strips the PL011 UART (ttyAMA0). `buildArgs` conditionally omits
+  `-nodefaults` when `machineType === "virt"`.
 - **Phase 7 regressions to finish wiring here:**
   - `checkAccel` darwin+aarch64 already gated on `process.arch === "arm64"`.
   - `machineType` field already widened to `"microvm" | "pc" | "virt"`.
