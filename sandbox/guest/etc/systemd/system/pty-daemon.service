@@ -1,7 +1,6 @@
 [Unit]
 Description=ValenceBox PTY Daemon
-After=dev-hvc0.device
-Requires=dev-hvc0.device
+After=multi-user.target
 
 [Service]
 ExecStart=/usr/local/libexec/pty-daemon.py

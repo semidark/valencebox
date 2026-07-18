@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-utils \
     curl \
     ripgrep \
+    python3 \
     vim-tiny \
     iproute2 \
     ca-certificates && \
@@ -136,6 +137,7 @@ RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d && \
 RUN systemctl mask \
     bluetooth.service \
     wpa_supplicant.service \
+    serial-getty@hvc0.service \
     systemd-timesyncd.service \
     systemd-resolved.service \
     systemd-networkd-wait-online.service \
