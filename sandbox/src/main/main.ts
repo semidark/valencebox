@@ -64,12 +64,14 @@ function registerIpc() {
     };
   });
   ipcMain.on(IPC.serialInput, (_e, data: string) => vm?.sendInput(data));
+  ipcMain.on(IPC.ptyInput, (_e, data: Uint8Array) => vm?.sendPtyInput(data));
+  ipcMain.on(IPC.ptyResize, (_e, cols: number, rows: number) => vm?.resizePty(cols, rows));
   ipcMain.handle(IPC.setBalloon, (_e, mb: number) => {
     if (typeof mb !== "number" || !Number.isFinite(mb)) return;
     return vm?.setBalloon(mb);
   });
   ipcMain.handle(IPC.getBalloon, () => vm ? vm.getBalloon() : null);
-  // Stub handlers for legacy IPC channels — renderer may still call them
+  // Stub handler for legacy IPC channel — renderer may still call it
   ipcMain.handle(IPC.saveSnapshot, () => {});
 }
 
@@ -149,6 +151,8 @@ async function startVm() {
     console.log("[qemu] serial closed");
     sendToWindow(IPC.onStatus, { phase: "stopped" });
   });
+  vm.on("pty:data", (chunk: Uint8Array) => sendToWindow(IPC.onPtyData, chunk));
+  vm.on("pty:closed", () => sendToWindow(IPC.onPtyClosed));
   vm.on("qmp:event", (event: string) => {
     console.log("[qemu] QMP event:", event);
   });

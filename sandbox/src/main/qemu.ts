@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as fsp from "fs/promises";
 import { EventEmitter } from "events";
-import { qemuBinaryPath, firmwareDir, qemuPlatformDir, allocSerialTransport, allocQmpTransport, VmTransport } from "./asset-paths";
+import { qemuBinaryPath, firmwareDir, qemuPlatformDir, allocSerialTransport, allocQmpTransport, allocPtyTransport, VmTransport } from "./asset-paths";
 import { QmpClient } from "./qmp";
 import { GuestProfile } from "./guest-profile";
 
@@ -38,6 +38,7 @@ export class QemuProcess extends EventEmitter {
   get qmp(): QmpClient | null { return this._qmp; }
   public serialTransport: VmTransport | null = null;
   public qmpTransport: VmTransport | null = null;
+  public ptyTransport: VmTransport | null = null;
   public machineType: "microvm" | "pc" | "virt" = "pc";
 
   get running(): boolean {
@@ -60,6 +61,7 @@ export class QemuProcess extends EventEmitter {
     this.startedAt = Date.now();
     this.serialTransport = await allocSerialTransport(opts.tmpDir);
     this.qmpTransport = await allocQmpTransport(opts.tmpDir);
+    this.ptyTransport = await allocPtyTransport(opts.tmpDir);
 
     const detected = QemuProcess.checkAccel(process.platform, opts.guestProfile.arch);
     const hw = opts.accel && opts.accel !== "auto" && opts.accel !== "tcg"
@@ -126,6 +128,7 @@ export class QemuProcess extends EventEmitter {
     if (this.serialTransport.type === "unix") {
       this.chmodSocket(this.serialTransport.connectPath).catch(() => {});
       this.chmodSocket(this.qmpTransport.connectPath).catch(() => {});
+      this.chmodSocket(this.ptyTransport.connectPath).catch(() => {});
     }
 
     const qmpLabel = this.qmpTransport.type === "unix"
@@ -219,7 +222,7 @@ export class QemuProcess extends EventEmitter {
     if (fwDir) args.push("-L", fwDir);
 
     // Delegate pure-argument construction to the static method (testable)
-    args.push(...QemuProcess.buildArgs(opts, machineType, resolvedAccel));
+    args.push(...QemuProcess.buildArgs(opts, machineType, resolvedAccel, this.ptyTransport));
 
     return args;
   }
@@ -238,7 +241,7 @@ export class QemuProcess extends EventEmitter {
     // Non-fatal — socket works, just less restrictive
   }
 
-  static buildArgs(opts: QemuOptions, machineType: string, resolvedAccel?: string): string[] {
+  static buildArgs(opts: QemuOptions, machineType: string, resolvedAccel?: string, ptyTransport?: VmTransport | null): string[] {
     const profile = opts.guestProfile;
     const args: string[] = [];
 
@@ -297,6 +300,17 @@ export class QemuProcess extends EventEmitter {
     args.push("-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22`, "-device", `${netDev},netdev=net0`);
     args.push("-device", rngDev);
     args.push("-device", `virtio-balloon${suffix}`);
+
+    // PTY channel via virtio-serial / virtconsole
+    if (ptyTransport) {
+      const ptyTr = ptyTransport;
+      const ptyArg = ptyTr.type === "unix"
+        ? `unix:${ptyTr.local},server,nowait`
+        : `tcp:127.0.0.1:${ptyTr.local},server,nowait`;
+      args.push("-chardev", ptyArg);
+      args.push("-device", `virtio-serial${suffix}`);
+      args.push("-device", `virtconsole,chardev=pty,name=pty`);
+    }
 
     return args;
   }

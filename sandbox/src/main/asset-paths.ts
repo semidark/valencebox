@@ -81,6 +81,21 @@ export async function allocQmpTransport(tmpDir: string): Promise<VmTransport> {
   return { type: "unix", local: sock, connectPath: sock };
 }
 
+/**
+ * Allocate a platform-appropriate PTY transport for virtio-console.
+ *
+ * - Linux / macOS: Unix domain socket inside tmpDir, chmod 0600 after creation.
+ * - Windows: TCP on 127.0.0.1 (same reason as serial).
+ */
+export async function allocPtyTransport(tmpDir: string): Promise<VmTransport> {
+  if (process.platform === "win32") {
+    const port = await getRandomFreePort();
+    return { type: "tcp", local: String(port), connectPath: String(port) };
+  }
+  const sock = path.join(tmpDir, "pty.sock");
+  return { type: "unix", local: sock, connectPath: sock };
+}
+
 export function getRandomFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
