@@ -154,4 +154,4 @@ rm -rf "/tmp/sandbox-rootfs${SUFFIX}" 2>/dev/null || true
 rm -f "images/rootfs${SUFFIX}.tar"
 
 echo "==> done"
-ls -lh images/ | grep "${SUFFIX}" || ls -lh images/
+ls -lh images/ | grep -- "${SUFFIX}" || ls -lh images/
