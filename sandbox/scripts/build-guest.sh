@@ -6,27 +6,48 @@
 set -e
 cd "$(dirname "$0")/.."
 
-ARCH="amd64"
+ARCH=""
 SUFFIX=""
-PLATFORM_FLAG="linux/amd64"
+PLATFORM_FLAG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --arch)
       shift
-      if [ "$1" = "arm64" ]; then
-        ARCH="arm64"
-        SUFFIX="-arm64"
-        PLATFORM_FLAG="linux/arm64"
-      fi
+      ARCH="$1"
       shift
       ;;
     *)
       echo "unknown option: $1"
-      echo "usage: $0 [--arch arm64]"
+      echo "usage: $0 [--arch amd64|arm64]"
       exit 1
       ;;
   esac
 done
+
+# Default to host architecture
+if [ -z "$ARCH" ]; then
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) echo "unsupported host arch: $ARCH"; exit 1 ;;
+  esac
+fi
+
+case "$ARCH" in
+  amd64)
+    SUFFIX=""
+    PLATFORM_FLAG="linux/amd64"
+    ;;
+  arm64)
+    SUFFIX="-arm64"
+    PLATFORM_FLAG="linux/arm64"
+    ;;
+  *)
+    echo "unsupported target arch: $ARCH (use amd64 or arm64)"
+    exit 1
+    ;;
+esac
 
 GUEST_ARCH_LABEL=$(echo "$ARCH" | sed 's/amd64/x86-64/')
 
