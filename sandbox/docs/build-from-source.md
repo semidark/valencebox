@@ -75,8 +75,8 @@ npm run images
 ```
 
 What happens:
-- Builds the Alpine x86-64 guest Docker image (`guest/Dockerfile`)
-- Exports the rootfs, extracts `vmlinuz-virt` + `initramfs-virt`
+- Builds the Ubuntu 24.04 guest Docker image (`guest/Dockerfile`)
+- Exports the rootfs, extracts `vmlinuz` + `initrd.img`
 - Creates `images/root.qcow2` (ext4, auto-sized)
 - Creates `images/workspace.qcow2` (default 1 GiB, override with
   `WORKSPACE_MB=<n>`)
@@ -118,8 +118,8 @@ Verifies: QEMU process starts, QMP socket connects, capabilities negotiated,
 npm run test:boot
 ```
 
-Verifies: boots Alpine to serial login, root login works, `/workspace` is
-mounted from the second virtio disk, `/dev/hvc0` present, sync-agent service
+Verifies: boots Ubuntu to serial login, root login works, `/workspace` is
+mounted from the second virtio disk, sync-agent service
 is running. Takes ~30-60s under TCG.
 
 Add `VERBOSE=1` to stream guest serial output:
@@ -176,7 +176,7 @@ ALL BOOT TESTS PASSED
 ```
 
 After `npm start`, the Electron window opens. The serial console shows an
-Alpine login prompt. Typing `root` / `root` logs you into the guest.
+Ubuntu login prompt. Typing `root` / `root` logs you into the guest.
 
 ## Cleaning up
 
@@ -190,7 +190,7 @@ rm -rf valencebox
 Docker images can be cleaned separately:
 
 ```sh
-docker rmi sandbox-guest alpine:3.21 2>/dev/null
+docker rmi sandbox-guest 2>/dev/null
 ```
 
 ## Troubleshooting

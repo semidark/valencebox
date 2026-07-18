@@ -51,8 +51,9 @@ export function x86_64Profile(
 
     // Ubuntu 24.04 + systemd: bare `rw` is required — the kernel defaults to `ro`
     // when no read-write flag is on the cmdline. `rootflags=rw` only appends mount
-    // options and is ineffective by itself. No Alpine `modules=` parameter needed;
-    // initramfs has modules baked in.
+    // options and is ineffective by itself. No `modules=` parameter needed
+    // (an Alpine mkinitfs feature — unused in Ubuntu); initramfs has modules
+    // baked in via /etc/initramfs-tools/modules.
     kernelCmdline:
       "console=ttyS0 root=/dev/vda rootfstype=ext4 rw quiet systemd.show_status=0 systemd.log_level=err systemd.journald.forward_to_console=0",
 

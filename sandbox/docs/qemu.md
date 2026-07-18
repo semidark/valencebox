@@ -42,14 +42,14 @@ Electron main (Node)
   │    on the QEMU command line (file-backed fw_cfg entry)
   └─ Snapshot manager (QMP migrate-to-file + zstd)
 
-Guest (Alpine x86-64)
+Guest (Ubuntu 24.04 x86-64)
  ├─ / on /dev/vda (root qcow2)
  ├─ /workspace on /dev/vdb (workspace qcow2)   ← native ext4, fast
  ├─ mounts host HTTP share via SLIRP (10.0.2.2) at /host-workspace
- ├─ rsync + inotifywait bridge: /host-workspace ⇄ /workspace
+ ├─ unison -repeat 2 bridge: /host-workspace ⇄ /workspace
  │    ├─ guest→host: inotify on local qcow2 (prompt)
  │    └─ host→guest: periodic poll ~2s (no inotify over network)
- └─ getty login shell on ttyS0
+ └─ systemd serial-getty login shell on ttyS0
 ```
 
 > **⚠️ Stale — x86_64-only design. To be rewritten in Phase 7 (multi-arch).**
@@ -64,7 +64,7 @@ Guest (Alpine x86-64)
 | Machine type | `pc` (i440fx, PCI/ACPI/HPET — microvm has no HPET, fails under TCG) |
 | Emulator | vanilla `qemu-system-x86_64`, bundled per-platform |
 | Acceleration | auto-detect: `kvm`/`whpx` if available, else `tcg,thread=multi` (HVF is aarch64-only) |
-| Guest | Alpine x86-64, `linux-virt` kernel, virtio devices |
+| Guest | Ubuntu 24.04, `linux-image-virtual` kernel, virtio devices |
 | Host↔guest share | **WebDAV over plain HTTP** (no TLS) over SLIRP — token-based auth for multi-user safety |
 | Working tree | native qcow2 (`/dev/vdb`), mirrored via in-guest rsync/inotify |
 | Source of truth | **host dir is canonical**; qcow2 is a synced cache |
@@ -140,7 +140,7 @@ app.listen(port);
 ```
 
 WebDAV (RFC 4918) is a standard protocol with clients on every OS: davfs2
-(Alpine/Linux), macOS Finder, Windows Explorer, GNOME Files, KDE Dolphin. Using
+(Ubuntu/Linux), macOS Finder, Windows Explorer, GNOME Files, KDE Dolphin. Using
 it means the guest mounts the share with `mount -t davfs` — no custom sync
 agent protocol, no bespoke CONNECT/BPROPPATCH parsing. The Nephele package is
 actively maintained (SciActive Inc, Apache-2.0, 10 transitive deps).
@@ -225,7 +225,7 @@ Goal: land the plan, carve out space, keep the tree buildable.
 
 ### Phase 1 — QEMU boots to a serial login
 
-Goal: `qemu-system-x86_64` launches a throwaway Alpine ISO/qcow2 and reaches a
+Goal: `qemu-system-x86_64` launches a throwaway Ubuntu ISO/qcow2 and reaches a
 login prompt over a Unix serial socket. **No sync, no snapshots, no workspace.**
 
 **Status: Phase 1 complete — QEMU binary vendored, asset resolver written,
@@ -242,7 +242,7 @@ Under TCG (no KVM/HVF/WHPX), the guest kernel cannot calibrate TSC and hangs.
 - [x] Write `src/main/vm-manager.ts` — wraps QEMU process, connects serial socket, exposes events
 - [x] Rewire `main.ts` — replaces `Sandbox`+v86 with `VmManager`; IPC handlers for serial I/O only
 - [x] Implement the accel priority list: `kvm`/`hvf`/`whpx` then `tcg,thread=multi`
-- [x] Boot a proper x86-64 Alpine root qcow2 (deferred to Phase 4 — guest image build)
+- [x] Boot a proper x86-64 Ubuntu root qcow2 (deferred to Phase 4 — guest image build)
 - [x] Wire the serial Unix socket into the existing xterm renderer (`onSerial` / input)
 - [x] Cross-platform binary/asset path resolver (dev vs `process.resourcesPath`)
 
@@ -305,7 +305,7 @@ accels.push("tcg,thread=multi");   // always last (fallback)
 // → ["tcg,thread=multi"] when no HW accel → machine selects pc
 ```
 
-**Verify (`test:boot`):** spawn QEMU, assert Alpine login prompt appears on the
+**Verify (`test:boot`):** spawn QEMU, assert Ubuntu login prompt appears on the
 serial socket within a timeout. Assert clean shutdown via QMP `quit` (or process
 kill). Runs on both a KVM host and a TCG-only host (`accel=tcg` forced).
 
@@ -411,15 +411,15 @@ Host side (Electron, before spawning QEMU):
     qemu-system-x86_64 ... \
       -fw_cfg name=opt/org.valencebox.config,file=/tmp/valence-<uuid>/config.json
 
-Guest side (Alpine boot script):
+Guest side (Ubuntu boot script):
 
     modprobe qemu_fw_cfg 2>/dev/null || true
     CONFIG=$(cat /sys/firmware/qemu_fw_cfg/by_name/opt/org.valencebox.config/raw)
     PORT=$(echo "$CONFIG" | grep -o '"port":[0-9]*' | grep -o '[0-9]*')
     TOKEN=$(echo "$CONFIG" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
-**Guest-side WebDAV client:** [`davfs2`](https://pkgs.alpinelinux.org/package/edge/community/x86/davfs2)
-(`apk add davfs2`). It mounts a WebDAV resource as a FUSE filesystem and works
+**Guest-side WebDAV client:** [`davfs2`](https://packages.ubuntu.com/noble/davfs2)
+(`apt install davfs2`). It mounts a WebDAV resource as a FUSE filesystem and works
 with plain HTTP (no TLS). The guest mounts the host's Nephele server via SLIRP:
 
     echo "http://10.0.2.2:$PORT/ valence $TOKEN" >> /etc/davfs2/secrets
@@ -430,7 +430,7 @@ Since auth is handled via Basic + token, configure `/etc/davfs2/davfs2.conf`:
 - No TLS settings needed — `http://` URLs are treated as plain HTTP
 - `secrets ''` means davfs2 reads from the default secrets file, not env
 
-- [x] Rewrite `guest/Dockerfile`: amd64 Alpine, `linux-virt` kernel + modules
+- [x] Rewrite `guest/Dockerfile`: Ubuntu 24.04, `linux-image-virtual` kernel + modules
 - [x] Initramfs features: `virtio_blk`, `virtio_net`, `ext4`
 - [x] Read-only root fix: add `rootflags=rw` to kernel cmdline (initramfs defaults to `ro`)
 - [x] Root fs on `/dev/vda`; workspace qcow2 on `/dev/vdb` mounted at `/workspace`
