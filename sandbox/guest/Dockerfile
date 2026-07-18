@@ -105,7 +105,7 @@ RUN KREL=$(ls /lib/modules | head -1) && \
            fs/ocfs2 fs/ocfs2_dlm fs/isofs fs/udf fs/exfat fs/gfs2 && \
     depmod $KREL
 
-# Create mount points for fstab-generated workspace.mount and WebDAV mount-share
+# Create mount points for workspace disk mount and WebDAV mount-share
 RUN mkdir -p /workspace /host-workspace
 
 # davfs2 config: no locking, no Expect:100 (SLIRP), short timeouts, cache on root fs
@@ -145,8 +145,10 @@ RUN echo sandbox > /etc/hostname
 # motd
 RUN printf '\nsandbox login ready (Ubuntu 24.04)\n' > /etc/motd
 
-# fstab: workspace qcow2 disk mounted at /workspace by systemd automagically
-RUN printf '/dev/vdb  /workspace  ext4  defaults,noatime,nofail  0  2\n' >> /etc/fstab
+# NOTE: No /workspace entry in /etc/fstab. mount-share.service manages the
+# workspace disk lifecycle — it formats the raw qcow2 on first boot (blkid
+# guard), then mounts it explicitly. If fstab mounted workspace.mount, systemd
+# would fail permanently on first boot when the disk has no filesystem.
 
 # SSH: lightweight host key (ed25519-only), fast ciphers, root key auth
 RUN rm -f /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub && \
