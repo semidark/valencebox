@@ -1,23 +1,51 @@
 # AGENTS.md
 
+## Active: QEMU-backed microVM (`-machine pc` or `virt`)
+
+The product runs **QEMU** (`qemu-system-x86_64` or `qemu-system-aarch64` as a
+bundled host subprocess, 64-bit guest). **`sandbox/docs/qemu.md` is the source
+of truth.**
+
+Machine type selection:
+- **pc** (i440fx) on x86-64 — provides HPET + ACPI PM timer for TSC
+  calibration under TCG; microvm is not used (HPET-less microvm needs reliable
+  kvmclock which TCG cannot provide).
+- **virt** (GICv3) on aarch64 — works with both HVF and TCG.
+
+Acceleration auto-detects: `kvm` (Linux) / `hvf` (macOS) / `whpx` (Windows)
+with `tcg,thread=multi` fallback.
+
 ## Repo shape
 
-- **Product** is entirely in `sandbox/` (TypeScript/Electron). Root has no manifests; `cd sandbox` for all dev work.
-- `env86/` is a git submodule used **only to extract build-time v86 assets** (`libv86.js`, `v86.wasm`, `seabios.bin`, `vgabios.bin`). Do not edit `env86/` to change product behavior.
+- **Product** is entirely in `sandbox/` (TypeScript/Electron). Root has no
+  manifests; `cd sandbox` for all dev work.
+- QEMU is a **bundled binary** under `resources/qemu/<platform>/`, built by
+  `scripts/build-qemu.sh`.
 
-## Bootstrap (order matters)
+## Target architecture (QEMU) — summary
+
+Full detail in `sandbox/docs/qemu.md`. In brief:
+
+- Guest is **Ubuntu 24.04** (x86-64 or aarch64) with virtio-blk root + workspace
+  disks, direct kernel boot via QEMU, HTTP/WebDAV host share over loopback
+  SLIRP.
+- **Host↔guest share is plain HTTP over loopback SLIRP** (pure-Node server, no
+  TLS). The guest mirrors the HTTP share into the native qcow2 working tree
+  with **unison**.
+- **Host directory is canonical**; the qcow2 working tree is a fast synced cache.
+- Snapshots via **QMP `migrate` to a zstd file** (RAM + device state only; the
+  workspace is host-canonical and excluded).
+- Target platforms: **Linux + macOS + Windows** from day one.
+
+## Bootstrap
 
 ```sh
-git submodule update --init                  # fetch env86 submodule
-make -C env86 all                            # build v86 assets (Go + Docker required, slow first time)
 cd sandbox
 npm install
-npm run images                               # build guest (sync-agent Rust, Alpine 3.18.6, ext4 disks + kernel)
+npm run images                  # x86-64 + arm64 root.qcow2 + workspace.qcow2
 npm run build
-npm start                                    # launch Electron app
+npm start
 ```
-
-- `npm run images` builds Rust sync-agent targeting `i686-unknown-linux-musl`, spins up `--platform=linux/386` Alpine, extracts kernel/initramfs, generates two ext4 disks. Outputs are gitignored; regenerate rather than commit.
 
 ## Build
 
@@ -27,28 +55,74 @@ npm start                                    # launch Electron app
   - Adding renderer deps requires updating `copy-renderer.js` with the exact asset paths
   - No ESLint/Prettier config; match existing code style
 
+## Linux sandbox note
+
+- Electron's `chrome-sandbox` SUID helper requires root ownership + mode `4755`.
+  On dev machines where `sudo chown` is inconvenient, use
+  `npm run start:no-sandbox` instead of `npm start` (adds `--no-sandbox`).
+
 ## Testing
 
-- No umbrella test target. Run individual test suite: `npm run test:unit` (fast, pure); `test:boot|sync|snapshot|net|dataplane|e2e` (VM tests, need `npm run images` built first); `test:ui` (Electron offscreen).
-- Env knobs: `SCRATCH=/path` (test dirs, default `/tmp`), `VERBOSE=1` (stream guest serial).
+- No umbrella test target; run suites individually.
+- **Current suites:** `test:boot` (QEMU reaches serial login), `test:unit`
+  (guest-profile + golden-args), `test:qmp` (QMP protocol).
+- **Future suites** (see `docs/qemu.md` phase verifications): `test:share` (HTTP
+  share round-trip, no VM), `test:snapshot` (QMP migrate save/restore),
+  `test:e2e`, `test:ui`.
+- Env knobs: `SCRATCH=/path` (test dirs, default `/tmp`), `VERBOSE=1` (stream
+  guest serial). Add `ACCEL=tcg` to force software emulation in accel-agnostic
+  tests.
 
-## Cross-cutting constraints (easy to break)
+## SSH debug access
 
-- **Everything is 32-bit x86**: guest is Alpine **pinned to 3.18.6** (newer `mkinitfs` breaks boot); Rust agent must target `i686-unknown-linux-musl`.
-- `src/shared/protocol.ts` mirrors `guest/sync-agent-rust/src/frame.rs` framing — **change both together**; 256 KiB frame cap.
-- Disks are IDE (`/dev/sda|sdb`), not virtio-blk. Guest detects mount point via `blkid`.
-- `src/main/vm.ts` virtio-console writer is deliberately **paced** (<4 KiB slices, waits for free RX descriptor) — do not "optimize" it; v86 silently drops bytes if the ring is full.
-- Security invariants (no live host mount, DNS-gate + IP-pin egress allowlist) live in `HARDENING.md`. Preserve when touching `sync-manager.ts`, `wisp.ts`, `doh.ts`, `data-plane.ts`.
+When a VM is running (via `npm start` or `test:boot`), you can SSH in for
+interactive debugging.
+
+```sh
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p 2222 root@127.0.0.1
+```
+
+- Forwarded via `-netdev user,hostfwd=tcp:127.0.0.1:2222-:22`
+- Only Ed25519 host key; `chacha20-poly1305` cipher, `curve25519-sha256` kex
+- `vm-debug` SSH public key baked into `/root/.ssh/authorized_keys`
+- **TODO: gate behind a config flag before release** (currently always on)
+- Works as long as QEMU SSH hostfwd is active (i.e., the app is running)
+
+## Cross-cutting constraints
+
+- **Guest is x86-64 or aarch64.** No more `i686`; use virtio drivers.
+- **Disks are virtio-blk** (`/dev/vda` root, `/dev/vdb` workspace), not IDE.
+- **Host↔guest sync is WebDAV + unison** (poll-based). inotify cannot cross the
+  network share. Do not "fix" this with a filesystem passthrough — none works
+  on Windows.
+- **Host dir is canonical.** Treat the qcow2 working tree as a rebuildable
+  cache; never make it the sole source of truth.
+- **Bundle, don't assume.** QEMU binary + firmware blobs + guest images ship
+  inside the app; resolve paths via `process.resourcesPath` in production, dev
+  paths otherwise.
+- **Keep the accel fallback intact.** Always append `tcg,thread=multi` last so
+  hosts without KVM/HVF/WHPX still boot.
 
 ## Workspace sync
 
-- `WORKSPACE_DIR=~/src/project npm start` points guest `/workspace` at a host dir (synced bidirectionally, **not mounted**).
-- Never synced at any depth: `node_modules`, `.git`, `.DS_Store`, `.sync-tmp`, `lost+found`. Run `npm install` inside the guest.
-- Workspace disk is 512 MB.
+- `WORKSPACE_DIR=~/src/project npm start` points the guest `/workspace` at a
+  host dir served over plain-HTTP WebDAV and mirrored into the qcow2 working
+  tree by unison (**not** a live mount).
+- Never synced at any depth: `node_modules`, `.git`, `.DS_Store`,
+  `lost+found`. Run `npm install` inside the guest.
+- Workspace disk sizing via `WORKSPACE_MB=<n> npm run images`.
+
+## Egress config (sandbox.config.json)
+
+Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
+
+- Egress is **open** via `-nic user` (SLIRP). A filtering proxy is deferred
+  (see `docs/qemu.md` risk #5).
+- New config knobs per `docs/qemu.md`: `accel`, `workspaceDir`, `memMb`, `smp`.
 
 ## Key docs
 
-- `sandbox/README.md` — architecture overview, measured boot/hydrate/snapshot timings.
-- `PROTOCOL.md` — framed wire format between host and sync-agent.
+- **`sandbox/docs/qemu.md` — the rewrite plan and source of truth. Start here.**
+- `sandbox/README.md` — architecture overview.
 - `HARDENING.md` — security model and invariants.
-- `docs/data-plane-architecture.md` — why two sync channels (console + TCP), data-plane VIP trick, batching strategy.

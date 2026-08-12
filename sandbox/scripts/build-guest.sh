@@ -1,80 +1,157 @@
 #!/bin/sh
-# Build the guest: sync-agent → docker image → ext4 disk
-# images + kernel/initramfs extracted for direct v86 bzimage boot.
-# AGENT=(rust|go) selects which sync-agent to use (default: rust).
+# Build the Ubuntu guest rootfs for QEMU direct kernel boot.
+# Supports x86-64 (default) and arm64 (--arch arm64) targets.
+# Output: root.qcow2, vmlinuz.bin, initramfs.bin, workspace.qcow2
+# On arm64: root-arm64.qcow2, vmlinuz-arm64.bin, initramfs-arm64.bin, workspace-arm64.qcow2
 set -e
 cd "$(dirname "$0")/.."
 
-# TODO: remove AGENT switching and Go agent entirely once Rust is stable
-AGENT="${AGENT:-rust}"
-
-mkdir -p images assets/v86
-
-echo "==> copying v86 runtime assets from env86 submodule"
-ENV86_ASSETS="../env86/assets"
-missing=""
-for f in libv86.js v86.wasm seabios.bin vgabios.bin; do
-	if [ ! -f "$ENV86_ASSETS/$f" ]; then missing="$missing $f"; fi
+ARCH=""
+SUFFIX=""
+PLATFORM_FLAG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --arch)
+      shift
+      ARCH="$1"
+      shift
+      ;;
+    *)
+      echo "unknown option: $1"
+      echo "usage: $0 [--arch amd64|arm64]"
+      exit 1
+      ;;
+  esac
 done
-if [ -n "$missing" ]; then
-	echo "ERROR: env86 assets not built:$missing" >&2
-	echo "  Run first (from the repo root):" >&2
-	echo "    git submodule update --init && make -C env86 all" >&2
-	exit 1
+
+# Default to host architecture
+if [ -z "$ARCH" ]; then
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) echo "unsupported host arch: $ARCH"; exit 1 ;;
+  esac
 fi
-for f in libv86.js v86.wasm seabios.bin vgabios.bin; do
-	cp "$ENV86_ASSETS/$f" "assets/v86/$f"
-done
 
-if [ "$AGENT" = "go" ]; then
-  echo "==> building sync-agent (Go, linux/386)"
-  GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -C guest/sync-agent -o ../sync-agent.bin .
-  GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -C guest/sync-agent -o ../blake2sum.bin ./blake2sum/
+case "$ARCH" in
+  amd64)
+    SUFFIX=""
+    PLATFORM_FLAG="linux/amd64"
+    ;;
+  arm64)
+    SUFFIX="-arm64"
+    PLATFORM_FLAG="linux/arm64"
+    ;;
+  *)
+    echo "unsupported target arch: $ARCH (use amd64 or arm64)"
+    exit 1
+    ;;
+esac
+
+GUEST_ARCH_LABEL=$(echo "$ARCH" | sed 's/amd64/x86-64/')
+
+# Register QEMU user-mode emulators for cross-arch Docker builds (e.g., arm64 on
+# x86-64 host). Idempotent — safe to run every build.
+if [ "$ARCH" != "amd64" ]; then
+  docker run --privileged --rm tonistiigi/binfmt --install "$ARCH" 2>/dev/null || true
+fi
+
+# Resolve qemu-img: prefer bundled, fall back to PATH
+PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
+QEMU_IMG=./resources/qemu/$PLATFORM/qemu-img
+[ -x "$QEMU_IMG" ] || QEMU_IMG=qemu-img
+
+mkdir -p images
+
+echo "==> building guest docker image ($GUEST_ARCH_LABEL Ubuntu, linux-image-virtual)"
+if [ "$ARCH" = "arm64" ]; then
+  docker buildx build \
+    --platform="$PLATFORM_FLAG" \
+    -t sandbox-guest-"$ARCH" \
+    -f guest/Dockerfile \
+    --load \
+    guest
 else
-  echo "==> building sync-agent (Rust, i686-unknown-linux-musl, inside Docker)"
-  docker run --rm \
-    --platform=linux/amd64 \
-    -v "$PWD/guest/sync-agent-rust:/src" \
-    -v "$PWD/guest:/output" \
-    rust:alpine \
-    sh -c "
-      apk add musl-dev &&
-      rustup target add i686-unknown-linux-musl &&
-      cd /src &&
-      cargo build --target i686-unknown-linux-musl --release &&
-      cp target/i686-unknown-linux-musl/release/sync-agent /output/sync-agent.bin &&
-      cargo build --target i686-unknown-linux-musl --release --bin blake2sum &&
-      cp target/i686-unknown-linux-musl/release/blake2sum /output/blake2sum.bin
-    "
+  docker build \
+    --platform="$PLATFORM_FLAG" \
+    -t sandbox-guest \
+    -f guest/Dockerfile guest
 fi
-
-echo "==> building guest docker image"
-docker build \
-  --platform=linux/386 \
-  --build-arg AGENT="${AGENT}" \
-  -t sandbox-guest \
-  -f guest/Dockerfile guest
 
 echo "==> exporting rootfs"
-docker rm -f sandbox-export >/dev/null 2>&1 || true
-docker create --platform=linux/386 --name sandbox-export sandbox-guest >/dev/null
-docker export sandbox-export -o images/rootfs.tar
-docker rm sandbox-export >/dev/null
+docker rm -f sandbox-export-"$ARCH" >/dev/null 2>&1 || true
+docker create --platform="$PLATFORM_FLAG" --name sandbox-export-"$ARCH" \
+  $( [ "$ARCH" = "arm64" ] && echo "sandbox-guest-arm64" || echo "sandbox-guest" ) \
+  >/dev/null
+docker export sandbox-export-"$ARCH" -o images/rootfs"$SUFFIX".tar
+docker rm sandbox-export-"$ARCH" >/dev/null
 
-echo "==> creating ext4 images (inside container for mkfs.ext4 -d)"
-docker run --rm -v "$PWD/images:/images" alpine:3.20 sh -ec '
-	apk add -q e2fsprogs
-	mkdir /fs && tar -xf /images/rootfs.tar -C /fs
-	echo sandbox > /fs/etc/hostname
-	printf "127.0.0.1\tlocalhost sandbox\n" > /fs/etc/hosts
-	cp /fs/boot/vmlinuz-lts /images/vmlinuz.bin
-	cp /fs/boot/initramfs-lts /images/initramfs.bin
-	rm -rf /fs/boot/* /fs/.dockerenv
-	SZ=$(du -sm /fs | cut -f1); SZ=$((SZ + SZ / 4 + 64))
-	rm -f /images/alpine-root.img /images/workspace.img
-	mkfs.ext4 -q -d /fs -L sandboxroot /images/alpine-root.img "${SZ}M"
-	mkfs.ext4 -q -L workspace /images/workspace.img 512M
-	chmod 644 /images/*.img /images/vmlinuz.bin /images/initramfs.bin
-'
-rm -f images/rootfs.tar
-ls -lh images/
+echo "==> creating root${SUFFIX}.qcow2"
+rm -f "images/root${SUFFIX}.qcow2"
+# Clean stale root-owned .ssh from previous failed builds
+docker run --rm --platform=linux/amd64 \
+  -v /tmp:/tmproot \
+  ubuntu:24.04 sh -c "rm -rf /tmproot/sandbox-rootfs${SUFFIX} 2>/dev/null || true"
+mkdir -p "/tmp/sandbox-rootfs${SUFFIX}"
+tar -xf "images/rootfs${SUFFIX}.tar" -C "/tmp/sandbox-rootfs${SUFFIX}" --numeric-owner
+
+# Set hostname and hosts
+echo sandbox > "/tmp/sandbox-rootfs${SUFFIX}/etc/hostname"
+printf "127.0.0.1\tlocalhost sandbox\n" > "/tmp/sandbox-rootfs${SUFFIX}/etc/hosts"
+
+# Generate vm-debug SSH keypair and inject the public key into the guest.
+# The private key is saved to images/vm-debug for host-side SSH access.
+mkdir -p images
+if [ ! -f images/vm-debug ]; then
+  ssh-keygen -t ed25519 -f images/vm-debug -N '' -q -C 'vm-debug@valencebox'
+fi
+mkdir -p "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh"
+cp images/vm-debug.pub "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh/authorized_keys"
+chmod 700 "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh"
+chmod 600 "/tmp/sandbox-rootfs${SUFFIX}/root/.ssh/authorized_keys"
+
+# Remove unnecessary files before creating fs
+rm -f "/tmp/sandbox-rootfs${SUFFIX}/.dockerenv" 2>/dev/null || true
+
+# Extract kernel + initramfs from exported rootfs
+KREL=$(ls "/tmp/sandbox-rootfs${SUFFIX}/lib/modules" 2>/dev/null | head -1)
+if [ -z "$KREL" ]; then
+  echo "ERROR: no kernel modules found in exported rootfs" >&2
+  exit 1
+fi
+cp "/tmp/sandbox-rootfs${SUFFIX}/boot/vmlinuz-$KREL" "images/vmlinuz${SUFFIX}.bin"
+cp "/tmp/sandbox-rootfs${SUFFIX}/boot/initrd.img-$KREL" "images/initramfs${SUFFIX}.bin"
+rm -rf "/tmp/sandbox-rootfs${SUFFIX}/boot/*"
+
+# Root image size: at least 5 GiB for growth (qcow2 is sparse). 25% slack.
+MIN_ROOT_MB=5120
+SZ=$(du -sm "/tmp/sandbox-rootfs${SUFFIX}" | cut -f1); SZ=$((SZ + SZ / 4))
+[ "$SZ" -lt "$MIN_ROOT_MB" ] && SZ=$MIN_ROOT_MB
+
+# Create raw ext4 image via Docker, then convert to qcow2.
+# The mkfs container runs as root and fixes ownership of SSH authorized_keys
+# (created by the build user) inline before embedding them in the image.
+dd if=/dev/zero of="/tmp/sandbox-rootfs${SUFFIX}.img" bs=1M count="$SZ" status=none
+docker run --rm --platform="$PLATFORM_FLAG" \
+  -v "/tmp/sandbox-rootfs${SUFFIX}:/rootfs" \
+  -v "/tmp/sandbox-rootfs${SUFFIX}.img:/rootfs.img" \
+  ubuntu:24.04 sh -c '
+    apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null
+    chown -R root:root /rootfs/root/.ssh
+    mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img
+  '
+"$QEMU_IMG" convert -f raw -O qcow2 "/tmp/sandbox-rootfs${SUFFIX}.img" "images/root${SUFFIX}.qcow2"
+rm -f "/tmp/sandbox-rootfs${SUFFIX}.img"
+
+# Workspace disk
+WSZ="${WORKSPACE_MB:-1024}"
+rm -f "images/workspace${SUFFIX}.qcow2"
+"$QEMU_IMG" create -f qcow2 "images/workspace${SUFFIX}.qcow2" "${WSZ}M"
+
+# Clean up (root-owned .ssh from prior build may block host rm; ignore errors)
+rm -rf "/tmp/sandbox-rootfs${SUFFIX}" 2>/dev/null || true
+rm -f "images/rootfs${SUFFIX}.tar"
+
+echo "==> done"
+ls -lh images/ | grep -- "${SUFFIX}" || ls -lh images/

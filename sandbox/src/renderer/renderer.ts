@@ -18,6 +18,10 @@ interface SandboxAPI {
   onStatus(cb: (s: RStatus) => void): void;
   onSerial(cb: (chunk: string) => void): void;
   onConflict(cb: (c: RConflict) => void): void;
+  onPtyData(cb: (chunk: Uint8Array) => void): void;
+  onPtyClosed(cb: () => void): void;
+  sendPtyInput(data: Uint8Array): void;
+  sendPtyResize(cols: number, rows: number): void;
 }
 declare const Terminal: any;
 declare const FitAddon: any;
@@ -44,15 +48,39 @@ term.open($("term"));
 fitAddon.fit();
 (window as any).__term = term; // debug hook (same convention as the earlier window.vm)
 
-// guest serial output → terminal; keystrokes → guest serial line
-api.onSerial((chunk) => term.write(chunk));
+// guest serial output → terminal (boot/fallback); PTY output → terminal (primary)
+// PTY input is accepted as soon as usingPty is set, bypassing the isReady gate.
+let usingPty = false;
+let pendingPtyInput: string[] = [];
+api.onSerial((chunk) => { if (!usingPty) term.write(chunk); });
+api.onPtyData((chunk) => {
+  if (!usingPty) {
+    usingPty = true;
+    term.reset();
+    api.sendPtyResize(term.cols, term.rows);
+    for (const buf of pendingPtyInput) api.sendPtyInput(new TextEncoder().encode(buf));
+    pendingPtyInput = [];
+  }
+  term.write(chunk);
+});
+api.onPtyClosed(() => {
+  usingPty = false;
+  term.write("\r\n\x1b[33m[pty session ended — serial fallback]\x1b[0m\r\n");
+});
 let isReady = false;
-term.onData((data: string) => { if (isReady) api.sendInput(data); });
+term.onData((data: string) => {
+  if (usingPty) {
+    api.sendPtyInput(new TextEncoder().encode(data));
+  } else if (isReady) {
+    api.sendInput(data);
+  }
+});
 term.focus();
 
 const refit = () => {
   try {
     fitAddon.fit();
+    if (usingPty) api.sendPtyResize(term.cols, term.rows);
   } catch {
     /* container not laid out yet */
   }
