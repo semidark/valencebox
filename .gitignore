@@ -6,9 +6,19 @@ dist/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
+# QEMU configure probes (ephemeral build artifacts)
+config-temp/
+
+# QEMU build artifacts (scripts/build-qemu.sh)
+build/qemu/
+
 # sandbox app build artifacts (regenerate: npm run images && npm run build)
 sandbox/images/
-sandbox/guest/sync-agent.bin
-sandbox/assets/v86/
 sandbox/snapshots/
 sandbox/workspace/
+sandbox/build/
+
+# QEMU bundled binary + firmware (regenerate: scripts/build-qemu.sh (Linux) or scripts/build-qemu.ps1 (Windows))
+sandbox/resources/qemu/*
+# ...but keep source files (entitlements plist consumed by build-qemu.sh signing)
+!sandbox/resources/qemu/hvf-entitlement.plist

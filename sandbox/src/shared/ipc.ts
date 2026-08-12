@@ -2,6 +2,8 @@
 export interface SandboxStatus {
   phase: "boot" | "restore" | "hydrating" | "ready" | "stopped" | "error";
   bootMs?: number;
+  accel?: string;
+  accelAvailable?: boolean;
   restored?: boolean;
   guest?: { root: string; version: number };
   net?: { relayUrl: string; policyHosts: string[]; dataPlane?: boolean };
@@ -24,6 +26,12 @@ export interface ConflictRecordDTO {
   at: number;
 }
 
+export interface BalloonStatus {
+  currentMB: number;
+  ceilingMB: number;
+  minMB: number;
+}
+
 export const IPC = {
   getStatus: "sandbox:getStatus",
   onStatus: "sandbox:status",
@@ -31,4 +39,12 @@ export const IPC = {
   onConflict: "sandbox:conflict",
   saveSnapshot: "sandbox:saveSnapshot",
   serialInput: "sandbox:serialInput", // raw keystrokes renderer→guest serial (fire-and-forget)
+  // PTY terminal (opens after sandbox reaches "ready" phase)
+  onPtyData: "sandbox:pty:data", // guest→renderer: PTY output bytes
+  onPtyClosed: "sandbox:pty:closed", // guest→renderer: PTY session ended
+  ptyInput: "sandbox:pty:input", // renderer→guest: keystrokes (fire-and-forget)
+  ptyResize: "sandbox:pty:resize", // renderer→guest: {cols, rows}
+  // Memory balloon control
+  setBalloon: "sandbox:setBalloon", // renderer→main: set balloon to N MB
+  getBalloon: "sandbox:getBalloon", // renderer→main: get current balloon status → BalloonStatus
 } as const;

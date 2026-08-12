@@ -1,39 +1,46 @@
 {
   "name": "valencebox",
   "version": "0.1.0",
-  "description": "Secure v86 microVM coding sandbox for an AI agent (Electron)",
+  "description": "Secure QEMU microVM coding sandbox for an AI agent (Electron)",
   "main": "dist/main/main.js",
   "private": true,
   "license": "AGPL-3.0-only",
   "scripts": {
     "build": "tsc -p . && node scripts/copy-renderer.js",
     "start": "npm run build && electron .",
-    "test:unit": "tsx test/manifest.unit.ts && tsx test/hydrate-channel-switch.unit.ts",
+    "start:no-sandbox": "npm run build && electron . --no-sandbox",
+    "test:unit": "tsx test/guest-profile.unit.ts && tsx test/golden-args.unit.ts",
+    "test:qmp": "tsx test/qmp.test.ts",
     "test:boot": "tsx test/boot.test.ts",
-    "test:bridge": "tsx test/bridge.test.ts",
-    "test:sync": "tsx test/sync.test.ts",
-    "test:snapshot": "tsx test/snapshot.test.ts",
-    "test:net": "tsx test/net.test.ts",
-    "test:dataplane": "tsx test/dataplane.test.ts",
-    "test:e2e": "tsx test/e2e.test.ts",
     "test:ui": "electron test/ui-smoke.js",
-    "test:agent": "cargo test --manifest-path guest/sync-agent-rust/Cargo.toml",
-    "images": "./scripts/build-guest.sh"
+    "images": "./scripts/build-guest.sh",
+"images:all": "./scripts/build-guest.sh --arch amd64 && ./scripts/build-guest.sh --arch arm64",
+    "build:qemu": "bash ../scripts/build-qemu.sh"
   },
   "dependencies": {
     "@mercuryworkshop/wisp-js": "^0.4.1",
     "@mongodb-js/zstd": "^2.0.0",
+    "@nephele/adapter-file-system": "^1.0.0-alpha.67",
+    "@nephele/authenticator-custom": "^1.0.0-alpha.67",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "blakejs": "^1.2.1",
     "chokidar": "^4.0.0",
+    "nephele": "^1.0.0-alpha.67",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
-    "electron": "^37.0.0",
+    "electron": "^37.10.3",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "@mongodb-js/zstd@2.0.1": true,
+    "bufferutil@4.1.0": true,
+    "electron@37.10.3": true,
+    "esbuild@0.28.1": true
   }
 }

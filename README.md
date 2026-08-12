@@ -29,7 +29,7 @@ single allowlisted, proxied egress path.
 | Path | What it is |
 |------|------------|
 | [`sandbox/`](sandbox/) | **The product.** The Electron app: headless v86, virtio-console sync engine, Rust sync-agent guest, zstd snapshots, WISP egress. Start here — see [`sandbox/README.md`](sandbox/README.md). |
-| [`env86/`](https://github.com/progrium/env86) | Git submodule, used only as a **build tool**. The product copies four prebuilt v86 runtime assets (`libv86.js`, `v86.wasm`, `seabios.bin`, `vgabios.bin`) out of `env86/assets/`; it does not use the env86 CLI at runtime. |
+| [`v86/`](https://github.com/semidark/v86) | Git submodule, used only as a **build tool**. A fork of [`copy/v86`](https://github.com/copy/v86) carrying a small patch that bounds the disk `block_cache` used for `hda`/`hdb` (see [semidark/v86#1](https://github.com/semidark/v86/pull/1)) — without it, host memory grows unboundedly with cumulative guest disk I/O. `./scripts/build-v86.sh` builds four runtime assets (`libv86.js`, `v86.wasm`, `seabios.bin`, `vgabios.bin`) out of it into `build/v86/`; the product does not use any v86 CLI at runtime. |
 
 ## License
 
@@ -43,8 +43,8 @@ attributions of other bundled/vendored components (v86 assets, xterm.js).
 ## Quick start
 
 ```sh
-git submodule update --init   # fetch env86
-make -C env86 all             # build v86 assets (needs Go + Docker; slow first time)
+git submodule update --init   # fetch the v86 submodule
+./scripts/build-v86.sh        # build v86 assets (needs Docker; slow first time)
 
 cd sandbox
 npm install
@@ -63,6 +63,7 @@ Full build, test, and architecture docs live in
 
 ## Why 32-bit Alpine
 
-v86 emulates a **32-bit** x86 CPU only, so the guest is 32-bit Alpine (pinned
-to 3.18.6 — newer mkinitfs breaks boot here). 64-bit guests such as Fedora
+v86 emulates a **32-bit** x86 CPU only, so the guest is 32-bit Alpine
+(3.22.5 — mkinitfs nlplug-findfs in 3.19-era edge had an OpenSSL crash; 3.22
+mkinitfs links only libkmod/libblkid/libcryptsetup). 64-bit guests such as Fedora
 CoreOS cannot run on v86 regardless of build tricks.
