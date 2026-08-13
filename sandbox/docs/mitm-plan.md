@@ -224,3 +224,64 @@ upstream. Requires an ephemeral CA and on-the-fly leaf certificate generation.
   - Update `sandbox/README.md` with egress proxy config documentation
   - Update `AGENTS.md` with proxy usage notes
   - Update `sandbox/docs/qemu.md` risk table (risk #5 resolved)
+
+## Phase D — Security hardening (post-audit fixes)
+
+Security review findings and hardening items identified during the
+`feat/mitm-proxy` branch security audit. All HIGH and MEDIUM items should be
+resolved before merging to main.
+
+### Tasks
+
+- [x] **D1. Remove OPENSSL env var injection**
+  - `process.env.OPENSSL` allowed arbitrary binary execution as the CA signing
+    step, exposing the MITM CA private key. Hardcoded to `"openssl"`.
+  - File: `sandbox/src/main/egress-proxy.ts:353`
+
+- [x] **D2. Validate env_name in resolveSecrets()**
+  - Secret environment variable names from user config are validated against
+    `^[a-zA-Z_][a-zA-Z0-9_]*$` to prevent shell injection via the guest's
+    `mount-share.sh` eval path.
+  - File: `sandbox/src/main/egress-proxy.ts:101`
+
+- [x] **D3. Remove eval in mount-share.sh secrets parsing**
+  - Replaced `eval "export ${env_name}=\"${env_val}\""` with direct
+    `export "${env_name}=${env_val}"` and `printf` for the profile script.
+    Combined with D2, this closes the guest-side shell injection vector.
+  - File: `sandbox/guest/usr/local/libexec/mount-share.sh:104–109`
+
+- [x] **D4. Fix forwardRequest hardcoded port 443**
+  - Parses `req.url` as an absolute URL to extract the real target port and
+    path, instead of always forwarding to port 443. Also selects the correct
+    protocol module (`http` vs `https`) based on the URL scheme.
+  - File: `sandbox/src/main/egress-proxy.ts:570–608`
+
+- [x] **D5. Enforce allowPorts in CONNECT and forward handlers**
+  - The `allowPorts` field was defined in `EgressRuntimeConfig` but never
+    checked. Now both `handleConnect` and `forwardRequest` reject connections
+    to ports not in the allow list.
+  - Files: `sandbox/src/main/egress-proxy.ts:622`, `sandbox/src/main/egress-proxy.ts:560`
+
+- [x] **D6. Fix normalizeHost for bare IPv6 addresses**
+  - Bare IPv6 like `::1` was incorrectly stripped to empty string by the
+    port-stripping logic. Added a guard that detects multiple colons (IPv6)
+    before attempting port removal.
+  - File: `sandbox/src/main/egress-proxy.ts:35–43`
+
+- [ ] **D7. Pure-Node fallback for certificate generation**
+  - MITM CA and leaf cert generation currently require `openssl` on the host.
+    Implement a pure-Node fallback using Node's `crypto` module to eliminate
+    the subprocess dependency entirely.
+
+- [ ] **D8. Rate limiting and connection limits**
+  - Add configurable per-client rate limiting and max concurrent connections
+    to prevent resource exhaustion from a compromised guest.
+
+- [ ] **D9. Custom upstream CA support**
+  - Add a `caCert` option in `EgressConfig` to supply a custom CA bundle for
+    upstream connections that use internal/self-signed certificates.
+
+- [ ] **D10. Response header sanitization**
+  - Strip or rewrite `Strict-Transport-Security`, `Public-Key-Pins`, and
+    `Expect-CT` headers from upstream responses to prevent interference with
+    the proxy's MITM TLS termination.

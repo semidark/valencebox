@@ -4,6 +4,7 @@ import {
   resolveSecrets,
   rewriteHeaders,
   rewriteBody,
+  normalizeHost,
   PlaceholderViolation,
   EgressProxy,
 } from "../src/main/egress-proxy";
@@ -92,6 +93,23 @@ function assertThrows(fn: () => void, msg: string): void {
   assert(hostAllowed("pypi.org:443", "allowlist", ["pypi.org"], []), "allowlist port stripped");
   assert(hostAllowed("pypi.org:9999", "allowlist", ["pypi.org"], []), "allowlist non-standard port stripped");
   console.log("✓ hostAllowed: port stripped");
+}
+
+{
+  // Invalid env_name is rejected
+  assertThrows(() => {
+    resolveSecrets([{ env: "MY_SECRET'; rm -rf /; echo '", fromEnv: "TEST_SECRET", hosts: ["x.com"] }]);
+  }, "env_name with shell metacharacters throws");
+  assertThrows(() => {
+    resolveSecrets([{ env: "123invalid", fromEnv: "TEST_SECRET", hosts: ["x.com"] }]);
+  }, "env_name starting with digit throws");
+  assertThrows(() => {
+    resolveSecrets([{ env: "has space", fromEnv: "TEST_SECRET", hosts: ["x.com"] }]);
+  }, "env_name with space throws");
+  // Valid env_name is accepted
+  const valid = resolveSecrets([{ env: "MY_SECRET_2", value: "val", hosts: ["x.com"] }]);
+  assertEq(valid[0].env, "MY_SECRET_2", "valid env_name accepted");
+  console.log("✓ resolveSecrets: invalid env_name rejected");
 }
 
 // ---- generatePlaceholder ----
@@ -234,6 +252,24 @@ function assertThrows(fn: () => void, msg: string): void {
   const rewritten = rewriteBody(body, secrets);
   assert(rewritten === body, "body without placeholder returns same buffer");
   console.log("✓ rewriteBody: unchanged body returns same reference");
+}
+
+// ---- normalizeHost ----
+
+{
+  // IPv4 with port is stripped
+  assertEq(normalizeHost("example.com:8080"), "example.com", "IPv4 port stripped");
+  // IPv4 without port is unchanged
+  assertEq(normalizeHost("example.com"), "example.com", "IPv4 without port unchanged");
+  // IPv6 bracketed with port
+  assertEq(normalizeHost("[::1]:443"), "[::1]", "IPv6 bracketed port stripped");
+  // IPv6 bare (no port) is preserved
+  assertEq(normalizeHost("::1"), "::1", "IPv6 bare preserved");
+  // IPv6 bare with zone ID (no port)
+  assertEq(normalizeHost("fe80::1%eth0"), "fe80::1%eth0", "IPv6 with zone ID preserved");
+  // Trailing dot stripped
+  assertEq(normalizeHost("example.com."), "example.com", "trailing dot stripped");
+  console.log("✓ normalizeHost");
 }
 
 // ---- EgressRuntimeConfig structure ----
