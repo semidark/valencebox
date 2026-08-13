@@ -65,13 +65,14 @@ npm start
 
 - No umbrella test target; run suites individually.
 - **Current suites:** `test:boot` (QEMU reaches serial login), `test:unit`
-  (guest-profile + golden-args), `test:qmp` (QMP protocol).
+  (guest-profile + golden-args), `test:qmp` (QMP protocol), `test:egress`
+  (egress proxy policy, secrets, and MITM helpers).
 - **Future suites** (see `docs/qemu.md` phase verifications): `test:share` (HTTP
   share round-trip, no VM), `test:snapshot` (QMP migrate save/restore),
   `test:e2e`, `test:ui`.
-- Env knobs: `SCRATCH=/path` (test dirs, default `/tmp`), `VERBOSE=1` (stream
-  guest serial). Add `ACCEL=tcg` to force software emulation in accel-agnostic
-  tests.
+- Env knobs: `SCRATCH=/path` (test dirs, default `/tmp`), `VERBOSE=1` (verbose
+  logging everywhere — guest serial, WebDAV share requests, QMP events). Add
+  `ACCEL=tcg` to force software emulation in accel-agnostic tests.
 
 ## SSH debug access
 
@@ -96,6 +97,11 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 - **Host↔guest sync is WebDAV + unison** (poll-based). inotify cannot cross the
   network share. Do not "fix" this with a filesystem passthrough — none works
   on Windows.
+- **All guest HTTP/HTTPS egress goes through the host-process `EgressProxy`.**
+  No direct SLIRP routing past the proxy.
+- **WebDAV share traffic bypasses the proxy.** The guest sets
+  `no_proxy=127.0.0.1,localhost,10.0.2.2,::1`; the share server listens on the
+  SLIRP gateway address.
 - **Host dir is canonical.** Treat the qcow2 working tree as a rebuildable
   cache; never make it the sole source of truth.
 - **Bundle, don't assume.** QEMU binary + firmware blobs + guest images ship
@@ -117,12 +123,67 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 
 Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
 
-- Egress is **open** via `-nic user` (SLIRP). A filtering proxy is deferred
-  (see `docs/qemu.md` risk #5).
-- New config knobs per `docs/qemu.md`: `accel`, `workspaceDir`, `memMb`, `smp`.
+- Egress is **mediated by the host-process `EgressProxy`** running in the
+  Electron main process (`sandbox/src/main/egress-proxy.ts`). It implements an
+  HTTP CONNECT forward proxy plus plain HTTP forwarding, with per-session token
+  authentication and allowlist/denylist host filtering.
+- When `egress` is absent or `policy` is `"none"`, the proxy still starts but
+  allows all traffic (same behaviour as the old open SLIRP).
+- Example configuration:
+
+  ```jsonc
+  {
+    "egress": {
+      "policy": "allowlist",            // "allowlist" | "denylist" | "none"
+      "allowHosts": ["pypi.org", "*.pythonhosted.org"],
+      "denyHosts": [],
+      "allowPorts": [80, 443],          // not yet enforced
+      "allowAll": false,                // bypass all filtering
+      "enableMitm": false,              // TLS interception for secret injection
+      "listenPort": 0,                  // 0 = OS-assigned
+      "secrets": [
+        { "env": "GITHUB_TOKEN", "fromEnv": "GITHUB_TOKEN", "hosts": ["api.github.com"] }
+      ]
+    }
+  }
+  ```
+
+- The proxy listens on `0.0.0.0:<port>`; the guest reaches it via the SLIRP
+  gateway at `10.0.2.2:<port>` with `HTTP_PROXY`/`HTTPS_PROXY`.
+- The guest `no_proxy=127.0.0.1,localhost,10.0.2.2,::1` ensures WebDAV share
+  traffic bypasses the proxy.
+- **MITM TLS interception (Phase B) is complete.** When `enableMitm: true` and a
+  secret host is matched, the proxy TLS-terminates the connection, replaces
+  placeholders in headers/body, and re-encrypts to the upstream. Guest CA trust
+  is handled via `fw_cfg` — the CA cert is injected into the guest at boot and
+  installed via `update-ca-certificates`. MITM currently requires `openssl` on
+  the host for certificate generation (pure-Node fallback tracked in Phase C).
+- Other config knobs per `docs/qemu.md`: `accel`, `workspaceDir`, `memMb`,
+  `smp`, `balloonMinMb`.
+
+## Egress proxy files
+
+- `sandbox/src/main/egress-proxy.ts` — proxy server, policy checks, placeholder
+  rewriting, MITM CA/leaf helpers.
+- `sandbox/src/config.ts` — `EgressConfig`, `EgressRuntimeConfig`, `SecretSpec`,
+  `ResolvedSecret`.
+- `sandbox/src/main/main.ts` — builds runtime config, starts/stops proxy,
+  passes proxy port/token to `VmManager`.
+- `sandbox/src/main/qemu.ts` — emits `valencebox.proxy_port`,
+  `valencebox.proxy_token`, `valencebox.secrets` on the kernel cmdline.
+  WebDAV share config and MITM CA cert passed via `-fw_cfg` entries.
+- `sandbox/guest/usr/local/libexec/mount-share.sh` — guest boot script that
+  reads the cmdline and `fw_cfg`, writes `/etc/profile.d/valencebox-proxy.sh`,
+  installs MITM CA cert, and starts unison sync.
+- `sandbox/test/egress-proxy.unit.ts` — unit tests (`npm run test:egress`).
+- `sandbox/test/egress-proxy.integration.ts` — integration tests (CA gen, auth,
+  policy, MITM secret injection). Run with `NODE_TLS_REJECT_UNAUTHORIZED=0 npx tsx test/egress-proxy.integration.ts`.
+- `sandbox/docs/mitm-plan.md` — implementation plan.
+- `sandbox/HARDENING.md` — security invariants.
 
 ## Key docs
 
 - **`sandbox/docs/qemu.md` — the rewrite plan and source of truth. Start here.**
+- `sandbox/docs/mitm-plan.md` — MITM egress proxy plan and current status.
 - `sandbox/README.md` — architecture overview.
-- `HARDENING.md` — security model and invariants.
+- `sandbox/HARDENING.md` — security model and invariants.

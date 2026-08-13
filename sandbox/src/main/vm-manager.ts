@@ -19,6 +19,11 @@ export interface VmManagerOptions {
   workspaceImage?: string;
   sharePort?: number;
   shareToken?: string;
+  shareConfigFile?: string;
+  proxyPort?: number;
+  proxyToken?: string;
+  proxySecrets?: string;
+  mitmCaFile?: string;
   balloonMinMb?: number;
 }
 

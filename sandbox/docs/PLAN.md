@@ -9,26 +9,21 @@ phases.
 
 ## Execution order
 
-Phases 1-5 are complete (x86_64 guest on Apple Silicon under TCG). The remaining
-phases execute in numeric order:
+Phases 1–9 are complete. Phases 10 and 11 are deferred.
 
 ```
-Phase 6  — Tests And Cleanup (lock in the x86_64 TCG fallback)
-Phase 7  — Multi-Arch Build And Runtime Abstraction
-Phase 8  — Ubuntu Guest Migration (all platforms, x86_64)
-Phase 9  — Accelerated aarch64 Ubuntu Guest (HVF, Apple Silicon)
-Phase 10 — x86_64 Userspace Support Via FEX
-Phase 11 — Packaging Readiness (signing + notarization, last)
+Phase 1  — Darwin QEMU Build Pipeline               ✓
+Phase 2  — Runtime Resource Resolution               ✓
+Phase 3  — Apple Silicon Runtime Policy              ✓
+Phase 4  — Apple Silicon Bring-Up                    ✓
+Phase 5  — Functional Parity On macOS                ✓
+Phase 6  — Tests And Cleanup                         ✓
+Phase 7  — Multi-Arch Build And Runtime Abstraction  ✓
+Phase 8  — Ubuntu Guest Migration (all platforms)    ✓
+Phase 9  — Accelerated aarch64 Ubuntu Guest (HVF)    ✓
+Phase 10 — x86_64 Userspace Support Via FEX          ⎯ deferred
+Phase 11 — Packaging Readiness (signing/notarization) ⎯ deferred
 ```
-
-This is a reorder from earlier drafts:
-- Packaging/signing (once Phase 7) runs last, after FEX works.
-- The Alpine→Ubuntu migration is split back out of the aarch64 work into its own
-  **Phase 8**, targeting **all platforms** (not just macOS). Ubuntu becomes the
-  default guest OS for every QEMU target — replacing Alpine on the x86_64 TCG
-  path first, before any aarch64 work begins.
-- The accelerated aarch64 guest (**Phase 9**) then builds on the already-migrated
-  Ubuntu base as a `linux/arm64` variant, rather than introducing a new distro.
 
 ## Decisions
 
@@ -119,7 +114,7 @@ Notes:
 
 Goal: make the app reliably use bundled QEMU assets in dev and packaged modes.
 
-- [ ] Update `src/main/asset-paths.ts` to distinguish repo-root dev paths from
+- [x] Update `src/main/asset-paths.ts` to distinguish repo-root dev paths from
   packaged `process.resourcesPath` paths.
 - [x] Resolve the bundled darwin QEMU binary from
   `resources/qemu/darwin/qemu-system-x86_64`.

@@ -1,12 +1,14 @@
-// Electron main process: owns the HTTP share + VmManager (QEMU), bridges to renderer.
+// Electron main process: owns the HTTP share + egress proxy + VmManager (QEMU),
+// bridges to renderer.
 import { app, BrowserWindow, ipcMain } from "electron";
 import * as fs from "fs";
 import * as path from "path";
 import { VmManager } from "./vm-manager";
 import { HttpShare } from "./http-share";
+import { EgressProxy, resolveSecrets, generatePlaceholder } from "./egress-proxy";
 import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
-import { SandboxAppConfig } from "../config";
+import { SandboxAppConfig, EgressRuntimeConfig } from "../config";
 import { GuestArch, selectGuest, x86_64Profile, aarch64Profile } from "./guest-profile";
 
 function loadAppConfig(root: string): SandboxAppConfig {
@@ -26,9 +28,38 @@ function resolveWorkspaceDir(cfg: SandboxAppConfig, tmpDir: string): string {
   return isolated;
 }
 
+/**
+ * Build the egress proxy runtime config from the app config.
+ * Resolves secret values (inline or from host env), picks a random port, and
+ * generates an auth token.
+ */
+function buildProxyConfig(cfg: SandboxAppConfig): EgressRuntimeConfig {
+  const egress = cfg.egress || {};
+
+  const resolvedSecrets = egress.secrets ? resolveSecrets(egress.secrets) : [];
+
+  const authToken = generatePlaceholder(); // random hex token for proxy auth
+
+  // Use port from config if specified, otherwise let the OS assign one.
+  const port = egress.listenPort ?? 0;
+
+  return {
+    policy: egress.policy ?? "none",
+    allowHosts: egress.allowHosts ?? [],
+    denyHosts: egress.denyHosts ?? [],
+    allowPorts: egress.allowPorts ?? [80, 443],
+    allowAll: egress.allowAll ?? false,
+    enableMitm: egress.enableMitm ?? false,
+    secrets: resolvedSecrets,
+    port,
+    authToken,
+  };
+}
+
 let win: BrowserWindow | null = null;
 let vm: VmManager | null = null;
 let share: HttpShare | null = null;
+let proxy: EgressProxy | null = null;
 let detectedAccel: { name: string; available: boolean } | undefined;
 
 async function createWindow() {
@@ -127,6 +158,32 @@ async function startVm() {
         path.join(assetPaths.imagesDir(), "initramfs.bin"),
       );
 
+  // ---- Egress proxy setup ----
+  const proxyCfg = buildProxyConfig(appCfg);
+  // buildProxyConfig already returns port=0 (OS-assign) unless egress.listenPort is set.
+  const caDir = path.join(app.getPath("userData"), "mitm-ca");
+  proxy = new EgressProxy(proxyCfg, caDir);
+  await proxy.start();
+  const proxyPort = proxy.port;
+  console.log(`[egress-proxy] listening on 0.0.0.0:${proxyPort} (policy=${proxyCfg.policy})`);
+
+  // Write WebDAV share config to a temp file for delivery via QEMU fw_cfg.
+  const shareConfigFile = path.join(tmpDir, "share-config.json");
+  fs.writeFileSync(shareConfigFile, JSON.stringify({ port: shareCfg.port, token: shareCfg.token }), { mode: 0o600 });
+
+  // If MITM is enabled, copy the CA cert for delivery via fw_cfg.
+  let mitmCaFile: string | undefined;
+  if (proxy.runtimeConfig.enableMitm && proxy.ca) {
+    mitmCaFile = path.join(tmpDir, "mitm-ca.pem");
+    fs.copyFileSync(proxy.ca.cert, mitmCaFile);
+    fs.chmodSync(mitmCaFile, 0o600);
+    console.log(`[egress-proxy] CA cert copied for fw_cfg: ${mitmCaFile}`);
+  }
+
+  // Build secret placeholders string for the guest kernel cmdline.
+  // Format: env=placeholder,env2=placeholder2 (URL-safe, no spaces)
+  const secretPlaceholders = proxyCfg.secrets.map((s) => `${s.env}=${s.placeholder}`).join(",");
+
   vm = new VmManager({
     memoryMB: appCfg.memMb ?? 4096,
     smp: appCfg.smp ?? 2,
@@ -136,9 +193,12 @@ async function startVm() {
     kernelCmdline: profile.kernelCmdline,
     rootImage,
     workspaceImage,
-    sharePort: shareCfg.port,
-    shareToken: shareCfg.token,
+    shareConfigFile,
+    mitmCaFile,
     balloonMinMb: appCfg.balloonMinMb,
+    proxyPort,
+    proxyToken: proxyCfg.authToken,
+    proxySecrets: secretPlaceholders,
   });
 
   vm.on("serial:data", (chunk: string) => sendToWindow(IPC.onSerial, chunk));
@@ -191,6 +251,7 @@ app.on("before-quit", (e) => {
   void (async () => {
     try {
       await vm?.stop();
+      await proxy?.stop();
       await share?.stop();
     } catch (err) {
       console.error("[qemu] failed to stop cleanly:", err);
