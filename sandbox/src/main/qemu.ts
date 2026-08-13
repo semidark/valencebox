@@ -21,6 +21,11 @@ export interface QemuOptions {
   workspaceImage?: string;
   sharePort?: number;
   shareToken?: string;
+  shareConfigFile?: string;
+  proxyPort?: number;
+  proxyToken?: string;
+  proxySecrets?: string;
+  mitmCaFile?: string;
 }
 
 export interface QemuStats {
@@ -270,10 +275,23 @@ export class QemuProcess extends EventEmitter {
     if (opts.kernelCmdline) {
       const extra = profile.extraCmdline(machineType);
       let cmdline = extra ? `${opts.kernelCmdline} ${extra}` : opts.kernelCmdline;
-      if (opts.sharePort && opts.shareToken) {
-        cmdline += ` valencebox.port=${opts.sharePort} valencebox.token=${opts.shareToken}`;
+      // Share config is passed via fw_cfg below, not on cmdline.
+      if (opts.proxyPort && opts.proxyToken) {
+        cmdline += ` valencebox.proxy_port=${opts.proxyPort} valencebox.proxy_token=${opts.proxyToken}`;
+        if (opts.proxySecrets) {
+          cmdline += ` valencebox.secrets=${opts.proxySecrets}`;
+        }
       }
       args.push("-append", cmdline);
+    }
+
+    // fw_cfg entries: pass sensitive guest boot config outside the visible
+    // command line.
+    if (opts.shareConfigFile) {
+      args.push("-fw_cfg", `name=opt/org.valencebox.config,file=${opts.shareConfigFile}`);
+    }
+    if (opts.mitmCaFile) {
+      args.push("-fw_cfg", `name=opt/org.valencebox.mitm-ca,file=${opts.mitmCaFile}`);
     }
 
     const suffix = profile.virtioSuffix(machineType);
