@@ -5,6 +5,7 @@ import { Duplex } from "stream";
 import * as tls from "tls";
 import * as crypto from "crypto";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret } from "../config";
 
@@ -99,10 +100,18 @@ export function generatePlaceholder(): string {
   return "psbx-sec-" + crypto.randomBytes(12).toString("hex");
 }
 
+function resolvePath(p: string): string {
+  // Expand ~ to the user's home directory.
+  if (p.startsWith("~")) {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
+
 /**
- * Resolve secrets from a config: read inline `value` or `fromEnv`, generate placeholders.
+ * Resolve secrets from a config: read inline `value`, `fromFile`, or `fromEnv`, generate placeholders.
  */
-export function resolveSecrets(secrets: { env: string; value?: string; fromEnv?: string; hosts: string[] }[]): ResolvedSecret[] {
+export function resolveSecrets(secrets: { env: string; value?: string; fromFile?: string; fromEnv?: string; hosts: string[] }[]): ResolvedSecret[] {
   return secrets.map((spec) => {
     // Validate env_name: must be a valid POSIX environment variable name.
     if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(spec.env)) {
@@ -113,6 +122,20 @@ export function resolveSecrets(secrets: { env: string; value?: string; fromEnv?:
 
     if (spec.value !== undefined) {
       value = spec.value;
+    } else if (spec.fromFile !== undefined) {
+      const filePath = resolvePath(spec.fromFile);
+      try {
+        value = fs.readFileSync(filePath, "utf-8").trimEnd();
+      } catch (err: any) {
+        const msg = `egress secret '${spec.env}': failed to read file '${filePath}': ${err.message}`;
+        console.error("[egress-proxy]", msg);
+        throw new Error(msg);
+      }
+      if (value === "") {
+        const msg = `egress secret '${spec.env}': file '${filePath}' is empty`;
+        console.error("[egress-proxy]", msg);
+        throw new Error(msg);
+      }
     } else if (spec.fromEnv !== undefined) {
       value = process.env[spec.fromEnv];
       if (value === undefined || value === "") {
@@ -121,7 +144,7 @@ export function resolveSecrets(secrets: { env: string; value?: string; fromEnv?:
         throw new Error(msg);
       }
     } else {
-      throw new Error(`egress secret '${spec.env}': must specify either 'value' or 'fromEnv'`);
+      throw new Error(`egress secret '${spec.env}': must specify 'value', 'fromFile', or 'fromEnv'`);
     }
 
     return {

@@ -21,6 +21,14 @@ export interface SecretSpec {
   fromEnv?: string;
 
   /**
+   * Read the secret value from a file on disk. The path supports `~` for the
+   * user's home directory. The file is read at app startup and trailing
+   * newlines are stripped. Preferred over inline `value` and `fromEnv` for
+   * secrets managed by external tools (e.g. 1password CLI, gpg).
+   */
+  fromFile?: string;
+
+  /**
    * Host patterns where this secret may be injected.
    * Supports wildcard: `*.openai.com`, `api.github.com`.
    */
