@@ -116,10 +116,12 @@ host-process forward proxy (`EgressProxy`). Configure it via
     "denyHosts": [],
     "enableMitm": false,              // TLS interception for secret injection
     "secrets": [
-      // Inline value:
+      // Inline value (caution — stored in config file):
       { "env": "MY_SECRET",    "value": "s3cr3t",                "hosts": ["service.example.com"] },
-      // Read from host environment at startup:
+      // Read from host environment variable at startup:
       { "env": "GITHUB_TOKEN", "fromEnv": "GITHUB_TOKEN",        "hosts": ["api.github.com"] },
+      // Read from a file on disk at startup (supports ~ expansion):
+      { "env": "NPM_TOKEN",    "fromFile": "~/.secrets/npm.key", "hosts": ["registry.npmjs.org"] },
     ]
   }
 }
@@ -131,7 +133,7 @@ host-process forward proxy (`EgressProxy`). Configure it via
 | `allowHosts` | `[]` | Hostnames/wildcards allowed (when policy is `"allowlist"`) |
 | `denyHosts` | `[]` | Hostnames/wildcards always blocked |
 | `enableMitm` | `false` | When `true`, TLS connections to secret hosts are intercepted, placeholders replaced with real secrets, and re-encrypted upstream |
-| `secrets` | `[]` | List of credential specs: `env` (guest var name), `value` or `fromEnv` (host env), `hosts` (which hosts trigger MITM) |
+| `secrets` | `[]` | List of credential specs: `env` (guest var name), `value` / `fromFile` / `fromEnv` (source), `hosts` (which hosts trigger MITM). Priority: `value` > `fromFile` > `fromEnv` |
 
 ### How MITM works
 
