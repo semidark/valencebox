@@ -32,12 +32,18 @@ function constantTimeEqual(a: string, b: string): boolean {
 /**
  * Normalize a host string: lowercase, strip trailing dot, strip port.
  */
-function normalizeHost(host: string): string {
+export function normalizeHost(host: string): string {
   let h = host.toLowerCase().replace(/\.$/, "");
-  // Strip port if present (IPv6-safe by looking for last colon)
   const colonIdx = h.lastIndexOf(":");
-  if (colonIdx > 0 && h[colonIdx - 1] !== "]") {
-    h = h.substring(0, colonIdx);
+  if (colonIdx > 0) {
+    if (h[colonIdx - 1] === "]" && colonIdx < h.length - 1) {
+      // Bracketed IPv6 with port: [::1]:443 → strip port.
+      h = h.substring(0, colonIdx);
+    } else if (h[colonIdx - 1] !== "]" && h.indexOf(":") === colonIdx) {
+      // Single colon → host:port format; strip the port.
+      h = h.substring(0, colonIdx);
+    }
+    // Otherwise it's bare IPv6 (e.g. ::1) — leave untouched.
   }
   return h;
 }
@@ -98,6 +104,11 @@ export function generatePlaceholder(): string {
  */
 export function resolveSecrets(secrets: { env: string; value?: string; fromEnv?: string; hosts: string[] }[]): ResolvedSecret[] {
   return secrets.map((spec) => {
+    // Validate env_name: must be a valid POSIX environment variable name.
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(spec.env)) {
+      throw new Error(`egress secret: invalid environment variable name '${spec.env}'`);
+    }
+
     let value: string | undefined;
 
     if (spec.value !== undefined) {
@@ -350,7 +361,7 @@ export function ensureLeafCertificate(
   // CSR config
   const csrSubject = `/CN=${normalized}/O=ValenceBox`;
 
-  const opensslPath = process.env.OPENSSL || "openssl";
+  const opensslPath = "openssl";
 
   // Generate CSR
   const csrResult = spawnSync(opensslPath, [
@@ -568,25 +579,43 @@ export class EgressProxy {
   }
 
   private async forwardRequest(req: http.IncomingMessage, res: http.ServerResponse, targetHost: string): Promise<void> {
-    const url = req.url || "/";
-    const options: https.RequestOptions = {
+    const rawUrl = req.url || "/";
+
+    // In forward proxy mode, req.url is an absolute URL (e.g. http://host:port/path).
+    // Parse it to extract the correct hostname, port, and path.
+    let port = 80;
+    let path = rawUrl;
+    let useTls = false;
+    try {
+      const parsed = new URL(rawUrl);
+      port = parseInt(parsed.port, 10) || (parsed.protocol === "https:" ? 443 : 80);
+      path = parsed.pathname + parsed.search;
+      useTls = parsed.protocol === "https:";
+    } catch {
+      // Origin-form request; keep defaults.
+    }
+
+    // Enforce allowPorts if configured.
+    if (this.config.allowPorts.length > 0 && !this.config.allowPorts.includes(port)) {
+      this.send403(res, `port ${port} is not allowed`);
+      return;
+    }
+
+    const options: http.RequestOptions = {
       hostname: targetHost,
-      port: 443,
-      path: url,
+      port,
+      path,
       method: req.method,
       headers: { ...req.headers },
-      rejectUnauthorized: true,
     };
 
     // Strip proxy-specific headers before forwarding.
     delete (options.headers as any)["proxy-authorization"];
     delete (options.headers as any)["proxy-connection"];
 
-    // Determine if this is HTTP or HTTPS based on target port.
-    const isHttps = parseInt(String(options.port)) === 443 || targetHost.endsWith(":443");
-
     return new Promise((resolve, reject) => {
-      const forwardReq = (isHttps ? https : http).request(options, (forwardRes) => {
+      const mod = useTls ? https : http;
+      const forwardReq = mod.request(options, (forwardRes) => {
         res.writeHead(forwardRes.statusCode || 200, forwardRes.headers);
         forwardRes.pipe(res);
         resolve();
@@ -596,10 +625,8 @@ export class EgressProxy {
         reject(err);
       });
 
-      // If there's a request body, pipe it (with secret replacement for MITM hosts).
+      // If there's a request body, pipe it.
       if (req) {
-        // For now, just pipe directly (no MITM on plain HTTP proxy for Phase A).
-        // Phase B will add body rewriting for MITM-enabled secret hosts.
         req.pipe(forwardReq);
       } else {
         forwardReq.end();
@@ -623,6 +650,14 @@ export class EgressProxy {
     if (!this.config.allowAll && !hostAllowed(targetHost, this.config.policy, this.config.allowHosts, this.config.denyHosts)) {
       this.log("DENY", "CONNECT", `${targetHost}:${targetPort}`, "host blocked by policy");
       clientSocket.write(`HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nEgress denied: host '${targetHost}' is not allowed\n`);
+      clientSocket.end();
+      return;
+    }
+
+    // Port check.
+    if (this.config.allowPorts.length > 0 && !this.config.allowPorts.includes(targetPort)) {
+      this.log("DENY", "CONNECT", `${targetHost}:${targetPort}`, "port blocked by policy");
+      clientSocket.write(`HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nEgress denied: port ${targetPort} is not allowed\n`);
       clientSocket.end();
       return;
     }
