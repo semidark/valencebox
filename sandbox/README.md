@@ -178,8 +178,9 @@ For integration tests (CA generation, CONNECT policy, MITM secret injection):
 NODE_TLS_REJECT_UNAUTHORIZED=0 npx tsx test/egress-proxy.integration.ts
 ```
 
-Set `SCRATCH=/path` to control where tests write host dirs (default `/tmp`),
-`VERBOSE=1` to stream the guest serial console.
+Set `SCRATCH=/path` to control where tests write host dirs (default `/tmp`).
+`VERBOSE=1` enables verbose logging throughout the app: streams guest serial
+in boot tests, requests in the WebDAV share server, and QMP events.
 
 ### Measured results (this machine, Apple Silicon)
 

@@ -26,9 +26,11 @@ export class HttpShare {
     const app = express();
     // Log every WebDAV request method, path, and response status
     app.use((req, res, next) => {
-      res.on("finish", () => {
-        console.log(`[share] ${req.method} ${req.originalUrl} -> ${res.statusCode}`);
-      });
+      if (process.env.VERBOSE) {
+        res.on("finish", () => {
+          console.log(`[share] ${req.method} ${req.originalUrl} -> ${res.statusCode}`);
+        });
+      }
       next();
     });
     app.use(
