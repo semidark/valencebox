@@ -717,28 +717,30 @@ export class EgressProxy {
       cert: fs.readFileSync(leaf.cert),
     });
 
+    // Enable TCP keepalive on the client TLS socket so intermediate NAT /
+    // firewalls don't tear down long-lived SSE streams.
+    clientTls.setKeepAlive(true, 15000);
+
     // Track errors and handshake outcome.
-    let handshakeFailed = false;
+    let handshakeComplete = false;
     clientTls.on("error", (err) => {
-      handshakeFailed = true;
-      this.log("ERROR", "MITM", `${targetHost}:${targetPort}`, `TLS handshake failed: ${err.message}`);
+      const phase = handshakeComplete ? "client TLS error" : "TLS handshake failed";
+      this.log("ERROR", "MITM", `${targetHost}:${targetPort}`, `${phase}: ${err.message}`);
       clientTls.destroy();
     });
 
-    // Hand the TLS socket to the mitmServer immediately so its connection handler
-    // starts reading from the socket (which triggers the underlying TCP read and
-    // completes the TLS handshake).
-    mitmTargetMap.set(clientTls, { host: targetHost, port: targetPort });
-    this.mitmServer.emit("connection", clientTls);
-
-    // Wait for the TLS handshake (with 5s timeout).
-    await new Promise<void>((resolve) => {
+    // A server-side TLSSocket emits "secure", not the client-side
+    // "secureConnect" event. Register before handing the socket to the HTTP
+    // server so a fast handshake cannot race past the listener.
+    const handshake = new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
-        handshakeFailed = true;
+        this.log("ERROR", "MITM", `${targetHost}:${targetPort}`, "TLS handshake timed out");
         clientTls.destroy();
         resolve();
       }, 5000);
-      clientTls.once("secureConnect", () => {
+
+      clientTls.once("secure", () => {
+        handshakeComplete = true;
         clearTimeout(timer);
         resolve();
       });
@@ -746,9 +748,20 @@ export class EgressProxy {
         clearTimeout(timer);
         resolve();
       });
+      clientTls.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
     });
 
-    if (handshakeFailed) {
+    // Hand the TLS socket to the mitmServer immediately so its connection handler
+    // starts reading from the socket (which triggers the underlying TCP read and
+    // completes the TLS handshake).
+    mitmTargetMap.set(clientTls, { host: targetHost, port: targetPort });
+    this.mitmServer.emit("connection", clientTls);
+    await handshake;
+
+    if (!handshakeComplete) {
       return;
     }
 
@@ -799,6 +812,26 @@ export class EgressProxy {
       const rewrittenHeaders = rewriteHeaders(rawHeaders, this.config.secrets, targetHost);
       const rewrittenBody = rewriteBody(body, this.config.secrets);
 
+      // Fix Content-Length if body size changed after placeholder replacement.
+      const origContentLength = req.headers["content-length"];
+      if (rewrittenBody !== body && origContentLength) {
+        const origLen = parseInt(origContentLength, 10);
+        // Remove the stale Content-Length; Node.js will recalculate (or we set the correct value).
+        let clRemoved = false;
+        for (let i = 0; i < rewrittenHeaders.length; i++) {
+          if (rewrittenHeaders[i][0].toLowerCase() === "content-length") {
+            rewrittenHeaders[i][1] = rewrittenBody.length.toString();
+            clRemoved = true;
+            break;
+          }
+        }
+        if (!clRemoved) {
+          rewrittenHeaders.push(["content-length", rewrittenBody.length.toString()]);
+        }
+        this.log("DEBUG", method, `${targetHost}:${targetPort}`,
+          `Content-Length adjusted: ${origLen} → ${rewrittenBody.length}`);
+      }
+
       // Forward to the upstream server over TLS.
       const upstreamReq = https.request({
         hostname: targetHost,
@@ -808,13 +841,62 @@ export class EgressProxy {
         headers: Object.fromEntries(rewrittenHeaders),
         rejectUnauthorized: process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0",
       }, (upstreamRes) => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+        const statusCode = upstreamRes.statusCode || 200;
+        this.log("MITM", method, `${targetHost}:${targetPort}`, `upstream responded ${statusCode}`);
+        res.writeHead(statusCode, upstreamRes.headers);
+
+        // Log all upstream response events for debugging SSE terminations.
+        const upTag = `upstream:${method}:${targetHost}:${targetPort}`;
+        let clientDisconnected = false;
+        upstreamRes.on("end", () => this.log("DEBUG", upTag, "", "upstreamRes 'end'"));
+        upstreamRes.on("error", (err) => {
+          this.log("ERROR", upTag, "", `upstreamRes 'error': ${err.message}`);
+          res.destroy();
+          upstreamReq.destroy();
+        });
+        upstreamRes.on("pause", () => this.log("DEBUG", upTag, "", "upstreamRes 'pause' (backpressure)"));
+        upstreamRes.on("resume", () => this.log("DEBUG", upTag, "", "upstreamRes 'resume'"));
+        upstreamRes.on("close", () => {
+          this.log("DEBUG", upTag, "", `upstreamRes 'close' (complete=${upstreamRes.complete}, errored=${!!upstreamRes.errored})`);
+          if (!upstreamRes.complete && !clientDisconnected) {
+            this.log("ERROR", upTag, "", `upstream connection dropped mid-stream`);
+            res.destroy();
+            upstreamReq.destroy();
+          }
+        });
+
+        // Log client response events.
+        const cliTag = `client:${method}:${targetHost}:${targetPort}`;
+        res.on("close", () => {
+          const ended = res.writableEnded;
+          if (!ended) clientDisconnected = true;
+          this.log("DEBUG", cliTag, "", `res 'close' (writableEnded=${ended})`);
+          if (!ended) {
+            this.log("ERROR", cliTag, "", `client disconnected before response completed (upstream status ${statusCode})`);
+          }
+          upstreamRes.destroy();
+          upstreamReq.destroy();
+        });
+        res.on("finish", () => this.log("DEBUG", cliTag, "", "res 'finish'"));
+        res.on("drain", () => this.log("DEBUG", cliTag, "", "res 'drain'"));
+
         upstreamRes.pipe(res);
       });
 
       upstreamReq.on("error", (err) => {
         this.log("ERROR", method, `${targetHost}:${targetPort}`, `upstream error: ${err.message}`);
         this.sendMitmError(res, 502, `Bad Gateway: ${err.message}`);
+      });
+
+      // Enable TCP keepalive on the upstream socket.
+      // Must handle both sync (pool reuse) and async (new conn) socket assignment.
+      if (upstreamReq.socket) {
+        upstreamReq.socket.setKeepAlive(true, 15000);
+        this.log("DEBUG", method, `${targetHost}:${targetPort}`, "keepalive set on pre-existing socket");
+      }
+      upstreamReq.on("socket", (socket) => {
+        socket.setKeepAlive(true, 15000);
+        this.log("DEBUG", method, `${targetHost}:${targetPort}`, "keepalive set on socket (async)");
       });
 
       upstreamReq.write(rewrittenBody);
@@ -849,6 +931,7 @@ export class EgressProxy {
   }
 
   private log(type: string, method: string, target: string, detail: string): void {
+    if (type === "DEBUG" && process.env.VERBOSE !== "1") return;
     const timestamp = new Date().toISOString();
     console.log(`[egress-proxy] ${timestamp} ${type} ${method} ${target} ${detail}`);
   }

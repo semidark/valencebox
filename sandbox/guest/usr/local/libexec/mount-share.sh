@@ -74,7 +74,8 @@ if [ -n "$proxy_port" ] && [ -n "$proxy_token" ]; then
 HTTP_PROXY="http://valencebox:PROXY_TOKEN@10.0.2.2:PROXY_PORT/"
 HTTPS_PROXY="http://valencebox:PROXY_TOKEN@10.0.2.2:PROXY_PORT/"
 NO_PROXY="127.0.0.1,localhost,10.0.2.2,::1"
-export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy
+NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/valencebox-mitm.crt
+export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy NODE_EXTRA_CA_CERTS
 PROXYEOF
 
   # Substitute actual values sed -i is portable across Linux distros.
@@ -85,6 +86,7 @@ PROXYEOF
   export HTTP_PROXY="http://valencebox:${proxy_token}@10.0.2.2:${proxy_port}/"
   export HTTPS_PROXY="http://valencebox:${proxy_token}@10.0.2.2:${proxy_port}/"
   export NO_PROXY="127.0.0.1,localhost,10.0.2.2,::1"
+  export NODE_EXTRA_CA_CERTS="/usr/local/share/ca-certificates/valencebox-mitm.crt"
   export http_proxy="$HTTP_PROXY"
   export https_proxy="$HTTPS_PROXY"
   export no_proxy="$NO_PROXY"

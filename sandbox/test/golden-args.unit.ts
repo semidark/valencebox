@@ -48,15 +48,15 @@ testCase("full x86_64 TCG", buildOpts(pFull, {
   rootImage: pFull.rootImage,
   workspaceImage: pFull.workspaceImage,
   kernelCmdline: "console=ttyS0 root=/dev/vda quiet",
-  sharePort: 12345,
-  shareToken: "abc123def456",
+  proxyPort: 12345,
+  proxyToken: "abc123def456",
 }), "pc", (args) => {
   assert(!args.includes("-cpu"), "x86_64 TCG has no -cpu flag");
   const appendIdx = args.indexOf("-append");
   assert(appendIdx !== -1, "cmdline present");
   assert(!args[appendIdx + 1].includes("reboot=t"), "no reboot=t under pc");
-  assert(args[appendIdx + 1].includes("valencebox.port=12345"), "port on cmdline");
-  assert(args[appendIdx + 1].includes("valencebox.token=abc123def456"), "token on cmdline");
+  assert(args[appendIdx + 1].includes("valencebox.proxy_port=12345"), "proxy_port on cmdline");
+  assert(args[appendIdx + 1].includes("valencebox.proxy_token=abc123def456"), "proxy_token on cmdline");
   assert(args.some(a => a === "virtio-balloon-pci"), "virtio-balloon-pci for pc");
 });
 
