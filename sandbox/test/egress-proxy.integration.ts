@@ -230,7 +230,9 @@ async function testMitmSecretInjection() {
         req.on("end", () => {
           capturedBody = body;
           res.writeHead(200, { "Content-Type": "text/plain" });
-          res.end(`ok: ${body}`);
+          // Keep the response alive beyond the proxy's 5s TLS handshake timeout.
+          // A server-side TLSSocket must clear that timer on its "secure" event.
+          setTimeout(() => res.end(`ok: ${body}`), 5250);
         });
       },
     );
@@ -265,8 +267,11 @@ async function testMitmSecretInjection() {
 
     // Read the CONNECT response.
     const connectResponse = await new Promise<Buffer>((resolve) => {
-      sock.once("data", resolve);
-      setTimeout(() => sock.destroy(), 3000);
+      const timer = setTimeout(() => sock.destroy(), 3000);
+      sock.once("data", (data) => {
+        clearTimeout(timer);
+        resolve(data);
+      });
     });
 
     assert(connectResponse.toString("utf-8").includes("200"), "CONNECT returns 200");
@@ -279,19 +284,28 @@ async function testMitmSecretInjection() {
     });
 
     await new Promise<void>((resolve, reject) => {
-      clientTls.once("secureConnect", resolve);
-      clientTls.once("error", reject);
-      setTimeout(() => reject(new Error("TLS timeout")), 3000);
+      const timer = setTimeout(() => reject(new Error("TLS timeout")), 3000);
+      clientTls.once("secureConnect", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      clientTls.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
     });
 
-    // Send an HTTPS request with a placeholder secret.
+    // Send an HTTPS request with placeholders in both a header and the body.
+    // The body replacement changes its byte length, exercising Content-Length repair.
+    const requestBody = "token=psbx-sec-test-abc";
     const request = [
-      "GET /test HTTP/1.1",
+      "POST /test HTTP/1.1",
       "Host: 127.0.0.1",
       "Authorization: Bearer psbx-sec-test-abc",
+      `Content-Length: ${Buffer.byteLength(requestBody)}`,
       "Connection: close",
       "",
-      "",
+      requestBody,
     ].join("\r\n");
 
     clientTls.write(request);
@@ -304,19 +318,21 @@ async function testMitmSecretInjection() {
       });
       clientTls.on("end", () => resolve(Buffer.concat(chunks)));
       clientTls.on("error", () => resolve(Buffer.concat(chunks)));
-      setTimeout(() => resolve(Buffer.concat(chunks)), 3000);
+      setTimeout(() => resolve(Buffer.concat(chunks)), 7000);
     });
 
     clientTls.destroy();
 
     const responseStr = response.toString("utf-8");
     assert(responseStr.includes("200"), `MITM response includes 200 (got: ${responseStr.slice(0, 100).replace(/\n/g, "\\n")})`);
+    assert(responseStr.includes("ok: "), "MITM response remains connected beyond the handshake timeout");
 
     // Wait briefly for the upstream to process.
     await new Promise((r) => setTimeout(r, 500));
 
     // Verify the upstream received the rewritten token (real value, not placeholder).
     assert(capturedHeaders !== undefined, "upstream received headers");
+    assertEq(capturedBody, "token=real-token-value", "placeholder replaced in upstream body");
     if (capturedHeaders) {
       const authHeader = capturedHeaders["authorization"] as string | undefined;
       assert(authHeader !== undefined, "authorization header present in upstream");
@@ -328,7 +344,7 @@ async function testMitmSecretInjection() {
 
     console.log("✓ MITM secret injection");
   } finally {
-    proxy?.stop();
+    await proxy?.stop();
     upstreamServer?.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

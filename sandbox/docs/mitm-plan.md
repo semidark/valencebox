@@ -181,6 +181,7 @@ upstream. Requires an ephemeral CA and on-the-fly leaf certificate generation.
 - [x] **B6. Guest CA trust**
   - CA cert passed to guest via `fw_cfg` entry `opt/org.valencebox/mitm-ca-cert.pem`
   - In `mount-share.sh`, writes the CA cert to `/usr/local/share/ca-certificates/valencebox-mitm.crt` and runs `update-ca-certificates`
+  - Also sets `NODE_EXTRA_CA_CERTS` in `/etc/profile.d/valencebox-proxy.sh` — Node.js's bundled undici (used by `EnvHttpProxyAgent` in prime-agent and other Node tools) does not reliably pick up the system CA bundle after `update-ca-certificates`; the explicit env var bypasses this
   - WebDAV share config also moved to `fw_cfg` (`opt/org.valencebox.config/raw`) — kernel cmdline now only carries proxy port/token/secrets
 
 ## Phase C — Polish and hardening
