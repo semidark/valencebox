@@ -285,3 +285,9 @@ resolved before merging to main.
   - Strip or rewrite `Strict-Transport-Security`, `Public-Key-Pins`, and
     `Expect-CT` headers from upstream responses to prevent interference with
     the proxy's MITM TLS termination.
+
+- [x] **D11. Add fromFile secret source**
+  - Added `fromFile?: string` to `SecretSpec` so secrets can be read from disk
+    files (e.g. `~/.secrets/gh.key`). Supports `~` expansion to the user's
+    home directory. Priority: `value` > `fromFile` > `fromEnv`.
+  - Files: `sandbox/src/config.ts:25–32`, `sandbox/src/main/egress-proxy.ts:105–145`

@@ -8,6 +8,9 @@ import {
   PlaceholderViolation,
   EgressProxy,
 } from "../src/main/egress-proxy";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import { EgressRuntimeConfig, EgressConfig, ResolvedSecret } from "../src/config";
 
 function assert(cond: boolean, msg: string): void {
@@ -162,10 +165,10 @@ function assertThrows(fn: () => void, msg: string): void {
 }
 
 {
-  // no value or fromEnv throws
+  // no value, fromFile, or fromEnv throws
   assertThrows(() => {
     resolveSecrets([{ env: "NO_VAL", hosts: ["x.com"] }]);
-  }, "missing both value and fromEnv throws");
+  }, "missing value, fromFile, and fromEnv throws");
   console.log("✓ resolveSecrets: no value/fromEnv throws");
 }
 
@@ -252,6 +255,82 @@ function assertThrows(fn: () => void, msg: string): void {
   const rewritten = rewriteBody(body, secrets);
   assert(rewritten === body, "body without placeholder returns same buffer");
   console.log("✓ rewriteBody: unchanged body returns same reference");
+}
+
+// ---- resolveSecrets: fromFile ----
+
+{
+  // fromFile reads correctly
+  const tmpFile = "/tmp/test-secret-" + Math.random().toString(36).slice(2);
+  try {
+    fs.writeFileSync(tmpFile, "file-secret-value\n", "utf-8");
+    const resolved = resolveSecrets([
+      { env: "FROM_FILE", fromFile: tmpFile, hosts: ["api.example.com"] },
+    ]);
+    assertEq(resolved.length, 1, "one resolved secret from file");
+    assertEq(resolved[0].env, "FROM_FILE", "env name preserved (fromFile)");
+    assertEq(resolved[0].value, "file-secret-value", "value from file (trailing newline stripped)");
+    assert(resolved[0].placeholder.startsWith("psbx-sec-"), "placeholder generated (fromFile)");
+    assertEq(resolved[0].hosts[0], "api.example.com", "hosts preserved (fromFile)");
+    console.log("✓ resolveSecrets: fromFile");
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+}
+
+{
+  // fromFile with ~ expansion
+  const home = os.homedir();
+  const tmpFile = path.join(home, ".test-secret-" + Math.random().toString(36).slice(2));
+  try {
+    fs.writeFileSync(tmpFile, "tilde-expanded", "utf-8");
+    const tildePath = "~/" + path.basename(tmpFile);
+    const resolved = resolveSecrets([
+      { env: "TILDE", fromFile: tildePath, hosts: ["x.com"] },
+    ]);
+    assertEq(resolved[0].value, "tilde-expanded", "~ expanded to homedir");
+    console.log("✓ resolveSecrets: fromFile with ~ expansion");
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+}
+
+{
+  // fromFile missing throws
+  assertThrows(() => {
+    resolveSecrets([{ env: "MISSING_FILE", fromFile: "/tmp/nonexistent-" + Math.random().toString(36).slice(2), hosts: ["x.com"] }]);
+  }, "missing fromFile throws");
+  console.log("✓ resolveSecrets: fromFile missing throws");
+}
+
+{
+  // fromFile empty throws
+  const tmpFile = "/tmp/test-empty-" + Math.random().toString(36).slice(2);
+  try {
+    fs.writeFileSync(tmpFile, "", "utf-8");
+    assertThrows(() => {
+      resolveSecrets([{ env: "EMPTY_FILE", fromFile: tmpFile, hosts: ["x.com"] }]);
+    }, "empty fromFile throws");
+    console.log("✓ resolveSecrets: fromFile empty throws");
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+}
+
+{
+  // fromFile takes priority over fromEnv
+  process.env.SHOULD_NOT_BE_USED = "env-value";
+  const tmpFile = "/tmp/test-priority-" + Math.random().toString(36).slice(2);
+  try {
+    fs.writeFileSync(tmpFile, "file-value", "utf-8");
+    const resolved = resolveSecrets([
+      { env: "PRIORITY", fromFile: tmpFile, fromEnv: "SHOULD_NOT_BE_USED", hosts: ["x.com"] },
+    ]);
+    assertEq(resolved[0].value, "file-value", "fromFile takes priority over fromEnv");
+    console.log("✓ resolveSecrets: fromFile priority over fromEnv");
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
 }
 
 // ---- normalizeHost ----
