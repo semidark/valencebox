@@ -33,7 +33,7 @@ Electron main (Node)
  │    ├─ net:    -device <virtio-net-device|virtio-net-pci>
  │    ├─ serial tcp:127.0.0.1:<port>,server,nowait
  │    ├─ qmp    tcp:127.0.0.1:<port>,server,nowait
- │    └─ -nic user (SLIRP, open egress for now)
+ │    └─ -nic user (SLIRP, filtered by host EgressProxy)
 ├─ WebDAV server (pure Node, no TLS, token-based auth)
   │    listens on 127.0.0.1:<random_port> — token prevents other
   │    local users from accessing the workspace on a multi-user host
@@ -52,10 +52,10 @@ Guest (Ubuntu 24.04 x86-64)
  └─ systemd serial-getty login shell on ttyS0
 ```
 
-> **⚠️ Stale — x86_64-only design. To be rewritten in Phase 7 (multi-arch).**
-> The table below describes the x86_64 TCG guest only. On Apple Silicon the
-> default will switch to an aarch64 guest under HVF (Phase 9). HVF is **not**
-> available for x86_64 guests on macOS — see `macos-issues.md`.
+> **Multi-arch.** The table below describes the x86_64 TCG guest. On Apple Silicon
+> the default is an aarch64 guest under HVF (falling back to x86_64 TCG when aarch64
+> assets or HVF are unavailable). HVF is not available for x86_64 guests on macOS —
+> see `macos-issues.md`.
 
 ### Confirmed decisions
 
@@ -467,7 +467,7 @@ resumes with RAM state intact.
 Goal: wire the pieces into the app lifecycle and restore user-facing config.
 
 - [ ] Rewrite `src/main/sandbox.ts` / `main.ts` to drive: HTTP share → QEMU spawn → QMP ready → serial to UI
-- [ ] `-nic user` open egress (document as temporary regression vs. old allowlist)
+- [x] `-nic user` open egress addressed by host-process EgressProxy (see sandbox/docs/mitm-plan.md)
 - [ ] `sandbox.config.json`: `accel` (override/force), `workspaceDir`, `memMb`, `smp`, `egress` (placeholder)
 - [ ] Clean shutdown ordering: stop sync → snapshot (optional) → `system_powerdown` → stop HTTP server
 
@@ -491,7 +491,7 @@ working terminal; confirm hw-accel is used when available and TCG otherwise.
 
 ### Phase 8 — Docs & cleanup
 
-- [ ] Rewrite `HARDENING.md`: host-canonical dir, plain-HTTP loopback share, open egress (temporary), no agent/relay
+- [x] Rewrite `HARDENING.md`: host-canonical dir, plain-HTTP loopback share, proxy-mediated egress, no agent/relay
 - [ ] Rewrite `README.md`: new architecture + measured boot/snapshot timings
 - [ ] Delete `PROTOCOL.md`, `docs/data-plane-architecture.md`, `docs/switch-to-v86-fork.md` (obsolete)
 - [ ] Remove dead deps from `package.json`; update test script list
@@ -606,8 +606,12 @@ restart interval. No device dependency: the daemon retries `open()` internally
    it checks availability at runtime and falls back to TCG.
 4. **host→guest latency** is poll-bound (~2s). Acceptable for source edits;
    documented. inotify cannot cross the network share.
-5. **Open egress** is a security regression vs. today's DNS-gate + IP-pin
-   allowlist. Re-add a filtering proxy in a later phase.
+5. **Open egress addressed by host-process proxy.** The `EgressProxy`
+   (`src/main/egress-proxy.ts`) implements HTTP CONNECT filtering with
+   allowlist/denylist host patterns, auth token, and optional MITM TLS
+   interception for secret injection. See `sandbox/docs/mitm-plan.md` for
+   the implementation plan and `sandbox/HARDENING.md` for the current
+   security invariants.
 6. **qcow2 double disk usage** (host canonical copy + guest qcow2 mirror) is
    expected by design.
 7. **TCG defaults** (`-smp`, `tb-size`, MTTCG) need validation against a real

@@ -13,34 +13,37 @@ async function main() {
   const tmpDir = fs.mkdtempSync(path.join(SCRATCH, "qmp-test-"));
   const qemu = new QemuProcess();
 
-  qemu.on("stderr", (msg: string) => VERBOSE && console.error("[qemu:stderr]", msg));
-  qemu.on("qmp:event", (event: string) => VERBOSE && console.log("[qmp:event]", event));
+  try {
+    qemu.on("stderr", (msg: string) => VERBOSE && console.error("[qemu:stderr]", msg));
+    qemu.on("qmp:event", (event: string) => VERBOSE && console.log("[qmp:event]", event));
 
-  const profile = x86_64Profile("", "");
+    const profile = x86_64Profile("", "");
 
-  await qemu.start({
-    memoryMB: 128,
-    smp: 1,
-    tmpDir,
-    accel: (ACCEL as any) ?? "tcg",
-    freeze: true,
-    guestProfile: profile,
-  });
+    await qemu.start({
+      memoryMB: 128,
+      smp: 1,
+      tmpDir,
+      accel: (ACCEL as any) ?? "tcg",
+      freeze: true,
+      guestProfile: profile,
+    });
 
-  // query-status while frozen at prelaunch
-  const status1 = await qemu.queryStatus();
-  console.log(`✓ query-status: ${JSON.stringify(status1)}`);
+    // query-status while frozen at prelaunch
+    const status1 = await qemu.queryStatus();
+    console.log(`✓ query-status: ${JSON.stringify(status1)}`);
 
-  // clean shutdown via QMP system_powerdown
-  await qemu.stop(15_000);
-  console.log("✓ clean shutdown via QMP");
+    // clean shutdown via QMP system_powerdown
+    await qemu.stop(15_000);
+    console.log("✓ clean shutdown via QMP");
 
-  if (qemu.running) throw new Error("QEMU still running after stop()");
-  console.log("✓ process exited cleanly");
+    if (qemu.running) throw new Error("QEMU still running after stop()");
+    console.log("✓ process exited cleanly");
 
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  console.log("ALL QMP TESTS PASSED");
-  process.exit(0);
+    console.log("ALL QMP TESTS PASSED");
+  } finally {
+    if (qemu.running) await qemu.stop(5_000);
+    fs.rmSync(SCRATCH, { recursive: true, force: true });
+  }
 }
 
 main().catch((e) => {

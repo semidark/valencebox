@@ -20,31 +20,56 @@ automated check or the code that enforces it.
 
 ## Egress
 
-- [x] **Single egress path.** The only network device is the virtio NIC
-      wired to the in-process WISP relay (`wisp.ts`). No TAP, no host routing,
-      no root. With `enableNetwork:false` there is no NIC at all.
-- [x] **Allowlist enforced.** Two coupled layers (`doh.ts` + `wisp.ts`):
-      DNS resolves only allowlisted hostnames (else NXDOMAIN); the WISP
-      server only opens streams to IPs the gate pinned, on allowlisted ports;
-      `allow_private_ips`/`allow_loopback_ips` off, so the guest cannot reach
-      the host LAN or localhost. Verified: `test/net.test.ts` (allowed host
-      fetches real data; `example.com` blocked; `apk update` works).
-- [ ] **Residual: IP-pinning granularity.** A CDN IP pinned for an allowed
-      host also permits other hostnames sharing that IP. Acceptable for a
-      registry allowlist; document per-deployment. UDP is off by default so
-      DNS is the only UDP and it is host-mediated.
-- [x] **Sync data plane does not widen egress.** The guest's TCP sync stream
-      targets a virtual IP (`11.86.86.86:7575`, `data-plane.ts`) that is
-      terminated *in-process* by a socket class injected into the WISP
-      server — packets to it never leave the process, and the VIP handler
-      refuses any port but the sync port. The channel is gated by a per-boot
-      random token advertised only over the virtio-console; a wrong token
-      closes the stream. Residual: the VIP/port pair joins the whitelist, so
-      a pinned CDN IP could be dialed on the sync port (remote-refused) —
-      no in-process surface is exposed. Verified: `test/dataplane.test.ts`
-      (token auth, restore re-dial with fresh token) and `test/net.test.ts`
-      (egress policy unchanged).
+- [x] **Single egress path through host-process proxy.** The only network
+      device is the SLIRP NIC (`-nic user`). All outbound HTTP(S) traffic
+      from the guest must go through the `EgressProxy` running in the Electron
+      main process (`egress-proxy.ts`). No TAP, no host routing, no root.
+- [x] **Allowlist/denylist enforced.** The proxy checks every CONNECT
+      request against a configurable allowlist or denylist of host patterns
+      (supports `*.example.com` wildcards). Deny rules take priority over
+      allow rules. Verified: `test/egress-proxy.unit.ts` (hostAllowed tests
+      for allowlist, denylist, none policy, wildcards, case insensitivity,
+      deny priority, trailing dots, port stripping).
+- [x] **Proxy authentication required.** The guest must present a bearer
+      token in the `Proxy-Authorization` header. The token is a
+      cryptographically random hex string generated per-session and passed
+      to the guest via kernel cmdline (`valencebox.proxy_token=`). Constant-
+      time comparison prevents timing attacks.
+- [x] **Open egress when unconfigured.** If the `sandbox.config.json` lacks
+      an `egress` section or policy is `"none"`, the proxy still starts but
+      allows all traffic (same behaviour as today's unconstrained SLIRP).
+- [x] **WebDAV sync traffic bypasses the proxy.** The guest sets
+      `no_proxy=127.0.0.1,localhost,10.0.2.2` so the WebDAV share server
+      (listening on the SLIRP gateway) is never proxied. Verified: the share
+      server and proxy are independent `http.Server` instances; the guest
+      sees `10.0.2.2:<share_port>` in `no_proxy`.
+- [ ] **MITM TLS interception (optional).** When `egress.enableMitm` is
+      `true`, the proxy terminates TLS for declared secret hosts, replaces
+      placeholder strings with real credentials, and re-encrypts to the
+      upstream. The guest must trust the proxy's ephemeral CA (installed via
+      `update-ca-certificates` in the guest image). MITM is off by default.
+      Verified: `test/egress-proxy.unit.ts` (placeholder replacement in
+      headers and body; unauthorized host blocking).
+- [ ] **Secret placeholders protect credentials.** Real secrets (API keys,
+      tokens) are never exposed to the guest. The host generates
+      cryptographically random placeholders (`psbx-sec-<hex>`) that the
+      guest sees in its environment variables. The proxy replaces them with
+      real values during MITM interception. A placeholder used on a
+      non-declared host results in a 403 Forbidden. Verified:
+      `test/egress-proxy.unit.ts` (PlaceholderViolation thrown for
+      unauthorized host).
 
+## Known gaps / follow-ups
+
+- Guest runs as root; add a non-root build user + drop caps for defence in
+  depth (agent builds already confined to `/workspace`).
+- No per-file encryption of snapshots at rest.
+- HTTP proxy does not filter request content (headers or body), only
+  hostname+port. For plain HTTP forward (non-CONNECT), the proxy forwards
+  GET/POST/etc. requests; MITM interception applies only to CONNECT on
+  declared secret hosts.
+- MITM CA and leaf certs use `openssl` subprocess (requires `openssl` on
+  host). A pure-Node fallback is tracked in Phase C.
 ## Persistence & durability
 
 - [x] **Canonical store is the host directory**, not VM disk internals. A
