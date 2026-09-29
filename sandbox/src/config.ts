@@ -88,6 +88,21 @@ export interface EgressRuntimeConfig {
   authToken: string;
 }
 
+// ---- Port forwarding ----
+
+export interface PortForward {
+  /** Host port to listen on (1–65535). */
+  hostPort: number;
+  /** Guest port to forward to (1–65535). */
+  guestPort: number;
+  /** Host bind address. Default "127.0.0.1" for security. */
+  hostIp?: string;
+  /** Protocol: "tcp" (default) or "udp". */
+  protocol?: "tcp" | "udp";
+  /** Optional description. */
+  label?: string;
+}
+
 // ---- Main app config ----
 
 export interface SandboxAppConfig {
@@ -100,4 +115,14 @@ export interface SandboxAppConfig {
 
   /** Egress proxy configuration. Undefined = proxy started with policy=none (all traffic allowed). */
   egress?: EgressConfig;
+
+  /**
+   * Port forwarding rules from host to guest (QEMU hostfwd).
+   * Each rule creates a listener on the host that forwards connections to the
+   * specified guest port.
+   *
+   * Default when undefined: `[{ hostPort: 2222, guestPort: 22, label: "SSH debug access" }]`.
+   * Set to an empty array `[]` to disable all port forwarding (including SSH).
+   */
+  portForwards?: PortForward[];
 }

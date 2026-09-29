@@ -6,6 +6,7 @@ import { EventEmitter } from "events";
 import { qemuBinaryPath, firmwareDir, qemuPlatformDir, allocSerialTransport, allocQmpTransport, allocPtyTransport, VmTransport } from "./asset-paths";
 import { QmpClient } from "./qmp";
 import { GuestProfile } from "./guest-profile";
+import { PortForward } from "../config";
 
 export interface QemuOptions {
   memoryMB: number;
@@ -26,6 +27,7 @@ export interface QemuOptions {
   proxyToken?: string;
   proxySecrets?: string;
   mitmCaFile?: string;
+  portForwards?: PortForward[];
 }
 
 export interface QemuStats {
@@ -315,7 +317,13 @@ export class QemuProcess extends EventEmitter {
       );
     }
 
-    args.push("-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22`, "-device", `${netDev},netdev=net0`);
+    const netdevParts = [`user,id=net0`];
+    for (const fwd of opts.portForwards ?? []) {
+      const proto = fwd.protocol ?? "tcp";
+      const ip = fwd.hostIp ?? "127.0.0.1";
+      netdevParts.push(`hostfwd=${proto}:${ip}:${fwd.hostPort}-:${fwd.guestPort}`);
+    }
+    args.push("-netdev", netdevParts.join(","), "-device", `${netDev},netdev=net0`);
     args.push("-device", rngDev);
     args.push("-device", `virtio-balloon${suffix}`);
 

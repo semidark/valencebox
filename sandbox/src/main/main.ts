@@ -184,6 +184,10 @@ async function startVm() {
   // Format: env=placeholder,env2=placeholder2 (URL-safe, no spaces)
   const secretPlaceholders = proxyCfg.secrets.map((s) => `${s.env}=${s.placeholder}`).join(",");
 
+  const portForwards = appCfg.portForwards ?? [
+    { hostPort: 2222, guestPort: 22, label: "SSH debug access" },
+  ];
+
   vm = new VmManager({
     memoryMB: appCfg.memMb ?? 4096,
     smp: appCfg.smp ?? 2,
@@ -199,6 +203,7 @@ async function startVm() {
     proxyPort,
     proxyToken: proxyCfg.authToken,
     proxySecrets: secretPlaceholders,
+    portForwards,
   });
 
   vm.on("serial:data", (chunk: string) => sendToWindow(IPC.onSerial, chunk));

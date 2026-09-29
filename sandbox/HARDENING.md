@@ -43,6 +43,10 @@ automated check or the code that enforces it.
       (listening on the SLIRP gateway) is never proxied. Verified: the share
       server and proxy are independent `http.Server` instances; the guest
       sees `10.0.2.2:<share_port>` in `no_proxy`.
+- [x] **Port forwards bind to 127.0.0.1 by default.** QEMU hostfwd rules in
+      `portForwards` default to `hostIp: "127.0.0.1"` unless the user
+      explicitly overrides it. This prevents accidental exposure of guest
+      services to the network.
 - [ ] **MITM TLS interception (optional).** When `egress.enableMitm` is
       `true`, the proxy terminates TLS for declared secret hosts, replaces
       placeholder strings with real credentials, and re-encrypts to the
