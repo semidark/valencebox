@@ -3,6 +3,7 @@
 // Calls the real static method directly — no duplication.
 import { QemuProcess, QemuOptions } from "../src/main/qemu";
 import { x86_64Profile, aarch64Profile, GuestProfile } from "../src/main/guest-profile";
+import { PortForward } from "../src/config";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(`ASSERTION FAILED: ${msg}`);
@@ -13,6 +14,7 @@ function buildOpts(p: GuestProfile, overrides: Partial<QemuOptions> = {}): QemuO
     memoryMB: 512,
     smp: 2,
     guestProfile: p,
+    portForwards: [],
     ...overrides,
   };
 }
@@ -115,5 +117,81 @@ testCase("aarch64 virt TCG", buildOpts(pa, {
   assert(cpuIdx !== -1, "-cpu present");
   assert(args[cpuIdx + 1] === "max", "cpu = max under TCG");
 }, "tcg,thread=multi");
+
+// ---- Port forwarding tests ----
+
+// Case 7: default SSH forward
+testCase("port-forward ssh only", buildOpts(p, {
+  portForwards: [{ hostPort: 2222, guestPort: 22 }],
+}), "pc", (args) => {
+  const idx = args.indexOf("-netdev");
+  assert(idx !== -1, "-netdev present");
+  assert(args[idx + 1].includes("hostfwd=tcp:127.0.0.1:2222-:22"), "SSH hostfwd present");
+  assert(!args[idx + 1].includes("hostfwd=tcp:127.0.0.1:2222-:22,hostfwd="), "no extra hostfwds");
+});
+
+// Case 8: no port forwards (empty array — SSH disabled)
+testCase("port-forward none", buildOpts(p, {
+  portForwards: [],
+}), "pc", (args) => {
+  const idx = args.indexOf("-netdev");
+  assert(idx !== -1, "-netdev present");
+  assert(!args[idx + 1].includes("hostfwd"), "no hostfwd when portForwards is empty");
+});
+
+// Case 9: single custom TCP forward
+testCase("port-forward single tcp", buildOpts(p, {
+  portForwards: [{ hostPort: 8080, guestPort: 80, label: "web" }],
+}), "pc", (args) => {
+  const idx = args.indexOf("-netdev");
+  assert(idx !== -1, "-netdev present");
+  assert(args[idx + 1].includes("hostfwd=tcp:127.0.0.1:8080-:80"), "custom TCP hostfwd");
+});
+
+// Case 10: multiple forwards
+testCase("port-forward multiple", buildOpts(p, {
+  portForwards: [
+    { hostPort: 2222, guestPort: 22, label: "SSH" },
+    { hostPort: 8080, guestPort: 80, label: "web" },
+    { hostPort: 3443, guestPort: 443, label: "https" },
+  ],
+}), "pc", (args) => {
+  const idx = args.indexOf("-netdev");
+  assert(idx !== -1, "-netdev present");
+  const val = args[idx + 1];
+  assert(val.includes("hostfwd=tcp:127.0.0.1:2222-:22"), "SSH hostfwd");
+  assert(val.includes("hostfwd=tcp:127.0.0.1:8080-:80"), "web hostfwd");
+  assert(val.includes("hostfwd=tcp:127.0.0.1:3443-:443"), "https hostfwd");
+  // All three should be in the same -netdev value, comma-separated
+  const matches = val.match(/hostfwd=/g);
+  assert(matches !== null && matches!.length === 3, "exactly three hostfwd entries");
+});
+
+// Case 11: UDP forward
+testCase("port-forward udp", buildOpts(p, {
+  portForwards: [{ protocol: "udp", hostPort: 5353, guestPort: 53 }],
+}), "pc", (args) => {
+  const idx = args.indexOf("-netdev");
+  assert(idx !== -1, "-netdev present");
+  assert(args[idx + 1].includes("hostfwd=udp:127.0.0.1:5353-:53"), "UDP hostfwd");
+});
+
+// Case 12: custom hostIp
+testCase("port-forward custom ip", buildOpts(p, {
+  portForwards: [{ hostIp: "0.0.0.0", hostPort: 3000, guestPort: 3000 }],
+}), "pc", (args) => {
+  const idx = args.indexOf("-netdev");
+  assert(idx !== -1, "-netdev present");
+  assert(args[idx + 1].includes("hostfwd=tcp:0.0.0.0:3000-:3000"), "custom IP hostfwd");
+});
+
+// Case 13: port forwards with aarch64 virt
+testCase("port-forward aarch64 virt", buildOpts(pa, {
+  portForwards: [{ hostPort: 2222, guestPort: 22 }],
+}), "virt", (args) => {
+  const idx = args.indexOf("-netdev");
+  assert(idx !== -1, "-netdev present");
+  assert(args[idx + 1].includes("hostfwd=tcp:127.0.0.1:2222-:22"), "aarch64 SSH hostfwd");
+});
 
 console.log("ALL GOLDEN ARGS TESTS PASSED");

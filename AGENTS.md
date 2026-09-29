@@ -84,11 +84,13 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -p 2222 root@127.0.0.1
 ```
 
-- Forwarded via `-netdev user,hostfwd=tcp:127.0.0.1:2222-:22`
+- Forwarded via `hostfwd` in the `-netdev user` argument (port 2222 → guest 22).
 - Only Ed25519 host key; `chacha20-poly1305` cipher, `curve25519-sha256` kex
 - `vm-debug` SSH public key baked into `/root/.ssh/authorized_keys`
-- **TODO: gate behind a config flag before release** (currently always on)
 - Works as long as QEMU SSH hostfwd is active (i.e., the app is running)
+- **Configurable via `sandbox.config.json` → `portForwards`.** Default is
+  `[{ hostPort: 2222, guestPort: 22, label: "SSH debug access" }]`. Set
+  `portForwards: []` to disable, or add custom forwards alongside SSH.
 
 ## Cross-cutting constraints
 
@@ -144,7 +146,11 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
       "secrets": [
         { "env": "GITHUB_TOKEN", "fromEnv": "GITHUB_TOKEN", "hosts": ["api.github.com"] }
       ]
-    }
+    },
+    "portForwards": [
+      { "hostPort": 2222, "guestPort": 22, "label": "SSH debug access" },
+      { "hostPort": 8080, "guestPort": 80, "label": "HTTP dev server" }
+    ]
   }
   ```
 
@@ -159,7 +165,7 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
   installed via `update-ca-certificates`. MITM currently requires `openssl` on
   the host for certificate generation (pure-Node fallback tracked in Phase C).
 - Other config knobs per `docs/qemu.md`: `accel`, `workspaceDir`, `memMb`,
-  `smp`, `balloonMinMb`.
+  `smp`, `balloonMinMb`, `portForwards`.
 
 ## Egress proxy files
 

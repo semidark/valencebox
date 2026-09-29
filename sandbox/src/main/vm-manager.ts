@@ -3,6 +3,7 @@ import * as fsp from "fs/promises";
 import * as net from "net";
 import { QemuProcess, QemuOptions } from "./qemu";
 import { GuestProfile } from "./guest-profile";
+import { PortForward } from "../config";
 import { PtyChannel } from "./pty-channel";
 
 
@@ -25,6 +26,7 @@ export interface VmManagerOptions {
   proxySecrets?: string;
   mitmCaFile?: string;
   balloonMinMb?: number;
+  portForwards: PortForward[];
 }
 
 export class VmManager extends EventEmitter {

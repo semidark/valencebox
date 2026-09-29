@@ -250,6 +250,9 @@ Under TCG (no KVM/HVF/WHPX), the guest kernel cannot calibrate TSC and hangs.
 Key details:
 - PC machine uses `-device virtio-blk-pci` (PCI) — standard PCI bus with HPET/ACPI
 - NIC uses explicit `-netdev user,id=net0 -device virtio-net-pci,netdev=net0`
+- Port forwarding via QEMU `hostfwd` rules inside the `-netdev` argument.
+  Configured through `sandbox.config.json` → `portForwards` array. Default:
+  SSH (2222→22) for debug access. Binds to `127.0.0.1` unless overridden.
 - Shutdown via QMP `system_powerdown` then SIGTERM/SIGKILL fallback
 - Serial and QMP over TCP (`127.0.0.1:port`) for cross-platform compatibility
 
