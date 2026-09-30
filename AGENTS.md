@@ -162,8 +162,9 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
   secret host is matched, the proxy TLS-terminates the connection, replaces
   placeholders in headers/body, and re-encrypts to the upstream. Guest CA trust
   is handled via `fw_cfg` — the CA cert is injected into the guest at boot and
-  installed via `update-ca-certificates`. MITM currently requires `openssl` on
-  the host for certificate generation (pure-Node fallback tracked in Phase C).
+  installed via `update-ca-certificates`. MITM CA and leaf certificates are
+  generated in pure Node (`selfsigned` → `@peculiar/x509`) — no `openssl`
+  required on the host.
 - Other config knobs per `docs/qemu.md`: `accel`, `workspaceDir`, `memMb`,
   `smp`, `balloonMinMb`, `portForwards`.
 

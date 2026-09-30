@@ -5,6 +5,7 @@ import {
   rewriteHeaders,
   rewriteBody,
   normalizeHost,
+  sanitizeResponseHeaders,
   PlaceholderViolation,
   EgressProxy,
 } from "../src/main/egress-proxy";
@@ -349,6 +350,47 @@ function assertThrows(fn: () => void, msg: string): void {
   // Trailing dot stripped
   assertEq(normalizeHost("example.com."), "example.com", "trailing dot stripped");
   console.log("✓ normalizeHost");
+}
+
+// ---- sanitizeResponseHeaders ----
+
+{
+  const headers = {
+    "content-type": "text/html",
+    "strict-transport-security": "max-age=31536000; includeSubDomains",
+    "public-key-pins": "pin-sha256=\"abc\"",
+    "expect-ct": "max-age=1",
+    "x-kept": "yes",
+  };
+  const out = sanitizeResponseHeaders(headers);
+  assertEq(out["content-type"], "text/html", "content-type kept");
+  assertEq(out["x-kept"], "yes", "unrelated header kept");
+  assert(out["strict-transport-security"] === undefined, "HSTS stripped");
+  assert(out["public-key-pins"] === undefined, "HPKP stripped");
+  assert(out["expect-ct"] === undefined, "Expect-CT stripped");
+  console.log("✓ sanitizeResponseHeaders: strips HSTS/HPKP/Expect-CT");
+}
+
+{
+  // Case-insensitive stripping + report-only variant
+  const headers = {
+    "Strict-Transport-Security": "max-age=1",
+    "Public-Key-Pins-Report-Only": "pin-x",
+    "Content-Length": "5",
+  };
+  const out = sanitizeResponseHeaders(headers);
+  assert(out["Strict-Transport-Security"] === undefined, "HSTS stripped case-insensitively");
+  assert(out["Public-Key-Pins-Report-Only"] === undefined, "HPKP report-only stripped");
+  assertEq(out["Content-Length"], "5", "content-length kept");
+  console.log("✓ sanitizeResponseHeaders: case-insensitive + report-only");
+}
+
+{
+  // Input not mutated
+  const headers = { "strict-transport-security": "x" };
+  sanitizeResponseHeaders(headers);
+  assertEq(headers["strict-transport-security"], "x", "input object not mutated");
+  console.log("✓ sanitizeResponseHeaders: input not mutated");
 }
 
 // ---- EgressRuntimeConfig structure ----

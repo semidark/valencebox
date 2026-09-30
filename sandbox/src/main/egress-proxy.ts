@@ -7,6 +7,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { generate as selfsignedGenerate } from "selfsigned";
 import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret } from "../config";
 
 // ---- Helpers ----
@@ -211,6 +212,34 @@ export function rewriteBody(body: Buffer, secrets: ResolvedSecret[]): Buffer {
   return modified ? Buffer.from(data, "utf-8") : body;
 }
 
+/**
+ * Response headers that must never reach the guest through the proxy: they can
+ * pin the client against the MITM leaf or otherwise interfere with the proxy's
+ * TLS termination.
+ */
+const STRIPPED_RESPONSE_HEADERS = [
+  "strict-transport-security",
+  "public-key-pins",
+  "public-key-pins-report-only",
+  "expect-ct",
+];
+
+/**
+ * Strip HSTS / HPKP / Expect-CT from upstream response headers so they cannot
+ * pin the guest against the proxy's MITM leaf or force policy the proxy cannot
+ * honor. Returns a new header object; the input is not mutated.
+ */
+export function sanitizeResponseHeaders(
+  headers: http.IncomingHttpHeaders,
+): http.IncomingHttpHeaders {
+  const out: http.IncomingHttpHeaders = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (STRIPPED_RESPONSE_HEADERS.includes(name.toLowerCase())) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
 // ---- Exceptions ----
 
 export class PlaceholderViolation extends Error {
@@ -227,11 +256,20 @@ export interface MitmCa {
   key: string;     // PEM private key path
 }
 
+/** True if the (bracket-stripped) host is an IPv4/IPv6 literal. */
+function isIpAddress(host: string): boolean {
+  const bare = host.replace(/^\[/, "").replace(/\]$/, "");
+  return net.isIP(bare) !== 0;
+}
+
 /**
  * Generate or load a MITM CA keypair for the proxy.
- * Stored under the userData directory for persistence across restarts.
+ *
+ * Pure-Node cert generation via `selfsigned` (→ @peculiar/x509); no `openssl`
+ * subprocess is required. Stored under the userData directory for persistence
+ * across restarts (a stable CA keeps the leaf-cert cache valid).
  */
-export function ensureMitmCa(caDir: string): MitmCa {
+export async function ensureMitmCa(caDir: string): Promise<MitmCa> {
   const certPath = path.join(caDir, "mitm-ca-cert.pem");
   const keyPath = path.join(caDir, "mitm-ca-key.pem");
 
@@ -239,122 +277,41 @@ export function ensureMitmCa(caDir: string): MitmCa {
     return { cert: certPath, key: keyPath };
   }
 
-  // Generate a new CA keypair.
   fs.mkdirSync(caDir, { recursive: true, mode: 0o755 });
 
-  const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: "spki", format: "pem" },
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-  });
+  const ca = await selfsignedGenerate(
+    [
+      { name: "commonName", value: "ValenceBox MITM CA" },
+      { name: "organizationName", value: "ValenceBox" },
+    ],
+    {
+      algorithm: "sha256",
+      keySize: 2048,
+      notAfterDate: new Date(Date.now() + 3650 * 24 * 60 * 60 * 1000),
+      extensions: [
+        { name: "basicConstraints", cA: true, critical: true },
+        { name: "keyUsage", keyCertSign: true, cRLSign: true, critical: true },
+      ],
+    },
+  );
 
-  // Create a self-signed CA cert.
-  // Node's X509Certificate API is read-only. We use crypto.createSign to build
-  // a self-signed x509 v3 certificate.
-  const serial = BigInt("0x" + crypto.randomBytes(8).toString("hex"));
-  const now = new Date();
-  const expires = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
-
-  // Build the cert using a simple DER approach with createSign.
-  // This replicates what `openssl req -x509 -new` does.
-  const subject = "/CN=ValenceBox MITM CA/O=ValenceBox";
-  const issuer = subject;
-
-  const certPem = generateSelfSignedCert(publicKey, privateKey, serial, subject, now, expires);
-
-  fs.writeFileSync(certPath, certPem, { mode: 0o644 });
-  fs.writeFileSync(keyPath, privateKey, { mode: 0o600 });
+  fs.writeFileSync(certPath, ca.cert, { mode: 0o644 });
+  fs.writeFileSync(keyPath, ca.private, { mode: 0o600 });
 
   console.log(`[egress-proxy] Generated MITM CA: ${certPath}`);
   return { cert: certPath, key: keyPath };
 }
 
 /**
- * Generate a self-signed X.509v3 certificate.
- * Uses Node crypto to build the DER and sign it.
+ * Generate or load a leaf certificate for a specific hostname, signed by the
+ * MITM CA. Pure-Node (selfsigned); cached to disk keyed by SHA256 of the
+ * normalized host. Issues an IP SAN for IP literals, DNS SAN otherwise.
  */
-function generateSelfSignedCert(
-  publicKeyPem: string,
-  privateKeyPem: string,
-  serial: bigint,
-  subject: string,
-  notBefore: Date,
-  notAfter: Date,
-): string {
-  // We use openssl via spawnSync for the actual cert generation because Node's
-  // built-in X509Certificate API is read-only. However, the proxy may need to
-  // run without openssl. As a fallback we do the DER construction manually.
-  //
-  // For production, we prefer the openssl subprocess since it produces
-  // widely-compatible certs. Fall back to a JS approximation.
-
-  try {
-    return generateSelfSignedCertViaOpenssl(privateKeyPem, serial, subject, notBefore, notAfter);
-  } catch {
-    return generateSelfSignedCertJs(publicKeyPem, privateKeyPem, serial, subject, notBefore, notAfter);
-  }
-}
-
-function generateSelfSignedCertViaOpenssl(
-  privateKeyPem: string,
-  serial: bigint,
-  subject: string,
-  notBefore: Date,
-  notAfter: Date,
-): string {
-  const { spawnSync } = require("child_process") as typeof import("child_process");
-
-  const tmpDir = fs.mkdtempSync("mitm-ca-");
-  const tmpKey = path.join(tmpDir, "key.pem");
-  fs.writeFileSync(tmpKey, privateKeyPem);
-
-  const result = spawnSync("openssl", [
-    "req", "-x509", "-new", "-nodes",
-    "-key", tmpKey,
-    "-sha256",
-    "-days", "365",
-    "-subj", subject,
-    "-set_serial", serial.toString(),
-    "-extensions", "v3_ca",
-  ], {
-    encoding: "utf-8",
-    timeout: 10000,
-  });
-
-  cleanupTempDir(tmpDir);
-
-  if (result.status !== 0) {
-    throw new Error(`openssl failed: ${result.stderr || result.stdout}`);
-  }
-
-  return result.stdout;
-}
-
-function generateSelfSignedCertJs(
-  _publicKeyPem: string,
-  privateKeyPem: string,
-  _serial: bigint,
-  _subject: string,
-  _notBefore: Date,
-  _notAfter: Date,
-): string {
-  // Minimal self-signed cert using Node crypto.
-  // For a real implementation, we'd construct the TBSCertificate DER manually.
-  // For Phase A (no MITM) this path isn't needed; we use openssl.
-  // For Phase B, we'll implement full DER encoding.
-  //
-  // For now, fall back to openssl requirement with a clear error.
-  throw new Error("openssl is required for MITM CA generation (JS fallback not yet implemented)");
-}
-
-/**
- * Generate or load a leaf certificate for a specific hostname.
- */
-export function ensureLeafCertificate(
+export async function ensureLeafCertificate(
   host: string,
   mitmCa: MitmCa,
   certCacheDir: string,
-): { cert: string; key: string } {
+): Promise<{ cert: string; key: string }> {
   fs.mkdirSync(certCacheDir, { recursive: true, mode: 0o755 });
 
   const normalized = normalizeHost(host);
@@ -366,87 +323,33 @@ export function ensureLeafCertificate(
     return { cert: certPath, key: keyPath };
   }
 
-  // Generate a leaf keypair.
-  const { privateKey } = crypto.generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-  } as any);
+  const altNames = isIpAddress(normalized)
+    ? [{ type: 7 as const, ip: normalized.replace(/^\[/, "").replace(/\]$/, "") }]
+    : [{ type: 2 as const, value: normalized }];
 
-  // Generate leaf cert signed by the MITM CA using openssl.
-  const { spawnSync } = require("child_process") as typeof import("child_process");
-  const tmpDir = fs.mkdtempSync("mitm-leaf-");
-  const keyFile = path.join(tmpDir, "leaf.key");
-  const csrFile = path.join(tmpDir, "leaf.csr");
-  const extFile = path.join(tmpDir, "leaf.ext");
+  const leaf = await selfsignedGenerate(
+    [{ name: "commonName", value: normalized }],
+    {
+      algorithm: "sha256",
+      keySize: 2048,
+      ca: {
+        key: fs.readFileSync(mitmCa.key, "utf-8"),
+        cert: fs.readFileSync(mitmCa.cert, "utf-8"),
+      },
+      extensions: [
+        { name: "basicConstraints", cA: false, critical: true },
+        { name: "keyUsage", digitalSignature: true, keyEncipherment: true, critical: true },
+        { name: "extKeyUsage", serverAuth: true },
+        { name: "subjectAltName", altNames },
+      ],
+    },
+  );
 
-  fs.writeFileSync(keyFile, privateKey);
+  fs.writeFileSync(certPath, leaf.cert, { mode: 0o644 });
+  fs.writeFileSync(keyPath, leaf.private, { mode: 0o600 });
 
-  // CSR config
-  const csrSubject = `/CN=${normalized}/O=ValenceBox`;
-
-  const opensslPath = "openssl";
-
-  // Generate CSR
-  const csrResult = spawnSync(opensslPath, [
-    "req", "-new",
-    "-key", keyFile,
-    "-subj", csrSubject,
-    "-sha256",
-  ], {
-    encoding: "utf-8",
-    timeout: 10000,
-  });
-
-  if (csrResult.status !== 0) {
-    cleanupTempDir(tmpDir);
-    throw new Error(`openssl CSR failed for ${host}: ${csrResult.stderr}`);
-  }
-
-  fs.writeFileSync(csrFile, csrResult.stdout);
-
-  // X509 v3 extensions
-  fs.writeFileSync(extFile, [
-    "subjectKeyIdentifier = hash",
-    "authorityKeyIdentifier = keyid:always,issuer",
-    "basicConstraints = CA:FALSE",
-    `subjectAltName = DNS:${normalized}`,
-  ].join("\n"));
-
-  // Sign with CA
-  const signResult = spawnSync(opensslPath, [
-    "x509", "-req",
-    "-in", csrFile,
-    "-CA", mitmCa.cert,
-    "-CAkey", mitmCa.key,
-    "-CAcreateserial",
-    "-out", certPath,
-    "-days", "365",
-    "-sha256",
-    "-extfile", extFile,
-  ], {
-    encoding: "utf-8",
-    timeout: 10000,
-  });
-
-  if (signResult.status !== 0) {
-    cleanupTempDir(tmpDir);
-    throw new Error(`openssl sign failed for ${host}: ${signResult.stderr}`);
-  }
-
-  // Copy the private key to the cache
-  fs.writeFileSync(keyPath, privateKey, { mode: 0o600 });
-
-  cleanupTempDir(tmpDir);
   console.log(`[egress-proxy] Generated leaf cert for ${normalized}`);
   return { cert: certPath, key: keyPath };
-}
-
-function cleanupTempDir(dir: string): void {
-  try {
-    const files = fs.readdirSync(dir);
-    for (const f of files) fs.unlinkSync(path.join(dir, f));
-    fs.rmdirSync(dir);
-  } catch {}
 }
 
 // ---- EgressProxy class ----
@@ -461,13 +364,19 @@ export class EgressProxy {
   private mitmCa: MitmCa | null = null;
   private caDir: string;
   private mitmServer: http.Server;
+  private logFile: string | undefined;
+  private activeConnections = 0;
+  private rateBuckets = new Map<string, { count: number; windowStart: number }>();
+  private byteCounters = new Map<string, { in: number; out: number }>();
 
   constructor(
     config: EgressRuntimeConfig,
     caDir?: string,
+    logFile?: string,
   ) {
     this.config = config;
     this.caDir = caDir || path.join(process.cwd(), ".mitm-ca");
+    this.logFile = logFile;
     this.mitmServer = http.createServer((req, res) => {
       this.handleMitmRequest(req, res);
     });
@@ -485,11 +394,20 @@ export class EgressProxy {
     return this.mitmCa;
   }
 
+  /** Snapshot of live connection count and per-host byte counters. */
+  getStats(): { activeConnections: number; hosts: Record<string, { in: number; out: number }> } {
+    const hosts: Record<string, { in: number; out: number }> = {};
+    for (const [h, v] of this.byteCounters) hosts[h] = { ...v };
+    return { activeConnections: this.activeConnections, hosts };
+  }
+
   async start(): Promise<void> {
-    // If MITM is enabled, ensure the CA exists.
+    // If MITM is enabled, ensure the CA exists (pure-Node, async).
     if (this.config.enableMitm) {
-      this.mitmCa = ensureMitmCa(this.caDir);
+      this.mitmCa = await ensureMitmCa(this.caDir);
     }
+
+    this.initLogFile();
 
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => {
@@ -504,13 +422,25 @@ export class EgressProxy {
         console.error("[egress-proxy] server error:", err);
       });
 
+      // Idle keep-alive protection. requestTimeout is disabled (0) so long-lived
+      // downloads / SSE streams are not killed mid-transfer.
+      this.server.keepAliveTimeout = 65000;
+      this.server.headersTimeout = 66000;
+      this.server.requestTimeout = 0;
+      this.server.on("connection", (socket) => this.trackConnection(socket));
+
+      this.mitmServer.keepAliveTimeout = 65000;
+      this.mitmServer.headersTimeout = 66000;
+      this.mitmServer.requestTimeout = 0;
+
       const port = this.config.port;
-      this.server.listen(port, "0.0.0.0", () => {
+      const host = this.config.listenHost || "0.0.0.0";
+      this.server.listen(port, host, () => {
         const addr = this.server!.address();
         if (addr && typeof addr === "object") {
           this.config.port = addr.port;
         }
-        console.log(`[egress-proxy] listening on 0.0.0.0:${this.config.port} (policy=${this.config.policy}, mitm=${this.config.enableMitm})`);
+        console.log(`[egress-proxy] listening on ${host}:${this.config.port} (policy=${this.config.policy}, mitm=${this.config.enableMitm})`);
         resolve();
       });
     });
@@ -528,6 +458,66 @@ export class EgressProxy {
         resolve();
       });
     });
+  }
+
+  /**
+   * Count a live TCP connection and enforce the max-connections limit.
+   * Over-limit connections are rejected with 503 and destroyed.
+   */
+  private trackConnection(socket: net.Socket): void {
+    this.activeConnections++;
+    if (this.activeConnections > this.config.maxConnections) {
+      this.log("DENY", "", socket.remoteAddress || "?", `connection limit reached (${this.config.maxConnections})`);
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    socket.once("close", () => { this.activeConnections--; });
+  }
+
+  /**
+   * Sliding-minute rate limit per client IP. Returns false when the limit is
+   * exceeded. A limit of 0 disables rate limiting entirely.
+   */
+  private checkRateLimit(ip: string): boolean {
+    const limit = this.config.rateLimitPerMin;
+    if (!limit || limit <= 0) return true;
+    const now = Date.now();
+    const minute = 60000;
+    const bucket = this.rateBuckets.get(ip);
+    if (!bucket || now - bucket.windowStart >= minute) {
+      this.rateBuckets.set(ip, { count: 1, windowStart: now });
+      return true;
+    }
+    bucket.count++;
+    return bucket.count <= limit;
+  }
+
+  /** Accumulate byte counts (up = client→upstream, down = upstream→client). */
+  private addBytes(host: string, up: number, down: number): void {
+    let c = this.byteCounters.get(host);
+    if (!c) { c = { in: 0, out: 0 }; this.byteCounters.set(host, c); }
+    c.in += up;
+    c.out += down;
+  }
+
+  /**
+   * Open the rotating log file. Truncates to empty if the existing file exceeds
+   * 10 MB (rotation on startup).
+   */
+  private initLogFile(): void {
+    if (!this.logFile) return;
+    try {
+      fs.mkdirSync(path.dirname(this.logFile), { recursive: true });
+      if (fs.existsSync(this.logFile)) {
+        const st = fs.statSync(this.logFile);
+        if (st.size > 10 * 1024 * 1024) {
+          fs.writeFileSync(this.logFile, "");
+        }
+      }
+    } catch (err: any) {
+      console.error("[egress-proxy] failed to init log file:", err.message);
+    }
   }
 
   private authenticate(req: http.IncomingMessage): boolean {
@@ -571,6 +561,15 @@ export class EgressProxy {
         "Proxy-Connection": "close",
       });
       res.end("Proxy authentication required\n");
+      return;
+    }
+
+    // Per-client rate limit.
+    const clientIp = req.socket.remoteAddress || "?";
+    if (!this.checkRateLimit(clientIp)) {
+      this.log("DENY", req.method || "GET", clientIp, "rate limit exceeded");
+      res.writeHead(429, { "Content-Type": "text/plain", "Proxy-Connection": "close" });
+      res.end("Too Many Requests\n");
       return;
     }
 
@@ -624,13 +623,19 @@ export class EgressProxy {
       return;
     }
 
-    const options: http.RequestOptions = {
+    const options: https.RequestOptions = {
       hostname: targetHost,
       port,
       path,
       method: req.method,
       headers: { ...req.headers },
     };
+
+    // Custom upstream CA bundle (D9): verify internal/self-signed upstreams
+    // against the configured CA in addition to the system trust store.
+    if (useTls && this.config.caCert) {
+      options.ca = [...tls.rootCertificates, this.config.caCert];
+    }
 
     // Strip proxy-specific headers before forwarding.
     delete (options.headers as any)["proxy-authorization"];
@@ -639,7 +644,8 @@ export class EgressProxy {
     return new Promise((resolve, reject) => {
       const mod = useTls ? https : http;
       const forwardReq = mod.request(options, (forwardRes) => {
-        res.writeHead(forwardRes.statusCode || 200, forwardRes.headers);
+        res.writeHead(forwardRes.statusCode || 200, sanitizeResponseHeaders(forwardRes.headers));
+        forwardRes.on("data", (c: Buffer) => this.addBytes(targetHost, 0, c.length));
         forwardRes.pipe(res);
         resolve();
       });
@@ -661,6 +667,15 @@ export class EgressProxy {
     // Authentication check.
     if (!this.authenticate(req)) {
       clientSocket.write("HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\nProxy-Authenticate: Basic realm=\"valencebox\"\r\n\r\n");
+      clientSocket.end();
+      return;
+    }
+
+    // Per-client rate limit.
+    const clientIp = (clientSocket as net.Socket).remoteAddress || "?";
+    if (!this.checkRateLimit(clientIp)) {
+      this.log("DENY", "CONNECT", clientIp, "rate limit exceeded");
+      clientSocket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
       clientSocket.end();
       return;
     }
@@ -702,6 +717,10 @@ export class EgressProxy {
       }
 
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+
+      // Byte counters for the tunnel (observe chunks; pipe still owns flow).
+      clientSocket.on("data", (c: Buffer) => this.addBytes(targetHost, c.length, 0));
+      upstream.on("data", (c: Buffer) => this.addBytes(targetHost, 0, c.length));
 
       // Start the tunnel: relay between client and upstream.
       // Simple two-way relay using pipe
@@ -749,11 +768,11 @@ export class EgressProxy {
       return;
     }
 
-    // Get or generate a leaf certificate for this host.
+    // Get or generate a leaf certificate for this host (pure-Node, async).
     const certCacheDir = path.join(this.caDir, "certs");
     let leaf: { cert: string; key: string };
     try {
-      leaf = ensureLeafCertificate(targetHost, this.mitmCa, certCacheDir);
+      leaf = await ensureLeafCertificate(targetHost, this.mitmCa, certCacheDir);
     } catch (err: any) {
       this.log("ERROR", "MITM", `${targetHost}:${targetPort}`, `cert generation failed: ${err.message}`);
       clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nFailed to generate TLS certificate for interception\n");
@@ -891,52 +910,46 @@ export class EgressProxy {
       }
 
       // Forward to the upstream server over TLS.
-      const upstreamReq = https.request({
+      const upstreamOpts: https.RequestOptions = {
         hostname: targetHost,
         port: targetPort,
         path: req.url,
         method: req.method,
         headers: Object.fromEntries(rewrittenHeaders),
         rejectUnauthorized: process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0",
-      }, (upstreamRes) => {
+      };
+      // Custom upstream CA bundle (D9): verify against the configured CA in
+      // addition to the system trust store.
+      if (this.config.caCert) {
+        upstreamOpts.ca = [...tls.rootCertificates, this.config.caCert];
+      }
+      const upstreamReq = https.request(upstreamOpts, (upstreamRes) => {
         const statusCode = upstreamRes.statusCode || 200;
         this.log("MITM", method, `${targetHost}:${targetPort}`, `upstream responded ${statusCode}`);
-        res.writeHead(statusCode, upstreamRes.headers);
+        res.writeHead(statusCode, sanitizeResponseHeaders(upstreamRes.headers));
 
-        // Log all upstream response events for debugging SSE terminations.
-        const upTag = `upstream:${method}:${targetHost}:${targetPort}`;
         let clientDisconnected = false;
-        upstreamRes.on("end", () => this.log("DEBUG", upTag, "", "upstreamRes 'end'"));
+        upstreamRes.on("data", (c: Buffer) => this.addBytes(targetHost, 0, c.length));
         upstreamRes.on("error", (err) => {
-          this.log("ERROR", upTag, "", `upstreamRes 'error': ${err.message}`);
+          this.log("ERROR", method, `${targetHost}:${targetPort}`, `upstream response error: ${err.message}`);
           res.destroy();
           upstreamReq.destroy();
         });
-        upstreamRes.on("pause", () => this.log("DEBUG", upTag, "", "upstreamRes 'pause' (backpressure)"));
-        upstreamRes.on("resume", () => this.log("DEBUG", upTag, "", "upstreamRes 'resume'"));
         upstreamRes.on("close", () => {
-          this.log("DEBUG", upTag, "", `upstreamRes 'close' (complete=${upstreamRes.complete}, errored=${!!upstreamRes.errored})`);
           if (!upstreamRes.complete && !clientDisconnected) {
-            this.log("ERROR", upTag, "", `upstream connection dropped mid-stream`);
+            this.log("ERROR", method, `${targetHost}:${targetPort}`, "upstream connection dropped mid-stream");
             res.destroy();
             upstreamReq.destroy();
           }
         });
-
-        // Log client response events.
-        const cliTag = `client:${method}:${targetHost}:${targetPort}`;
         res.on("close", () => {
-          const ended = res.writableEnded;
-          if (!ended) clientDisconnected = true;
-          this.log("DEBUG", cliTag, "", `res 'close' (writableEnded=${ended})`);
-          if (!ended) {
-            this.log("ERROR", cliTag, "", `client disconnected before response completed (upstream status ${statusCode})`);
+          if (!res.writableEnded) {
+            clientDisconnected = true;
+            this.log("ERROR", method, `${targetHost}:${targetPort}`, `client disconnected before response completed (status ${statusCode})`);
           }
           upstreamRes.destroy();
           upstreamReq.destroy();
         });
-        res.on("finish", () => this.log("DEBUG", cliTag, "", "res 'finish'"));
-        res.on("drain", () => this.log("DEBUG", cliTag, "", "res 'drain'"));
 
         upstreamRes.pipe(res);
       });
@@ -991,6 +1004,14 @@ export class EgressProxy {
   private log(type: string, method: string, target: string, detail: string): void {
     if (type === "DEBUG" && process.env.VERBOSE !== "1") return;
     const timestamp = new Date().toISOString();
-    console.log(`[egress-proxy] ${timestamp} ${type} ${method} ${target} ${detail}`);
+    const line = `[egress-proxy] ${timestamp} ${type} ${method} ${target} ${detail}`;
+    console.log(line);
+    if (this.logFile) {
+      try {
+        fs.appendFileSync(this.logFile, line + "\n");
+      } catch {
+        // Never let a log-write failure disrupt proxying.
+      }
+    }
   }
 }

@@ -122,7 +122,11 @@ host-process forward proxy (`EgressProxy`). Configure it via
       { "env": "GITHUB_TOKEN", "fromEnv": "GITHUB_TOKEN",        "hosts": ["api.github.com"] },
       // Read from a file on disk at startup (supports ~ expansion):
       { "env": "NPM_TOKEN",    "fromFile": "~/.secrets/npm.key", "hosts": ["registry.npmjs.org"] },
-    ]
+    ],
+    "caCertFile": "~/.company/ca.pem",  // custom upstream CA bundle (PEM)
+    "maxConnections": 256,              // over-limit → 503
+    "rateLimitPerMin": 0,               // per-client-IP cap; 0 = off → 429
+    "listenHost": "0.0.0.0"             // bind interface (guest reaches via 10.0.2.2)
   }
 }
 ```
@@ -134,6 +138,13 @@ host-process forward proxy (`EgressProxy`). Configure it via
 | `denyHosts` | `[]` | Hostnames/wildcards always blocked |
 | `enableMitm` | `false` | When `true`, TLS connections to secret hosts are intercepted, placeholders replaced with real secrets, and re-encrypted upstream |
 | `secrets` | `[]` | List of credential specs: `env` (guest var name), `value` / `fromFile` / `fromEnv` (source), `hosts` (which hosts trigger MITM). Priority: `value` > `fromFile` > `fromEnv` |
+| `caCertFile` | — | PEM bundle used to verify upstream TLS servers in addition to the system trust store (for internal/self-signed upstreams). Supports `~` |
+| `maxConnections` | `256` | Max concurrent TCP connections; over-limit rejected with `503` |
+| `rateLimitPerMin` | `0` | Max requests/CONNECTs per client IP per minute; over-limit returns `429`. `0` disables |
+| `listenHost` | `"0.0.0.0"` | Interface the proxy binds to (guest reaches it via the SLIRP gateway `10.0.2.2`) |
+
+MITM CA and leaf certificates are generated in pure Node (`selfsigned` →
+`@peculiar/x509`) — no `openssl` required on the host.
 
 ### How MITM works
 
