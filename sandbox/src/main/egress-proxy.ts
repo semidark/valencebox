@@ -623,6 +623,13 @@ export class EgressProxy {
       return;
     }
 
+    // Secret hosts over plain HTTP: buffer and rewrite headers/body so
+    // placeholders are swapped for real secrets without TLS interception.
+    if (!useTls && this.isSecretHost(targetHost)) {
+      await this.forwardRequestWithSecrets(req, res, targetHost, port, path);
+      return;
+    }
+
     const options: https.RequestOptions = {
       hostname: targetHost,
       port,
@@ -661,6 +668,99 @@ export class EgressProxy {
         forwardReq.end();
       }
     });
+  }
+
+  private async forwardRequestWithSecrets(req: http.IncomingMessage, res: http.ServerResponse, targetHost: string, port: number, path: string): Promise<void> {
+    const method = req.method || "GET";
+    try {
+      const transferEncoding = req.headers["transfer-encoding"];
+      if (transferEncoding && transferEncoding.toLowerCase().includes("chunked")) {
+        this.log("BLOCK", method, targetHost, "chunked encoding not supported for secret hosts");
+        this.send403(res, "chunked encoding is not supported for secret hosts");
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      let totalLen = 0;
+      for await (const chunk of req) {
+        totalLen += chunk.length;
+        if (totalLen > MITM_MAX_BODY_SIZE) {
+          this.send403(res, "payload too large");
+          return;
+        }
+        chunks.push(chunk as Buffer);
+      }
+      const body = Buffer.concat(chunks);
+
+      const rawHeaders: [string, string][] = [];
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        rawHeaders.push([req.rawHeaders[i], req.rawHeaders[i + 1]]);
+      }
+
+      const rewrittenHeaders = rewriteHeaders(rawHeaders, this.config.secrets, targetHost);
+      const rewrittenBody = rewriteBody(body, this.config.secrets);
+
+      const origContentLength = req.headers["content-length"];
+      if (rewrittenBody !== body && origContentLength) {
+        const origLen = parseInt(origContentLength, 10);
+        let clFixed = false;
+        for (let i = 0; i < rewrittenHeaders.length; i++) {
+          if (rewrittenHeaders[i][0].toLowerCase() === "content-length") {
+            rewrittenHeaders[i][1] = rewrittenBody.length.toString();
+            clFixed = true;
+            break;
+          }
+        }
+        if (!clFixed) {
+          rewrittenHeaders.push(["content-length", rewrittenBody.length.toString()]);
+        }
+        this.log("DEBUG", method, `${targetHost}:${port}`,
+          `Content-Length adjusted: ${origLen} → ${rewrittenBody.length}`);
+      }
+
+      const headers: Record<string, string> = Object.fromEntries(rewrittenHeaders);
+      delete headers["proxy-authorization"];
+      delete headers["proxy-connection"];
+
+      const options: https.RequestOptions = {
+        hostname: targetHost,
+        port,
+        path,
+        method,
+        headers,
+      };
+
+      const forwardReq = http.request(options, (forwardRes) => {
+        this.log("HTTP-SECRET", method, `${targetHost}:${port}`, `upstream responded ${forwardRes.statusCode}`);
+        res.writeHead(forwardRes.statusCode || 200, sanitizeResponseHeaders(forwardRes.headers));
+        forwardRes.on("data", (c: Buffer) => this.addBytes(targetHost, 0, c.length));
+        forwardRes.pipe(res);
+      });
+
+      forwardReq.on("error", (err) => {
+        this.log("ERROR", method, `${targetHost}:${port}`, `upstream error: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "text/plain", "Proxy-Connection": "close" });
+          res.end(`Bad Gateway: ${err.message}\n`);
+        }
+      });
+
+      forwardReq.write(rewrittenBody);
+      forwardReq.end();
+
+      this.log("HTTP-SECRET", method, `${targetHost}:${port}`, "secret injection active");
+    } catch (err: any) {
+      if (err instanceof PlaceholderViolation) {
+        this.log("BLOCK", method, targetHost, `placeholder(s) not authorized: ${err.envNames.join(", ")}`);
+        this.send403(res, `Egress denied: ${err.message}`);
+      } else {
+        this.log("ERROR", method, `${targetHost}:${port}`, err.message);
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "text/plain", "Proxy-Connection": "close" });
+          res.end(`Bad Gateway: ${err.message}\n`);
+        }
+      }
+    }
   }
 
   private async handleConnect(req: http.IncomingMessage, clientSocket: Duplex, head: Buffer): Promise<void> {
