@@ -59,6 +59,34 @@ export interface EgressConfig {
 
   /** Secrets to inject: placeholders in the guest, real values replaced by the proxy. */
   secrets?: SecretSpec[];
+
+  /**
+   * Path to a custom CA bundle (PEM) used to verify upstream TLS servers.
+   * Supports `~` for the user's home directory. Use this when upstreams present
+   * internal/self-signed certificates that should verify without disabling
+   * `rejectUnauthorized`. When set, MITM upstream connections verify against
+   * this bundle in addition to the system trust store.
+   */
+  caCertFile?: string;
+
+  /**
+   * Maximum number of concurrent connections the proxy will accept.
+   * Connections beyond this limit are rejected with 503. Default 256.
+   */
+  maxConnections?: number;
+
+  /**
+   * Maximum requests (or CONNECTs) per client IP per minute. 0 disables rate
+   * limiting. Requests beyond the limit are rejected with 429. Default 0.
+   */
+  rateLimitPerMin?: number;
+
+  /**
+   * Host interface the proxy binds to. Default "0.0.0.0" so the guest can reach
+   * it via the SLIRP gateway (10.0.2.2). Set to "127.0.0.1" to restrict to
+   * loopback only if your SLIRP setup delivers guest connections via loopback.
+   */
+  listenHost?: string;
 }
 
 /**
@@ -86,6 +114,14 @@ export interface EgressRuntimeConfig {
   secrets: ResolvedSecret[];
   port: number;
   authToken: string;
+  /** Resolved PEM content of the custom upstream CA bundle, or undefined. */
+  caCert?: string;
+  /** Max concurrent connections accepted by the proxy. */
+  maxConnections: number;
+  /** Max requests per client IP per minute; 0 = unlimited. */
+  rateLimitPerMin: number;
+  /** Interface the proxy binds to. */
+  listenHost: string;
 }
 
 // ---- Port forwarding ----

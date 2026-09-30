@@ -16,7 +16,7 @@
     "test:boot": "tsx test/boot.test.ts",
     "test:ui": "electron test/ui-smoke.js",
     "images": "./scripts/build-guest.sh",
-"images:all": "./scripts/build-guest.sh --arch amd64 && ./scripts/build-guest.sh --arch arm64",
+    "images:all": "./scripts/build-guest.sh --arch amd64 && ./scripts/build-guest.sh --arch arm64",
     "build:qemu": "bash ../scripts/build-qemu.sh"
   },
   "dependencies": {
@@ -24,11 +24,13 @@
     "@mongodb-js/zstd": "^2.0.0",
     "@nephele/adapter-file-system": "^1.0.0-alpha.67",
     "@nephele/authenticator-custom": "^1.0.0-alpha.67",
+    "@peculiar/x509": "2.1.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "blakejs": "^1.2.1",
     "chokidar": "^4.0.0",
     "nephele": "^1.0.0-alpha.67",
+    "selfsigned": "5.5.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

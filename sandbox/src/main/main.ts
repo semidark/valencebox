@@ -2,6 +2,7 @@
 // bridges to renderer.
 import { app, BrowserWindow, ipcMain } from "electron";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { VmManager } from "./vm-manager";
 import { HttpShare } from "./http-share";
@@ -43,6 +44,19 @@ function buildProxyConfig(cfg: SandboxAppConfig): EgressRuntimeConfig {
   // Use port from config if specified, otherwise let the OS assign one.
   const port = egress.listenPort ?? 0;
 
+  // Resolve a custom upstream CA bundle (PEM) if configured.
+  let caCert: string | undefined;
+  if (egress.caCertFile) {
+    const p = egress.caCertFile.startsWith("~")
+      ? path.join(os.homedir(), egress.caCertFile.slice(1))
+      : egress.caCertFile;
+    try {
+      caCert = fs.readFileSync(p, "utf-8");
+    } catch (err: any) {
+      throw new Error(`egress.caCertFile: failed to read '${p}': ${err.message}`);
+    }
+  }
+
   return {
     policy: egress.policy ?? "none",
     allowHosts: egress.allowHosts ?? [],
@@ -53,6 +67,10 @@ function buildProxyConfig(cfg: SandboxAppConfig): EgressRuntimeConfig {
     secrets: resolvedSecrets,
     port,
     authToken,
+    caCert,
+    maxConnections: egress.maxConnections ?? 256,
+    rateLimitPerMin: egress.rateLimitPerMin ?? 0,
+    listenHost: egress.listenHost ?? "0.0.0.0",
   };
 }
 
@@ -162,7 +180,8 @@ async function startVm() {
   const proxyCfg = buildProxyConfig(appCfg);
   // buildProxyConfig already returns port=0 (OS-assign) unless egress.listenPort is set.
   const caDir = path.join(app.getPath("userData"), "mitm-ca");
-  proxy = new EgressProxy(proxyCfg, caDir);
+  const proxyLogFile = path.join(app.getPath("userData"), "proxy.log");
+  proxy = new EgressProxy(proxyCfg, caDir, proxyLogFile);
   await proxy.start();
   const proxyPort = proxy.port;
   console.log(`[egress-proxy] listening on 0.0.0.0:${proxyPort} (policy=${proxyCfg.policy})`);

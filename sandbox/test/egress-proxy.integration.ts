@@ -32,7 +32,7 @@ async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
 
 // ---- Helpers ----
 
-function createMitmCa(tempDir: string): MitmCa {
+async function createMitmCa(tempDir: string): Promise<MitmCa> {
   const caDir = path.join(tempDir, "ca");
   return ensureMitmCa(caDir);
 }
@@ -58,6 +58,7 @@ function generateTestKeyPair(tmpDir: string): { key: string; cert: string } {
     "-sha256",
     "-days", "1",
     "-subj", "/CN=localhost/O=Test",
+    "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
   ], { encoding: "utf-8", timeout: 5000 });
 
   if (result.status !== 0) throw new Error(`openssl failed: ${result.stderr}`);
@@ -71,22 +72,37 @@ function generateTestKeyPair(tmpDir: string): { key: string; cert: string } {
 async function testMitmCertGeneration() {
   const tmpDir = fs.mkdtempSync("mitm-test-");
   try {
-    const ca = createMitmCa(tmpDir);
+    const ca = await createMitmCa(tmpDir);
     assert(fs.existsSync(ca.cert), "CA cert file exists");
     assert(fs.existsSync(ca.key), "CA key file exists");
 
+    // CA must be a real CA (basicConstraints CA:TRUE).
+    const caX = new crypto.X509Certificate(fs.readFileSync(ca.cert));
+    assert(caX.subject.includes("ValenceBox MITM CA"), "CA subject correct");
+
     // Generate a leaf cert for a test host.
     const certCacheDir = path.join(tmpDir, "certs");
-    const leaf = ensureLeafCertificate("test.example.com", ca, certCacheDir);
+    const leaf = await ensureLeafCertificate("test.example.com", ca, certCacheDir);
     assert(fs.existsSync(leaf.cert), "leaf cert file exists");
     assert(fs.existsSync(leaf.key), "leaf key file exists");
 
+    // Leaf must carry the DNS SAN and be signed by the CA.
+    const leafX = new crypto.X509Certificate(fs.readFileSync(leaf.cert));
+    assert(leafX.subjectAltName === "DNS:test.example.com", `leaf SAN correct (got ${leafX.subjectAltName})`);
+    assert(leafX.issuer === caX.subject, "leaf issued by CA");
+    assert(leafX.verify(caX.publicKey), "leaf signature verifies against CA public key");
+
     // Cached reuse: calling again should return the same files.
-    const leaf2 = ensureLeafCertificate("test.example.com", ca, certCacheDir);
+    const leaf2 = await ensureLeafCertificate("test.example.com", ca, certCacheDir);
     assertEq(leaf.cert, leaf2.cert, "leaf cert cache hit");
     assertEq(leaf.key, leaf2.key, "leaf key cache hit");
 
-    console.log("✓ MITM CA and leaf cert generation");
+    // IP host gets an IP SAN, not a DNS SAN.
+    const ipLeaf = await ensureLeafCertificate("127.0.0.1", ca, certCacheDir);
+    const ipLeafX = new crypto.X509Certificate(fs.readFileSync(ipLeaf.cert));
+    assert(ipLeafX.subjectAltName === "IP Address:127.0.0.1", `IP SAN correct (got ${ipLeafX.subjectAltName})`);
+
+    console.log("✓ MITM CA and leaf cert generation (pure-Node)");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -123,6 +139,7 @@ async function testAuthTokenValidation() {
     policy: "none", allowHosts: [], denyHosts: [],
     allowPorts: [80, 443], allowAll: true, enableMitm: false,
     secrets: [], port: 0, authToken: "test-token",
+    maxConnections: 256, rateLimitPerMin: 0, listenHost: "127.0.0.1",
   };
   const proxy = new EgressProxy(config);
 
@@ -159,6 +176,7 @@ async function testConnectPolicyEnforcement() {
     policy: "allowlist", allowHosts: ["allowed.example.com"], denyHosts: [],
     allowPorts: [80, 443], allowAll: false, enableMitm: false,
     secrets: [], port: 0, authToken: "test",
+    maxConnections: 256, rateLimitPerMin: 0, listenHost: "127.0.0.1",
   };
   const proxy = new EgressProxy(config);
 
@@ -252,6 +270,9 @@ async function testMitmSecretInjection() {
       ],
       port: 0,
       authToken: "test",
+      maxConnections: 256,
+      rateLimitPerMin: 0,
+      listenHost: "127.0.0.1",
     };
 
     const caDir = path.join(tmpDir, "ca");
@@ -350,6 +371,173 @@ async function testMitmSecretInjection() {
   }
 }
 
+// ---- D8: max connection limit ----
+
+async function testMaxConnectionLimit() {
+  const config: EgressRuntimeConfig = {
+    policy: "none", allowHosts: [], denyHosts: [],
+    allowPorts: [80, 443], allowAll: true, enableMitm: false,
+    secrets: [], port: 0, authToken: "test",
+    maxConnections: 1, rateLimitPerMin: 0, listenHost: "127.0.0.1",
+  };
+  const proxy = new EgressProxy(config);
+  try {
+    await proxy.start();
+    const port = proxy.port;
+
+    // Occupy the single allowed connection.
+    const sock1 = net.connect(port, "127.0.0.1");
+    await new Promise<void>((resolve) => sock1.once("connect", resolve));
+
+    // Second connection exceeds the limit → 503.
+    const sock2 = net.connect(port, "127.0.0.1");
+    const data = await new Promise<Buffer>((resolve) => {
+      sock2.once("data", resolve);
+      setTimeout(() => sock2.destroy(), 2000);
+    });
+    assert(data.toString("utf-8").includes("503"), `over-limit connection gets 503 (got ${data.toString("utf-8").slice(0, 40)})`);
+
+    sock1.destroy();
+    sock2.destroy();
+    console.log("✓ max connection limit (503 over limit)");
+  } finally {
+    await proxy.stop();
+  }
+}
+
+// ---- D8: per-client rate limit ----
+
+async function testRateLimit() {
+  const config: EgressRuntimeConfig = {
+    policy: "none", allowHosts: [], denyHosts: [],
+    allowPorts: [80, 443], allowAll: true, enableMitm: false,
+    secrets: [], port: 0, authToken: "test",
+    maxConnections: 256, rateLimitPerMin: 2, listenHost: "127.0.0.1",
+  };
+  const proxy = new EgressProxy(config);
+  try {
+    await proxy.start();
+    const port = proxy.port;
+    const auth = "Basic " + Buffer.from("psbx:test").toString("base64");
+
+    const good1 = await proxyRequest(port, "example.com", auth);
+    const good2 = await proxyRequest(port, "example.com", auth);
+    assert(good1 !== 429 && good2 !== 429, `first two requests not rate-limited (got ${good1}, ${good2})`);
+
+    const limited = await proxyRequest(port, "example.com", auth);
+    assertEq(limited, 429, "third request within the minute is rate-limited");
+
+    console.log("✓ per-client rate limit (429 over limit)");
+  } finally {
+    await proxy.stop();
+  }
+}
+
+// ---- D9: custom upstream CA verification ----
+
+async function testCustomUpstreamCa() {
+  const tmpDir = fs.mkdtempSync("mitm-ca-test-");
+  let upstreamServer: https.Server | undefined;
+  let proxy: EgressProxy | undefined;
+
+  try {
+    const upstreamDir = path.join(tmpDir, "upstream");
+    fs.mkdirSync(upstreamDir, { recursive: true });
+    const upstreamKeyPair = generateTestKeyPair(upstreamDir);
+    const upstreamCert = fs.readFileSync(upstreamKeyPair.cert, "utf-8");
+
+    upstreamServer = https.createServer(
+      { key: fs.readFileSync(upstreamKeyPair.key), cert: fs.readFileSync(upstreamKeyPair.cert) },
+      (_req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("secure-ok"); },
+    );
+    await new Promise<void>((resolve) => upstreamServer!.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstreamServer!.address() as any).port;
+
+    const proxyConfig: EgressRuntimeConfig = {
+      policy: "allowlist", allowHosts: ["127.0.0.1"], denyHosts: [],
+      allowPorts: [upstreamPort, 443], allowAll: false, enableMitm: true,
+      secrets: [{ env: "T", value: "real", placeholder: "psbx-sec-ca-1", hosts: ["127.0.0.1"] }],
+      port: 0, authToken: "test",
+      caCert: upstreamCert,
+      maxConnections: 256, rateLimitPerMin: 0, listenHost: "127.0.0.1",
+    };
+    proxy = new EgressProxy(proxyConfig, path.join(tmpDir, "ca"));
+    await proxy.start();
+    const proxyPort = proxy.port;
+    const auth = "Basic " + Buffer.from("psbx:test").toString("base64");
+
+    // Force strict upstream verification for this test (ignore ambient env).
+    const savedEnv = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    try {
+      const sock = net.connect(proxyPort, "127.0.0.1");
+      sock.write(`CONNECT 127.0.0.1:${upstreamPort} HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+      await new Promise<void>((resolve) => sock.once("data", () => resolve()));
+
+      const clientTls = tls.connect({ socket: sock, host: "127.0.0.1", rejectUnauthorized: false });
+      await new Promise<void>((resolve, reject) => {
+        clientTls.once("secureConnect", () => resolve());
+        clientTls.once("error", reject);
+        setTimeout(() => reject(new Error("TLS timeout")), 3000);
+      });
+
+      clientTls.write("GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Token: psbx-sec-ca-1\r\nConnection: close\r\n\r\n");
+      const resp = await new Promise<Buffer>((resolve) => {
+        const chunks: Buffer[] = [];
+        clientTls.on("data", (c) => chunks.push(c as Buffer));
+        clientTls.on("end", () => resolve(Buffer.concat(chunks)));
+        clientTls.on("error", () => resolve(Buffer.concat(chunks)));
+        setTimeout(() => resolve(Buffer.concat(chunks)), 4000);
+      });
+      clientTls.destroy();
+
+      const s = resp.toString("utf-8");
+      // With the custom CA configured, the self-signed upstream verifies under
+      // strict checking → 200, not a 502 verification failure.
+      assert(s.includes("200") && s.includes("secure-ok"), `custom CA upstream verified (got ${s.slice(0, 60)})`);
+      assert(!s.includes("502"), "no 502 (upstream CA verification passed)");
+    } finally {
+      if (savedEnv !== undefined) process.env.NODE_TLS_REJECT_UNAUTHORIZED = savedEnv;
+    }
+
+    console.log("✓ custom upstream CA verification (strict)");
+  } finally {
+    await proxy?.stop();
+    upstreamServer?.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// ---- C2: log file sink ----
+
+async function testLogFileSink() {
+  const tmpDir = fs.mkdtempSync("proxylog-");
+  const logFile = path.join(tmpDir, "proxy.log");
+  const config: EgressRuntimeConfig = {
+    policy: "allowlist", allowHosts: [], denyHosts: ["blocked.example.com"],
+    allowPorts: [80, 443], allowAll: false, enableMitm: false,
+    secrets: [], port: 0, authToken: "test",
+    maxConnections: 256, rateLimitPerMin: 0, listenHost: "127.0.0.1",
+  };
+  const proxy = new EgressProxy(config, path.join(tmpDir, "ca"), logFile);
+  try {
+    await proxy.start();
+    const port = proxy.port;
+    const auth = "Basic " + Buffer.from("psbx:test").toString("base64");
+    // Trigger a DENY (blocked host) which logs to the file.
+    await proxyRequest(port, "blocked.example.com", auth);
+
+    assert(fs.existsSync(logFile), "log file created");
+    const contents = fs.readFileSync(logFile, "utf-8");
+    assert(contents.includes("DENY"), `log file contains DENY entry (got: ${contents.slice(0, 120)})`);
+    assert(contents.includes("blocked.example.com"), "log file names the blocked host");
+    console.log("✓ log file sink (DENY persisted)");
+  } finally {
+    await proxy.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 // ---- Run all ----
 
 async function main() {
@@ -358,6 +546,10 @@ async function main() {
     await testAuthTokenValidation();
     await testConnectPolicyEnforcement();
     await testMitmSecretInjection();
+    await testMaxConnectionLimit();
+    await testRateLimit();
+    await testCustomUpstreamCa();
+    await testLogFileSink();
     console.log("\nALL EGRESS PROXY INTEGRATION TESTS PASSED");
   } catch (err: any) {
     console.error("\nTEST FAILED:", err.message);

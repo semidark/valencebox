@@ -47,13 +47,36 @@ automated check or the code that enforces it.
       `portForwards` default to `hostIp: "127.0.0.1"` unless the user
       explicitly overrides it. This prevents accidental exposure of guest
       services to the network.
-- [ ] **MITM TLS interception (optional).** When `egress.enableMitm` is
+- [x] **Proxy connection + rate limits.** `maxConnections` (default 256) caps
+      concurrent TCP connections; over-limit connections are rejected with 503.
+      `rateLimitPerMin` (default 0 = off) caps requests/CONNECTs per client IP
+      per minute; over-limit returns 429. This contains resource exhaustion from
+      a compromised guest. Verified: `test/egress-proxy.integration.ts`
+      (max-connection 503, rate-limit 429).
+- [x] **Response header sanitization.** `Strict-Transport-Security`,
+      `Public-Key-Pins`, `Public-Key-Pins-Report-Only`, and `Expect-CT` are
+      stripped from upstream responses (plain-HTTP forward + MITM paths) so they
+      cannot pin the guest against the proxy's MITM leaf. Verified:
+      `test/egress-proxy.unit.ts` (`sanitizeResponseHeaders`).
+- [x] **MITM TLS interception (optional).** When `egress.enableMitm` is
       `true`, the proxy terminates TLS for declared secret hosts, replaces
       placeholder strings with real credentials, and re-encrypts to the
       upstream. The guest must trust the proxy's ephemeral CA (installed via
       `update-ca-certificates` in the guest image). MITM is off by default.
       Verified: `test/egress-proxy.unit.ts` (placeholder replacement in
-      headers and body; unauthorized host blocking).
+      headers and body; unauthorized host blocking) and
+      `test/egress-proxy.integration.ts` (end-to-end injection).
+- [x] **Pure-Node certificate generation (no `openssl`).** The MITM CA and leaf
+      certs are generated with `selfsigned` (→ `@peculiar/x509`), removing the
+      host `openssl` subprocess dependency (and its env-var injection surface).
+      Leaf certs carry a DNS SAN for hostnames and an IP SAN for IP literals.
+      Verified: `test/egress-proxy.integration.ts` (CA:TRUE, leaf SAN, chain
+      verification).
+- [x] **Custom upstream CA (optional).** `egress.caCertFile` supplies a PEM
+      bundle used to verify upstream TLS servers in addition to the system
+      trust store, so internal/self-signed upstreams verify without disabling
+      `rejectUnauthorized`. Verified: `test/egress-proxy.integration.ts`
+      (strict verification against a custom CA).
 - [ ] **Secret placeholders protect credentials.** Real secrets (API keys,
       tokens) are never exposed to the guest. The host generates
       cryptographically random placeholders (`psbx-sec-<hex>`) that the
@@ -72,8 +95,7 @@ automated check or the code that enforces it.
   hostname+port. For plain HTTP forward (non-CONNECT), the proxy forwards
   GET/POST/etc. requests; MITM interception applies only to CONNECT on
   declared secret hosts.
-- MITM CA and leaf certs use `openssl` subprocess (requires `openssl` on
-  host). A pure-Node fallback is tracked in Phase C.
+
 ## Persistence & durability
 
 - [x] **Canonical store is the host directory**, not VM disk internals. A
