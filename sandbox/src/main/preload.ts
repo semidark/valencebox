@@ -23,4 +23,8 @@ contextBridge.exposeInMainWorld("sandbox", {
   // Memory balloon
   setBalloon: (mb: number): Promise<void> => ipcRenderer.invoke(IPC.setBalloon, mb),
   getBalloon: (): Promise<BalloonStatus | null> => ipcRenderer.invoke(IPC.getBalloon),
+  // Clipboard (routed through main so terminal copy/paste works regardless of
+  // renderer secure-context / permission state on file://)
+  clipboardRead: (): Promise<string> => ipcRenderer.invoke(IPC.clipboardRead),
+  clipboardWrite: (text: string): void => ipcRenderer.send(IPC.clipboardWrite, text),
 });

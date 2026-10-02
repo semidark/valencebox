@@ -161,4 +161,19 @@ export interface SandboxAppConfig {
    * Set to an empty array `[]` to disable all port forwarding (including SSH).
    */
   portForwards?: PortForward[];
+
+  /**
+   * Swap the physical Ctrl and Cmd keys for terminal control (macOS).
+   *
+   * Some macOS users configure their system to swap the physical Ctrl and Cmd
+   * keys. When `true`, the terminal treats the physical Ctrl key — which then
+   * arrives as `metaKey` — as the terminal-control modifier (Ctrl+A, Ctrl+C,
+   * …) and suppresses the physical Cmd key (arriving as `ctrlKey`) so it does
+   * not leak control characters. Copy/paste follow the same modifier
+   * (physical Ctrl + Shift + C/V).
+   *
+   * Default `false` (standard macOS layout): physical Ctrl = `ctrlKey` drives
+   * terminal control, physical Cmd = `metaKey` is suppressed.
+   */
+  swapCtrlCmd?: boolean;
 }
