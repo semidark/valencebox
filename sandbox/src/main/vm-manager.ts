@@ -101,6 +101,10 @@ export class VmManager extends EventEmitter {
     this.ptyChannel?.resize(cols, rows);
   }
 
+  get ptyConnected(): boolean {
+    return this.ptyChannel?.connected ?? false;
+  }
+
   /** Query current balloon state. Returns { currentMB, ceilingMB, minMB } or null. */
   async getBalloon(): Promise<{ currentMB: number; ceilingMB: number; minMB: number } | null> {
     if (!this.qemu.qmp?.connected) return null;

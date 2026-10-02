@@ -1,6 +1,6 @@
 // Electron main process: owns the HTTP share + egress proxy + VmManager (QEMU),
 // bridges to renderer.
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, clipboard, ipcMain, Menu } from "electron";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -79,6 +79,38 @@ let vm: VmManager | null = null;
 let share: HttpShare | null = null;
 let proxy: EgressProxy | null = null;
 let detectedAccel: { name: string; available: boolean } | undefined;
+// Loaded once at startup so both the IPC handlers and the VM launcher share it.
+let appCfg: SandboxAppConfig = {};
+
+// Minimal menu: drops the default reload (Ctrl/Cmd+R) and force-reload
+// accelerators (which would reload the renderer and kick the terminal back
+// to the serial fallback) and the edit menu (Cmd+C/V would steal terminal
+// copy/paste — the terminal now uses Ctrl+Shift+C/V instead).
+function buildMenu() {
+  const template: Electron.MenuItemConstructorOptions[] = [
+    ...(process.platform === "darwin"
+      ? [{ role: "appMenu" as const }]
+      : []),
+    { role: "fileMenu" },
+    {
+      label: "View",
+      submenu: [
+        // No accelerator on purpose: reloads the renderer (to test PTY
+        // re-attach) without re-introducing the Ctrl/Cmd+R binding.
+        { label: "Reload Window", click: () => win?.webContents.reload() },
+        { role: "toggleDevTools" },
+        { type: "separator" },
+        { role: "resetZoom" },
+        { role: "zoomIn" },
+        { role: "zoomOut" },
+        { type: "separator" },
+        { role: "togglefullscreen" },
+      ],
+    },
+    { role: "windowMenu" },
+  ];
+  return Menu.buildFromTemplate(template);
+}
 
 async function createWindow() {
   win = new BrowserWindow({
@@ -92,6 +124,7 @@ async function createWindow() {
       sandbox: false, // preload needs require(); renderer stays isolated
     },
   });
+  Menu.setApplicationMenu(buildMenu());
   win.on("closed", () => {
     win = null;
   });
@@ -104,12 +137,15 @@ function sendToWindow(channel: string, ...args: any[]) {
 
 function registerIpc() {
   ipcMain.handle(IPC.getStatus, () => {
-    if (!vm) return { phase: "boot" } as const;
+    const swapCtrlCmd = appCfg.swapCtrlCmd ?? false;
+    if (!vm) return { phase: "boot", swapCtrlCmd } as const;
     return {
       phase: vm.running ? "ready" as const : "stopped" as const,
       bootMs: vm.bootMs,
       accel: detectedAccel?.name,
       accelAvailable: detectedAccel?.available,
+      ptyConnected: vm.ptyConnected,
+      swapCtrlCmd,
     };
   });
   ipcMain.on(IPC.serialInput, (_e, data: string) => vm?.sendInput(data));
@@ -120,12 +156,17 @@ function registerIpc() {
     return vm?.setBalloon(mb);
   });
   ipcMain.handle(IPC.getBalloon, () => vm ? vm.getBalloon() : null);
+  // Terminal copy/paste (Ctrl+Shift+C/V) — main-process clipboard so it works
+  // regardless of renderer secure-context / permission state on file://.
+  ipcMain.handle(IPC.clipboardRead, () => clipboard.readText());
+  ipcMain.on(IPC.clipboardWrite, (_e, text: string) => {
+    if (typeof text === "string") clipboard.writeText(text);
+  });
   // Stub handler for legacy IPC channel — renderer may still call it
   ipcMain.handle(IPC.saveSnapshot, () => {});
 }
 
 async function startVm() {
-  const appCfg = loadAppConfig(app.getPath("userData"));
   const tmpDir = fs.mkdtempSync(path.join(app.getPath("userData"), "qemu-"));
 
   // Resolve guest architecture before checking images (paths differ by arch)
@@ -250,6 +291,7 @@ async function startVm() {
     sendToWindow(IPC.onStatus, {
       phase: "ready", bootMs: vm.bootMs,
       accel: detectedAccel?.name, accelAvailable: detectedAccel?.available,
+      swapCtrlCmd: appCfg.swapCtrlCmd ?? false,
     });
   } catch (e: any) {
     sendToWindow(IPC.onStatus, { phase: "error", error: e.message });
@@ -258,6 +300,7 @@ async function startVm() {
 }
 
 app.whenReady().then(async () => {
+  appCfg = loadAppConfig(app.getPath("userData"));
   registerIpc();
   await createWindow();
   await startVm();

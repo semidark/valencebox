@@ -8,6 +8,8 @@ interface RStatus {
   restored?: boolean;
   sync?: RSyncStats;
   net?: { relayUrl: string; policyHosts: string[]; dataPlane?: boolean };
+  ptyConnected?: boolean;
+  swapCtrlCmd?: boolean;
   error?: string;
 }
 interface RConflict { path: string; winner: string; at: number; }
@@ -22,6 +24,8 @@ interface SandboxAPI {
   onPtyClosed(cb: () => void): void;
   sendPtyInput(data: Uint8Array): void;
   sendPtyResize(cols: number, rows: number): void;
+  clipboardRead(): Promise<string>;
+  clipboardWrite(text: string): void;
 }
 declare const Terminal: any;
 declare const FitAddon: any;
@@ -52,6 +56,9 @@ fitAddon.fit();
 // PTY input is accepted as soon as usingPty is set, bypassing the isReady gate.
 let usingPty = false;
 let pendingPtyInput: string[] = [];
+// Which modifier represents the physical Ctrl key, from host config.
+// false (default, standard macOS): ctrlKey. true (swapped): metaKey.
+let swapCtrlCmd = false;
 api.onSerial((chunk) => { if (!usingPty) term.write(chunk); });
 api.onPtyData((chunk) => {
   if (!usingPty) {
@@ -99,11 +106,20 @@ const OVERLAY_MSG: Record<string, string> = {
 };
 
 function render(s: RStatus) {
+  swapCtrlCmd = s.swapCtrlCmd ?? false;
   const phase = $("phase");
   phase.textContent = s.phase + (s.restored ? " (restored)" : "");
   phase.className = "badge" + (s.phase === "ready" ? " ready" : s.phase === "error" ? " error" : "");
   const wasReady = isReady;
   isReady = s.phase === "ready";
+  // Re-attach to a live PTY after a renderer reload (e.g. via DevTools):
+  // the channel persists in main, but an idle session sends no data, so
+  // without this the terminal would stay on the serial fallback.
+  if (s.ptyConnected && !usingPty) {
+    usingPty = true;
+    term.reset();
+    api.sendPtyResize(term.cols, term.rows);
+  }
   const overlay = $("overlay");
   if (isReady) {
     overlay.classList.add("hidden");
@@ -147,7 +163,50 @@ api.onConflict((c) => {
 
 $("snap").addEventListener("click", () => {
   if (isReady) api.saveSnapshot();
-  term.focus();
+});
+
+term.focus();
+
+// Custom key routing. `swapCtrlCmd` (from host config) selects which modifier
+// represents the physical Ctrl key for terminal control:
+//   - false (default, standard macOS): physical Ctrl = ctrlKey.
+//   - true (user swapped Ctrl/Cmd in system settings): physical Ctrl = metaKey.
+// Terminal control chars and Ctrl+Shift+C/V copy/paste use that modifier; the
+// other modifier + letter is suppressed so it doesn't leak control chars.
+term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+  if (e.type !== "keydown") return true;
+
+  // Modifier that represents the physical Ctrl key for terminal control.
+  const termCtrl = swapCtrlCmd ? e.metaKey : e.ctrlKey;
+  // The other modifier (physical Cmd) — suppress its control chars.
+  const otherMod = swapCtrlCmd ? e.ctrlKey : e.metaKey;
+
+  // Copy: physical Ctrl + Shift + C.
+  if (e.shiftKey && e.code === "KeyC" && termCtrl) {
+    const text = term.getSelection();
+    if (text) api.clipboardWrite(text);
+    return false;
+  }
+  // Paste: physical Ctrl + Shift + V.
+  if (e.shiftKey && e.code === "KeyV" && termCtrl) {
+    void api.clipboardRead().then((text) => {
+      if (text) term.paste(text);
+    });
+    return false;
+  }
+  // Terminal control chars: physical Ctrl + A–Z.
+  if (termCtrl && !e.shiftKey && e.keyCode >= 65 && e.keyCode <= 90) {
+    const ch = String.fromCharCode(e.keyCode - 64);
+    if (usingPty) api.sendPtyInput(new TextEncoder().encode(ch));
+    else if (isReady) api.sendInput(ch);
+    return false;
+  }
+  // Suppress physical Cmd + A–Z so xterm doesn't send control chars for it.
+  if (otherMod && !termCtrl && !e.shiftKey && e.keyCode >= 65 && e.keyCode <= 90) {
+    return false;
+  }
+  // Everything else (arrows, Enter, Tab, Escape, …) → let xterm handle it.
+  return true;
 });
 
 $("debug-btn").addEventListener("click", (e) => {

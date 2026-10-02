@@ -17,6 +17,9 @@ export interface SandboxStatus {
     throughput?: { out: number; in: number };
   };
   snapshot?: { at: number; compressedBytes: number } | null;
+  ptyConnected?: boolean;
+  /** True when the host config swaps physical Ctrl/Cmd for terminal control. */
+  swapCtrlCmd?: boolean;
   error?: string;
 }
 
@@ -47,4 +50,8 @@ export const IPC = {
   // Memory balloon control
   setBalloon: "sandbox:setBalloon", // renderer→main: set balloon to N MB
   getBalloon: "sandbox:getBalloon", // renderer→main: get current balloon status → BalloonStatus
+  // Clipboard (terminal copy/paste via Ctrl+Shift+C/V; routed through main
+  // so it works regardless of renderer secure-context / permission state)
+  clipboardRead: "sandbox:clipboard:read", // renderer→main: read clipboard → string
+  clipboardWrite: "sandbox:clipboard:write", // renderer→main: write clipboard (fire-and-forget)
 } as const;
