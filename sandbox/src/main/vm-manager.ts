@@ -1,5 +1,4 @@
 import { EventEmitter } from "events";
-import * as fsp from "fs/promises";
 import * as net from "net";
 import { QemuProcess, QemuOptions } from "./qemu";
 import { GuestProfile } from "./guest-profile";
@@ -34,6 +33,7 @@ export class VmManager extends EventEmitter {
   private serialClient: net.Socket | null = null;
   private _serialLog = "";
   private ptyChannel: PtyChannel | null = null;
+  private stopPromise: Promise<void> | null = null;
 
   constructor(private opts: VmManagerOptions) {
     super();
@@ -44,6 +44,7 @@ export class VmManager extends EventEmitter {
     this.qemu.on("qmp:event", (event: string) => this.emit("qmp:event", event));
     this.qemu.on("accel", (info: { name: string; available: boolean }) => this.emit("accel", info));
     await this.qemu.start(this.opts as QemuOptions);
+    if (this.stopPromise) return;
     this.connectSerial();
     this.connectPty();
   }
@@ -52,13 +53,26 @@ export class VmManager extends EventEmitter {
     return this.qemu;
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (!this.stopPromise) this.stopPromise = this.stopVm();
+    return this.stopPromise;
+  }
+
+  forceStop(): void {
+    this.disconnectChannels();
+    this.qemu.forceStop();
+  }
+
+  private disconnectChannels(): void {
     this.ptyChannel?.disconnect();
     this.ptyChannel = null;
     this.serialClient?.destroy();
     this.serialClient = null;
+  }
+
+  private async stopVm(): Promise<void> {
+    this.disconnectChannels();
     await this.qemu.stop();
-    await fsp.rm(this.opts.tmpDir, { recursive: true, force: true });
   }
 
   sendInput(data: string): void {

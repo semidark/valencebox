@@ -11,6 +11,8 @@ import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
 import { SandboxAppConfig, EgressRuntimeConfig } from "../config";
 import { GuestArch, selectGuest, x86_64Profile, aarch64Profile } from "./guest-profile";
+import { ShutdownCoordinator, withTimeout } from "./shutdown";
+import { cleanupRuntimeDir, resolveWorkspaceDir } from "./workspace";
 
 function loadAppConfig(root: string): SandboxAppConfig {
   const p = path.join(root, "sandbox.config.json");
@@ -19,14 +21,6 @@ function loadAppConfig(root: string): SandboxAppConfig {
   } catch {
     return {};
   }
-}
-
-function resolveWorkspaceDir(cfg: SandboxAppConfig, tmpDir: string): string {
-  if (cfg.workspaceDir) return cfg.workspaceDir;
-  if (process.env.WORKSPACE_DIR) return process.env.WORKSPACE_DIR;
-  const isolated = path.join(tmpDir, "workspace");
-  fs.mkdirSync(isolated, { recursive: true });
-  return isolated;
 }
 
 /**
@@ -78,6 +72,8 @@ let win: BrowserWindow | null = null;
 let vm: VmManager | null = null;
 let share: HttpShare | null = null;
 let proxy: EgressProxy | null = null;
+let runtimeDir: string | null = null;
+let quitting = false;
 let detectedAccel: { name: string; available: boolean } | undefined;
 // Loaded once at startup so both the IPC handlers and the VM launcher share it.
 let appCfg: SandboxAppConfig = {};
@@ -167,7 +163,9 @@ function registerIpc() {
 }
 
 async function startVm() {
+  if (quitting) return;
   const tmpDir = fs.mkdtempSync(path.join(app.getPath("userData"), "qemu-"));
+  runtimeDir = tmpDir;
 
   // Resolve guest architecture before checking images (paths differ by arch)
   const guestArch = selectGuest(
@@ -183,9 +181,10 @@ async function startVm() {
   }
 
   // Start HTTP share server (WebDAV) before QEMU so port+token are ready for fw_cfg
-  const workspaceDir = resolveWorkspaceDir(appCfg, tmpDir);
+  const workspaceDir = resolveWorkspaceDir(appCfg, app.getPath("userData"));
   share = new HttpShare();
   const shareCfg = await share.start(workspaceDir);
+  if (quitting) return;
   console.log(`[share] WebDAV on 127.0.0.1:${shareCfg.port}, token=${shareCfg.token.slice(0, 8)}...`);
   console.log(`[share] workspace: ${workspaceDir}`);
 
@@ -224,6 +223,7 @@ async function startVm() {
   const proxyLogFile = path.join(app.getPath("userData"), "proxy.log");
   proxy = new EgressProxy(proxyCfg, caDir, proxyLogFile);
   await proxy.start();
+  if (quitting) return;
   const proxyPort = proxy.port;
   console.log(`[egress-proxy] listening on 0.0.0.0:${proxyPort} (policy=${proxyCfg.policy})`);
 
@@ -288,6 +288,7 @@ async function startVm() {
 
   try {
     await vm.start();
+    if (quitting) return;
     sendToWindow(IPC.onStatus, {
       phase: "ready", bootMs: vm.bootMs,
       accel: detectedAccel?.name, accelAvailable: detectedAccel?.available,
@@ -303,25 +304,40 @@ app.whenReady().then(async () => {
   appCfg = loadAppConfig(app.getPath("userData"));
   registerIpc();
   await createWindow();
-  await startVm();
+  if (!quitting) await startVm();
+}).catch((err) => {
+  if (!quitting) console.error("[startup] failed:", err);
 });
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-let quitting = false;
+const shutdown = new ShutdownCoordinator([
+  {
+    name: "VM stop", timeoutMs: 31_000,
+    stop: async () => {
+      try { await withTimeout(vm?.stop() ?? Promise.resolve(), 30_000, "QEMU stop"); }
+      catch (err) { vm?.forceStop(); throw err; }
+    },
+  },
+  { name: "proxy stop", timeoutMs: 2_000, stop: async () => { await proxy?.stop(); } },
+  { name: "share stop", timeoutMs: 2_000, stop: async () => { await share?.stop(); } },
+  {
+    name: "runtime cleanup", timeoutMs: 2_000,
+    stop: async () => {
+      if (vm?.running) throw new Error("Runtime files retained because QEMU is still running");
+      if (runtimeDir) await cleanupRuntimeDir(runtimeDir);
+    },
+  },
+], (code) => app.exit(code), () => {
+  vm?.forceStop();
+  proxy?.forceStop();
+  share?.forceStop();
+});
+
 app.on("before-quit", (e) => {
-  if (quitting) return;
   e.preventDefault();
   quitting = true;
-  void (async () => {
-    try {
-      await vm?.stop();
-      await proxy?.stop();
-      await share?.stop();
-    } catch (err) {
-      console.error("[qemu] failed to stop cleanly:", err);
-    }
-    })().finally(() => app.quit());
+  void shutdown.request();
 });

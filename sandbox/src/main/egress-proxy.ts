@@ -366,6 +366,10 @@ export class EgressProxy {
   private mitmServer: http.Server;
   private logFile: string | undefined;
   private activeConnections = 0;
+  private sockets = new Set<net.Socket>();
+  private requests = new Set<http.ClientRequest>();
+  private stopping = false;
+  private stopPromise: Promise<void> | null = null;
   private rateBuckets = new Map<string, { count: number; windowStart: number }>();
   private byteCounters = new Map<string, { in: number; out: number }>();
 
@@ -402,10 +406,12 @@ export class EgressProxy {
   }
 
   async start(): Promise<void> {
+    if (this.stopping) throw new Error("Proxy is stopping");
     // If MITM is enabled, ensure the CA exists (pure-Node, async).
     if (this.config.enableMitm) {
       this.mitmCa = await ensureMitmCa(this.caDir);
     }
+    if (this.stopping) throw new Error("Proxy startup cancelled");
 
     this.initLogFile();
 
@@ -446,18 +452,29 @@ export class EgressProxy {
     });
   }
 
-  async stop(): Promise<void> {
-    return new Promise((resolve) => {
-      if (!this.server) {
-        resolve();
-        return;
-      }
-      this.server.close(() => {
+  forceStop(): void {
+    this.stopping = true;
+    this.server?.closeAllConnections();
+    this.mitmServer.closeAllConnections();
+    for (const request of this.requests) request.destroy();
+    // Includes upgraded CONNECT sockets, which closeAllConnections omits.
+    for (const socket of this.sockets) socket.destroy();
+  }
+
+  stop(): Promise<void> {
+    this.stopping = true;
+    if (this.stopPromise) return this.stopPromise;
+    const server = this.server;
+    this.stopPromise = new Promise((resolve) => {
+      if (!server) { this.forceStop(); resolve(); return; }
+      server.close(() => {
         console.log("[egress-proxy] stopped");
         this.server = null;
         resolve();
       });
+      this.forceStop();
     });
+    return this.stopPromise;
   }
 
   /**
@@ -465,14 +482,30 @@ export class EgressProxy {
    * Over-limit connections are rejected with 503 and destroyed.
    */
   private trackConnection(socket: net.Socket): void {
+    this.trackSocket(socket);
     this.activeConnections++;
+    socket.once("close", () => { this.activeConnections--; });
     if (this.activeConnections > this.config.maxConnections) {
       this.log("DENY", "", socket.remoteAddress || "?", `connection limit reached (${this.config.maxConnections})`);
       socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
-    socket.once("close", () => { this.activeConnections--; });
+  }
+
+  private trackSocket(socket: net.Socket): void {
+    if (this.sockets.has(socket)) return;
+    this.sockets.add(socket);
+    socket.once("close", () => this.sockets.delete(socket));
+    if (this.stopping) socket.destroy();
+  }
+
+  private trackRequest(request: http.ClientRequest): void {
+    this.requests.add(request);
+    request.once("close", () => this.requests.delete(request));
+    request.on("socket", (socket) => this.trackSocket(socket));
+    if (request.socket) this.trackSocket(request.socket);
+    if (this.stopping) request.destroy();
   }
 
   /**
@@ -660,6 +693,7 @@ export class EgressProxy {
       forwardReq.on("error", (err) => {
         reject(err);
       });
+      this.trackRequest(forwardReq);
 
       // If there's a request body, pipe it.
       if (req) {
@@ -745,6 +779,7 @@ export class EgressProxy {
         }
       });
 
+      this.trackRequest(forwardReq);
       forwardReq.write(rewrittenBody);
       forwardReq.end();
 
@@ -809,6 +844,7 @@ export class EgressProxy {
     // Plain CONNECT tunnel: open a TCP connection to the upstream and relay bytes.
     try {
       const upstream = await this.connectUpstream(targetHost, targetPort);
+      if (this.stopping || clientSocket.destroyed) { upstream.destroy(); return; }
 
       // Forward any initial data the client already sent (race between headers
       // and CONNECT response).
@@ -880,6 +916,7 @@ export class EgressProxy {
       return;
     }
 
+    if (this.stopping || clientSocket.destroyed) return;
     // Send 200 to the client to confirm CONNECT.
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
 
@@ -893,6 +930,7 @@ export class EgressProxy {
       key: fs.readFileSync(leaf.key),
       cert: fs.readFileSync(leaf.cert),
     });
+    this.trackSocket(clientTls);
 
     // Enable TCP keepalive on the client TLS socket so intermediate NAT /
     // firewalls don't tear down long-lived SSE streams.
@@ -1058,6 +1096,7 @@ export class EgressProxy {
         this.log("ERROR", method, `${targetHost}:${targetPort}`, `upstream error: ${err.message}`);
         this.sendMitmError(res, 502, `Bad Gateway: ${err.message}`);
       });
+      this.trackRequest(upstreamReq);
 
       // Enable TCP keepalive on the upstream socket.
       // Must handle both sync (pool reuse) and async (new conn) socket assignment.
@@ -1088,12 +1127,15 @@ export class EgressProxy {
   private connectUpstream(host: string, port: number): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
       const socket = new net.Socket();
+      this.trackSocket(socket);
+      if (this.stopping) { reject(new Error("Proxy is stopping")); return; }
       socket.setTimeout(10000);
       socket.connect(port, host, () => {
         socket.setTimeout(0);
         resolve(socket);
       });
       socket.on("error", reject);
+      socket.once("close", () => reject(new Error("Upstream connection closed")));
       socket.on("timeout", () => {
         socket.destroy();
         reject(new Error(`upstream connection timeout: ${host}:${port}`));

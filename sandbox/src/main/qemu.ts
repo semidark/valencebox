@@ -40,6 +40,8 @@ export class QemuProcess extends EventEmitter {
   private proc: ChildProcess | null = null;
   private startedAt = 0;
   private _qmp: QmpClient | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private stopping = false;
 
   /** Expose QMP client for balloon control and other direct QMP calls. */
   get qmp(): QmpClient | null { return this._qmp; }
@@ -49,7 +51,7 @@ export class QemuProcess extends EventEmitter {
   public machineType: "microvm" | "pc" | "virt" = "pc";
 
   get running(): boolean {
-    return this.proc !== null && this.proc.exitCode === null;
+    return this.proc !== null && this.proc.exitCode === null && this.proc.signalCode === null;
   }
 
   get pid(): number | undefined {
@@ -65,10 +67,12 @@ export class QemuProcess extends EventEmitter {
   }
 
   async start(opts: QemuOptions): Promise<void> {
+    if (this.stopping) throw new Error("QEMU is stopping");
     this.startedAt = Date.now();
     this.serialTransport = await allocSerialTransport(opts.tmpDir);
     this.qmpTransport = await allocQmpTransport(opts.tmpDir);
     this.ptyTransport = await allocPtyTransport(opts.tmpDir);
+    if (this.stopping) throw new Error("QEMU startup cancelled");
 
     const detected = QemuProcess.checkAccel(process.platform, opts.guestProfile.arch);
     const hw = opts.accel && opts.accel !== "auto" && opts.accel !== "tcg"
@@ -171,32 +175,56 @@ export class QemuProcess extends EventEmitter {
     return this.qmp.execute("query-status") as Promise<{ status: string; running: boolean }>;
   }
 
-  async stop(timeoutMs = 10_000): Promise<void> {
-    if (!this.proc) return;
+  stop(timeoutMs = 10_000): Promise<void> {
+    this.stopping = true;
+    if (!this.stopPromise) this.stopPromise = this.stopProcess(timeoutMs);
+    return this.stopPromise;
+  }
+
+  /** Synchronous last resort, also cancels QMP startup retries. */
+  forceStop(): void {
+    this.stopping = true;
+    this._qmp?.disconnect();
+    this._qmp = null;
+    if (this.proc && !this.hasExited(this.proc)) this.proc.kill("SIGKILL");
+  }
+
+  private async stopProcess(timeoutMs: number): Promise<void> {
     const proc = this.proc;
+    if (!proc) {
+      this._qmp?.disconnect();
+      this._qmp = null;
+      return;
+    }
 
     try {
       if (this.qmp?.connected) {
-        const status = await this.queryStatus();
+        const qmp = this.qmp;
+        const commandTimeout = Math.min(timeoutMs, 2_000);
+        const status = await qmp.execute<{ running: boolean }>("query-status", undefined, commandTimeout);
         if (status.running) {
-          await this.qmp.execute("system_powerdown");
+          await qmp.execute("system_powerdown", undefined, commandTimeout);
           await this.waitForExit(proc, timeoutMs);
         }
       }
-    } catch {
+    } catch (err) {
+      console.warn("[shutdown] QMP powerdown failed; terminating QEMU:", err);
       // QMP failed — fall through to kill
     }
     this._qmp?.disconnect();
     this._qmp = null;
 
-    if (proc.exitCode === null) {
+    if (!this.hasExited(proc)) {
+      console.log("[shutdown] QEMU: sending SIGTERM");
       proc.kill("SIGTERM");
       await this.waitForExit(proc, timeoutMs);
     }
-    if (proc.exitCode === null) {
+    if (!this.hasExited(proc)) {
+      console.log("[shutdown] QEMU: sending SIGKILL");
       proc.kill("SIGKILL");
       await this.waitForExit(proc, 5_000);
     }
+    if (!this.hasExited(proc)) throw new Error("QEMU did not exit after SIGKILL");
   }
 
   private buildArgs(opts: QemuOptions): string[] {
@@ -411,10 +439,19 @@ export class QemuProcess extends EventEmitter {
   }
 
   private async waitForExit(proc: ChildProcess, timeoutMs: number): Promise<void> {
-    if (proc.exitCode !== null) return;
+    if (this.hasExited(proc)) return;
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
-      proc.once("exit", () => { clearTimeout(timer); resolve(); });
+      const done = () => {
+        clearTimeout(timer);
+        proc.removeListener("exit", done);
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      proc.once("exit", done);
     });
+  }
+
+  private hasExited(proc: ChildProcess): boolean {
+    return proc.exitCode !== null || proc.signalCode !== null;
   }
 }

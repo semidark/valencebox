@@ -4,6 +4,7 @@ import nepheleServer from "nephele";
 import FileSystemAdapter from "@nephele/adapter-file-system";
 import CustomAuthenticator, { User } from "@nephele/authenticator-custom";
 import { randomBytes } from "crypto";
+import { Socket } from "net";
 import { getRandomFreePort } from "./asset-paths";
 
 export interface ShareConfig {
@@ -13,6 +14,9 @@ export interface ShareConfig {
 
 export class HttpShare {
   private server: Server | null = null;
+  private sockets = new Set<Socket>();
+  private stopping = false;
+  private stopPromise: Promise<void> | null = null;
   public readonly token: string;
   public port = 0;
 
@@ -21,7 +25,9 @@ export class HttpShare {
   }
 
   async start(workspaceDir: string): Promise<ShareConfig> {
+    if (this.stopping) throw new Error("Share is stopping");
     this.port = await getRandomFreePort();
+    if (this.stopping) throw new Error("Share startup cancelled");
 
     const app = express();
     // Log every WebDAV request method, path, and response status
@@ -52,6 +58,11 @@ export class HttpShare {
 
     return new Promise((resolve, reject) => {
       this.server = createServer(app);
+      this.server.on("connection", (socket) => {
+        this.sockets.add(socket);
+        socket.once("close", () => this.sockets.delete(socket));
+        if (this.stopping) socket.destroy();
+      });
       this.server.listen(this.port, "127.0.0.1", () => {
         resolve({ port: this.port, token: this.token });
       });
@@ -59,11 +70,26 @@ export class HttpShare {
     });
   }
 
-  async stop(): Promise<void> {
-    if (this.server) {
-      return new Promise((resolve) => this.server!.close(() => resolve()));
-    }
+  forceStop(): void {
+    this.stopping = true;
+    this.server?.closeAllConnections();
+    for (const socket of this.sockets) socket.destroy();
+  }
+
+  stop(): Promise<void> {
+    this.stopping = true;
+    if (this.stopPromise) return this.stopPromise;
+    const server = this.server;
+    this.stopPromise = new Promise((resolve) => {
+      if (!server) { resolve(); return; }
+      // Stop accepting connections before terminating existing requests.
+      server.close(() => {
+        this.server = null;
+        resolve();
+      });
+      this.forceStop();
+    });
+    return this.stopPromise;
   }
 }
-
 
