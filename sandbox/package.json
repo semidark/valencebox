@@ -13,6 +13,8 @@
     "test:egress": "tsx test/egress-proxy.unit.ts",
     "test:egress:integration": "tsx test/egress-proxy.integration.ts",
     "test:qmp": "tsx test/qmp.test.ts",
+    "test:shutdown": "npm run build && tsx test/shutdown.test.ts && electron test/shutdown.electron.js",
+    "test:share": "tsx test/share.test.ts",
     "test:boot": "tsx test/boot.test.ts",
     "test:ui": "electron test/ui-smoke.js",
     "images": "./scripts/build-guest.sh",

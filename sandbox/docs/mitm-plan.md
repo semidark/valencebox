@@ -1,297 +1,270 @@
-# MITM Egress Proxy — Implementation Plan
+# MITM Egress Proxy — Implementation Plan and Current Status
 
-Replaces the current open SLIRP egress (`-nic user` with no filtering) with a
-host-process HTTP CONNECT forward proxy that enforces an allowlist/denylist
-policy, optionally performs TLS interception (MITM) for secret injection, and
-integrates with the existing `sandbox.config.json` configuration.
+The original plan added a host-process HTTP CONNECT/forward proxy with
+allowlist/denylist policy and optional TLS interception for secret injection.
+It did **not** replace unrestricted SLIRP with a mandatory egress gate in the
+current implementation. Guest proxy environment variables configure cooperating
+HTTP(S) clients; they do not force all guest traffic through the proxy.
 
-## Architecture
+## Current status — implementation evidence and verification scope
 
+This section describes current code and assertions present in tests, not a
+security audit or a declaration that all audit findings are resolved. For this
+docs-only update, `test:unit`, `test:share`, `test:egress`, and the no-emit
+TypeScript check passed. **No integration tests, builds, UI tests or QEMU boots
+were run.** Paths below are relative to `sandbox/`. The historical task record
+is separate from current verification.
+
+### Wiring and policy
+
+- `src/main/main.ts` starts `EgressProxy` in Electron's main process, resolves
+  secrets, generates a per-start auth token, and passes proxy config to
+  `VmManager`/`QemuProcess`. `src/main/qemu.ts` emits unrestricted
+  `-netdev user,id=net0` SLIRP plus a virtio NIC: no `restrict=on` or firewall
+  enforcing proxy-only egress is configured.
+- `guest/usr/local/libexec/mount-share.sh` writes HTTP(S) proxy environment
+  variables with URL credentials `valencebox:<token>` and a `no_proxy` list
+  including `127.0.0.1,localhost,10.0.2.2,::1`. The share server is separate from
+  the egress proxy. `src/main/http-share.ts` serves the host directory as
+  plain-HTTP WebDAV on loopback; `workspace-sync.sh` mounts it with davfs at
+  `/host-workspace` and mirrors it with unison to native `/workspace`.
+  This is a network mount, not QEMU filesystem passthrough.
+- Proxy authentication is **Basic**, not bearer or HMAC authentication:
+  `Proxy-Authorization: Basic <base64(username:token)>`. `authenticate()`
+  compares the password token but does not check the username; an empty runtime
+  token disables auth. The app generates a token with `generatePlaceholder()`
+  (`psbx-sec-` plus 12 random bytes in hex). Proxy port/token and comma-separated
+  `ENV=placeholder` mappings are on the kernel cmdline, not JSON or `fw_cfg`.
+  Equal-length comparison uses `timingSafeEqual`; no timing analysis was run.
+- CONNECT and outer HTTP handlers check host policy. Deny rules take priority
+  in allowlist/denylist modes. Policy `"none"` ignores both host lists;
+  `allowAll: true` bypasses host checks. **Neither disables `allowPorts`**,
+  authentication, or applicable limits. A nonempty port list is enforced in
+  CONNECT and forwarding; `[]` disables the port check. App defaults are
+  policy `"none"`, ports `[80, 443]`, `allowAll: false`, and MITM off. Absent
+  `egress` therefore means no host filtering, not all proxy ports allowed.
+- The proxy defaults to listening on `0.0.0.0` (configurable `listenHost`), while
+  WebDAV binds to `127.0.0.1`. QEMU host forwards default to `127.0.0.1` unless
+  explicitly overridden; the app defaults to SSH 2222 → 22, with `[]` disabling
+  forwards. These listener choices are distinct from guest egress enforcement.
+
+### MITM, secrets, and remaining implementation limitations
+
+- MITM CONNECT interception occurs only with `enableMitm` and a target matching
+  a declared secret host. Other CONNECT requests are opaque TCP tunnels.
+  Runtime CA/leaf generation uses pure Node `selfsigned` / `@peculiar/x509`.
+  The CA is **persistent**, stored under application `userData/mitm-ca/` and
+  reused when both files exist. New key/cert files use modes 0600/0644. Leaf
+  certs are cached under `mitm-ca/certs/` by normalized-host SHA256; runtime
+  generation does not call `openssl`.
+- QEMU names the CA `fw_cfg` entry **`opt/org.valencebox.mitm-ca`**. The guest
+  reads **`/sys/firmware/qemu_fw_cfg/by_name/opt/org.valencebox.mitm-ca/raw`**,
+  installs `/usr/local/share/ca-certificates/valencebox-mitm.crt`, attempts
+  `update-ca-certificates` with tolerated failure, and configures
+  `NODE_EXTRA_CA_CERTS`. The share config entry is `opt/org.valencebox.config`,
+  read at `/sys/firmware/qemu_fw_cfg/by_name/opt/org.valencebox.config/raw`.
+  Host-side integration tests do not verify actual guest CA installation/trust.
+- `resolveSecrets()` validates env names and resolves sources in order
+  `value` > `fromFile` > `fromEnv`. Guest setup receives placeholders rather
+  than resolved values. **Header and body authorization differ:**
+  `rewriteHeaders()` checks each encountered placeholder's declared hosts;
+  `rewriteBody()` has no host argument and replaces from the entire secret
+  list. MITM and plain-HTTP secret paths pass all secrets after matching any
+  secret host. Header mismatch assertions do not prove host-scoped body
+  authorization. Ordinary forwards/opaque tunnels do not scan all placeholder
+  uses; there is no blanket “unauthorized placeholder always returns 403” or
+  “real secrets can never reach the guest” guarantee.
+- **Plaintext secret injection exists independently of MITM enablement.**
+  Non-TLS forwards to secret hosts use `forwardRequestWithSecrets()` and send
+  rewritten credentials upstream via `http.request`. Both secret paths buffer
+  up to 10 MB. MITM returns 411 for chunked bodies and 413 for oversized bodies;
+  plain-HTTP secret forwarding returns 403 for those cases.
+- **TLS verification is environment-dependent.** MITM upstream requests set
+  `rejectUnauthorized` from `NODE_TLS_REJECT_UNAUTHORIZED !== "0"`; ordinary
+  HTTPS forwards use Node's defaults. `caCertFile` adds a PEM bundle to
+  `tls.rootCertificates` but does not counter an environment disabling TLS
+  verification. The strict custom-CA fixture temporarily removes the variable;
+  client-to-proxy TLS in the integration fixtures uses
+  `rejectUnauthorized: false`, so it is not a guest trust test.
+- **Connection accounting has a rejection gap.** `trackConnection()` increments
+  first, then writes 503/destroys over-limit sockets and returns before adding
+  their close-decrement listener. Rejected increments remain in the count.
+  The integration fixture asserts one 503, not recovery of the counter. This
+  is a source observation, not an untested exploit claim. Defaults are 256
+  connections and rate limiting off; configured per-client-IP rate checks
+  return 429 for outer HTTP requests/CONNECTs, not each MITM inner request.
+- Response sanitization strips HSTS, HPKP/report-only, and Expect-CT from
+  HTTP/MITM responses, not opaque tunnels. Logs append to `userData/proxy.log`
+  with truncation above 10 MB **at startup**, not continuous rotation.
+  `getStats()` exposes connection and per-host byte counters; the counters are
+  not a complete resource-accounting guarantee.
+
+### Current tests and invocation scope
+
+`package.json` currently defines these separate commands, to be invoked from
+`sandbox/` (`test:egress` passed for this update; integration was **not run**):
+
+```sh
+npm run test:egress
+npm run test:egress:integration
 ```
-Guest (Ubuntu 24.04)
-  eth0 ── SLIRP (QEMU -nic user)
-            │  HTTP_PROXY=http://valencebox:<token>@10.0.2.2:<port>/
-            │  HTTPS_PROXY=http://valencebox:<token>@10.0.2.2:<port>/
-            │  no_proxy=127.0.0.1,localhost,10.0.2.2,::1
-            │
-            ▼
-EgressProxy (Node.js, Electron main process)
-  ┌─ CONNECT <host>:<port>
-  │   ├─ authenticate via Proxy-Authorization
-  │   ├─ hostAllowed(host)? → deny / allow
-  │   ├─ isSecretHost(host)? → MITM path (TLS terminate, replace placeholders, re-encrypt)
-  │   └─ else → plain tunnel
-  │
-  └─ GET/POST/PUT/... <url>
-      ├─ authenticate
-      ├─ hostAllowed(host)? → deny / allow
-      └─ forward request, return response
-```
+
+- `test:egress` runs only `test/egress-proxy.unit.ts`: host policy and
+  normalization, secret resolution/env validation, header mismatch/replacement,
+  body replacement, and response sanitization assertions. It does not run the
+  integration suite or prove cross-host body authorization.
+- `test:egress:integration` runs `test/egress-proxy.integration.ts`: leaf SAN,
+  signature and cache assertions; Basic auth; CONNECT host policy; MITM
+  header/body injection with Content-Length repair and a delayed response;
+  one over-limit 503; outer-request rate limiting; strict custom upstream CA;
+  and log sink assertions. The certificate fixture asserts CA subject and
+  leaf signing behavior, not every CA property mentioned in its comments.
+- The integration suite's upstream fixture helper still invokes host `openssl`.
+  `testMitmSecretInjection` uses a self-signed upstream without a custom CA and
+  inherits upstream verification behavior from the host environment. The old
+  command prefix `NODE_TLS_REJECT_UNAUTHORIZED=0` disabled verification to
+  accommodate that fixture; it is **not** a secure production setting or
+  evidence of strict verification. The package command itself does not add
+  this override; no clean-environment pass is claimed here. The separate
+  custom-CA case explicitly removes the override for its upstream assertion.
+- Guest-side CA trust, mandatory network mediation, cross-host body policy,
+  and connection-count recovery are not established by these assertions.
+  See [HARDENING.md](../HARDENING.md) for the filesystem/traversal test scope,
+  `contextIsolation: true` / `nodeIntegration: false` / `sandbox: false`,
+  startup-only sync marker and archive clearing/host preference (not durability
+  guarantees), unimplemented snapshot backend/no-op IPC, and app RAM default
+  4096 MB versus the boot fixture's 512 MB.
 
 ## Config shape (`sandbox.config.json`)
 
-Extends the existing `SandboxAppConfig` with an `egress` section:
+The current `SandboxAppConfig` supports an `egress` section. Use strict JSON:
+comments or trailing commas cause `loadAppConfig()` to silently return empty
+configuration and discard the intended policy. This example enables host
+filtering without provisioning credentials:
 
-```jsonc
+```json
 {
   "egress": {
-    "policy": "allowlist",            // "allowlist" | "denylist" | "none"
+    "policy": "allowlist",
     "allowHosts": ["pypi.org", "*.pythonhosted.org"],
     "denyHosts": [],
     "allowPorts": [80, 443],
-    "allowAll": false,                // bypass all filtering (open egress)
-    "enableMitm": false,              // true = enable TLS interception for secret hosts
-    "secrets": [
-      // Inline value (for automation):
-      { "env": "MY_SECRET",    "value": "s3cr3t",           "hosts": ["service.example.com"] },
-      // Read from host environment variable at startup (recommended):
-      { "env": "GITHUB_TOKEN", "fromEnv": "GITHUB_TOKEN",   "hosts": ["api.github.com"] }
-    ]
+    "allowAll": false,
+    "enableMitm": false,
+    "secrets": []
   }
 }
 ```
 
-When `egress` is absent or policy is `"none"`, the proxy still starts (for
-consistency) but allows all traffic.
+Secret specs support `env`, one of `value` / `fromFile` / `fromEnv`, and `hosts`.
+Review the credential limitations above before adding real values. Secret host
+patterns do not automatically add entries to the global allowlist.
 
-## Current state
+Additional current fields include `listenPort`, `listenHost`, `caCertFile`,
+`maxConnections`, `rateLimitPerMin`, and secret `fromFile`. Config type comments
+are not substitutes for the handler semantics described above.
 
-- **Phase A is complete.** The host-process `EgressProxy` (`egress-proxy.ts`)
-  runs in the Electron main process, enforces allowlist/denylist host policy,
-  authenticates per-session tokens, and configures the guest environment via
-  kernel cmdline + `fw_cfg`. Unit + integration tests pass (`npm run test:egress`).
-- **Phase B is complete.** TLS interception (MITM) with leaf certificate generation,
-  secret placeholder replacement in headers/body, chunked body rejection, guest CA
-  trust via `fw_cfg`, and end-to-end integration test.
-- **Phase C is complete.** Connection timeouts, a rotating `proxy.log`, per-host
-  byte counters, robust error handling, and the full unit + integration suites.
-- **Phase D is complete.** All post-audit hardening items are resolved, including
-  **pure-Node certificate generation** (no `openssl` host dependency) via
-  `selfsigned` (→ `@peculiar/x509`), connection/rate limits, custom upstream CA
-  support, and response-header sanitization.
-- **WebDAV share config** moved from kernel cmdline to `fw_cfg` (`opt/org.valencebox.config/raw`).
-  MITM CA cert passed via `fw_cfg` (`opt/org.valencebox/mitm-ca-cert.pem`).
-- **HARDENING.md** has been updated for the QEMU/proxy architecture.
+## Historical implementation task record
 
-## Phase A — Basic CONNECT proxy (no MITM)
+The phase/task identifiers below preserve the original work breakdown.
+Checkboxes record historical implementation tasks, **not tests run for this
+update, audited guarantees, or proof that every original goal was met**.
+Current source and limitations above take precedence over the original intent.
 
-Goal: a runnable HTTP CONNECT forward proxy that enforces an allowlist/denylist
-on hostnames, replaces the WISP-based egress described in HARDENING.md.
+### Phase A — Basic CONNECT/forward proxy
 
-**All Phase A tasks are pure TypeScript / shell / docs and can be done entirely
-inside the valencebox sandbox without booting a QEMU VM.** The proxy class
-(`egress-proxy.ts`) is a plain Node.js HTTP server testable with standard unit
-tests; config changes are compile-time only; guest shell scripts are
-self-contained; doc updates are prose.
+Original goal: add a host HTTP proxy with configurable hostname policy and guest
+setup, testable on the host without a QEMU boot. This did not establish forced
+network mediation.
 
-### Tasks
+- [x] **A1. Create `src/main/egress-proxy.ts`.** Node HTTP server with CONNECT,
+  plain forwarding, Basic token auth, and host matching; default listener
+  `0.0.0.0`, reachable through the guest's SLIRP gateway.
+- [x] **A2. Extend `src/config.ts`.** Add egress, secret specification/resolution,
+  and runtime configuration types.
+- [x] **A3. Wire into `src/main/main.ts`.** Resolve secrets, generate placeholders
+  and auth token, start/stop the proxy, and pass config to `VmManager`.
+- [x] **A4. Pass proxy config to QEMU.** Kernel cmdline carries proxy port/token
+  and comma-separated `ENV=placeholder` mappings (not JSON).
+- [x] **A5. Guest proxy configuration.** `mount-share.sh` writes profile scripts
+  for HTTP(S) proxy variables, bypass list, and secret placeholders.
+- [x] **A6. Update `docs/qemu.md`.** Historical architecture documentation task;
+  current architecture and historical proposals are now separated there.
+- [x] **A7. Update `HARDENING.md`.** Current notes now distinguish proxy policy
+  from network enforcement and source observations from test assertions.
+- [x] **A8. Add basic proxy tests.** Unit assertions are in
+  `test/egress-proxy.unit.ts`; historical counts/pass reports are not current
+  verification. Guest curl/policy and WebDAV smoke checks require a VM and
+  were not performed for this update.
 
-- [x] **A1. Create `sandbox/src/main/egress-proxy.ts`**
-  - `EgressProxy` class using Node `http` module
-  - `CONNECT` handler: authenticate → `hostAllowed()` → tunnel
-  - Plain HTTP forward handler (GET, POST, etc.)
-  - Auth token verification (HMAC-compare)
-  - Policy checking: `hostAllowed(host, policy, allowHosts, denyHosts)`
-  - Listen on `0.0.0.0:<port>` (reachable from guest via SLIRP gateway `10.0.2.2`)
+### Phase B — MITM interception and secret injection
 
-- [x] **A2. Extend `sandbox/src/config.ts`**
-  - Add `EgressConfig` interface (policy, allowHosts, denyHosts, allowPorts, allowAll, enableMitm, secrets)
-  - Add `SecretSpec` interface (env, value?, fromEnv?, hosts)
-  - Extend `SandboxAppConfig` with `egress?: EgressConfig`
+Original goal: terminate TLS for declared secret hosts, replace placeholders,
+then forward upstream over TLS. Current behavior also includes plain-HTTP
+injection and the authorization limitations described above.
 
-- [x] **A3. Wire proxy into `sandbox/src/main/main.ts`**
-  - `loadAppConfig` already reads `sandbox.config.json` — extend to consume `egress` section
-  - Resolve secret values (inline `value` or read from `process.env[fromEnv]`)
-  - Generate random placeholders for each secret
-  - Instantiate `EgressProxy`, call `proxy.start()`, pass the proxy port to VmManager
-  - Shut down proxy in `before-quit`
+- [x] **B1. MITM CA generation/storage.** Generate when needed, then persist/reuse
+  `userData/mitm-ca/mitm-ca-cert.pem` and `mitm-ca-key.pem`; not ephemeral.
+- [x] **B2. Leaf generation/cache.** Pure-Node signing with DNS/IP SANs and
+  normalized-host-hash disk cache. No snapshot sizing or performance claims.
+- [x] **B3. MITM CONNECT handler.** Select secret-host interception, TLS-terminate,
+  parse HTTP, rewrite, repair Content-Length, and forward HTTPS. Upstream
+  verification remains environment-dependent; chunked MITM bodies get 411.
+- [x] **B4. Placeholder validation helpers.** Header mismatch throws
+  `PlaceholderViolation`; body replacement lacks per-secret host validation.
+  This task does not establish universal unauthorized-placeholder rejection.
+- [x] **B5. Add secret injection integration fixture.** Host-side header/body
+  assertions exist; suite/environment scope is documented above, not a guest
+  trust or clean-environment pass claim.
+- [x] **B6. Guest CA setup.** Deliver via `opt/org.valencebox.mitm-ca` and read
+  its guest sysfs `raw` file; install system CA and set `NODE_EXTRA_CA_CERTS`.
+  Share config uses the separate `opt/org.valencebox.config` entry.
 
-- [x] **A4. Pass proxy config to QEMU guest**
-  - Add `proxyPort` field to `QemuOptions` / `VmManagerOptions`
-  - In `qemu.ts` `buildArgs`, emit `valencebox.proxy_port=<port>` in kernel cmdline
-  - Also emit `valencebox.proxy_token=<token>` so the guest can authenticate
-  - Emit `valencebox.secrets=<json>` with the placeholder→env mapping
+### Phase C — Operational polish
 
-- [x] **A5. Guest-side proxy configuration**
-  - In `mount-share.sh`, parse `valencebox.proxy_port=` and `valencebox.secrets=` from `/proc/cmdline`
-  - Write `/etc/profile.d/valencebox-proxy.sh` with `HTTP_PROXY`, `HTTPS_PROXY`, `no_proxy`, and secret env vars (with placeholders)
-  - Ensure `no_proxy=127.0.0.1,localhost,10.0.2.2,::1` so WebDAV share traffic bypasses the proxy
+- [x] **C1. Timeouts/connection handling.** Main and inner HTTP server timeout
+  configuration, upstream TCP connect timeout, and TCP keepalive exist. They
+  do not establish complete connection pooling/resource protection.
+- [x] **C2. Logging/observability.** Event log sink, startup truncation, per-host
+  counters, and `VERBOSE`-gated DEBUG output exist.
+- [x] **C3. Error handling.** TLS handshake timeout and error/close handlers,
+  upstream 502 handling, and MITM mid-stream drop handling exist; no blanket
+  robustness guarantee is made.
+- [x] **C4. Unit suite.** Helper assertions in `test/egress-proxy.unit.ts`.
+- [x] **C5. Integration suite.** Host-side proxy assertions in
+  `test/egress-proxy.integration.ts`; not QEMU smoke verification.
+- [x] **C6. Documentation.** Historical multi-document update task; current
+  implementation notes are not a declaration that hardening is complete.
 
-- [x] **A6. Update `sandbox/docs/qemu.md`**
-  - Remove or update risk #5 ("Open egress is a security regression")
-  - Document the proxy architecture with a diagram
-  - Note: basic egress filtering is implemented; MITM + secret injection is Phase B
+### Phase D — Historical post-review hardening tasks
 
-- [x] **A7. Update `HARDENING.md`**
-  - Replace the stale WISP/DNS-gate/IP-pin egress section
-  - Document: proxy-enforced allowlist/denylist, auth token, no TAP, no root
-  - Note: MITM secret injection is gated behind `enableMitm: true` (Phase B)
+This is a record of earlier hardening work, not a new audit or a declaration
+that all HIGH/MEDIUM findings are resolved. The current body authorization,
+plaintext injection, TLS environment, and connection accounting limitations
+remain explicitly documented above. Obsolete source line numbers and prior
+exploit/resolution claims are not carried forward as current evidence.
 
-- [x] **A8. Verify basic proxy works (unit tests)**
-  - Core logic tested: `hostAllowed` (9 cases), `generatePlaceholder`/`resolveSecrets` (4 cases),
-    `rewriteHeaders` (4 cases), `rewriteBody` (2 cases), config structure (1 case)
-  - 21 unit tests pass in `test/egress-proxy.unit.ts` (`npm run test:egress`)
-  - **End-to-end verification requires a real QEMU guest** (this sandbox has no QEMU):
-    - SSH in, `curl -v https://pypi.org` (works), `curl -v https://example.com` (blocked)
-    - Confirm WebDAV sync works with `no_proxy`
-    - `npm start` → guest boots, syncs, proxy applies policy
-
-## Phase B — MITM TLS interception + secret injection
-
-Goal: for allowlisted hosts declared in `secrets[*].hosts`, the proxy terminates
-TLS, replaces placeholder strings with real credentials, and re-encrypts to the
-upstream. Requires an ephemeral CA and on-the-fly leaf certificate generation.
-
-### Tasks
-
-- [x] **B1. MITM CA generation**
-  - Generate an ephemeral RSA 2048-bit CA keypair at proxy startup if `enableMitm: true`
-  - Store CA cert + key in `app.getPath("userData")/mitm-ca/` (persisted across restarts)
-  - File permissions: `0o600` for key, `0o644` for cert
-  - If CA already exists on disk, reuse it (stable CA = stable leaf cert cache)
-  - Self-signed CA with `basicConstraints=CA:TRUE`
-  - *Implementation note:* pure-Node via `selfsigned` (→ `@peculiar/x509`); no `openssl`.
-
-- [x] **B2. Leaf certificate generation**
-  - On-the-fly per-hostname leaf certs, cached to disk
-  - Cert cache dir: `app.getPath("userData")/mitm-ca/certs/`
-  - Cache key: SHA256 of hostname
-  - Leaf cert validity: 365 days, SHA256, SAN: `DNS:<hostname>` or `IP:<addr>`
-  - *Implementation note:* pure-Node via `selfsigned` (→ `@peculiar/x509`); no `openssl`.
-
-- [x] **B3. MITM CONNECT handler**
-  - In `egress-proxy.ts`: if `enableMitm && isSecretHost(host)` → MITM path
-  - TLS-terminate the client connection with the leaf cert
-  - Parse the plaintext HTTP request from the guest via a private `http.Server`
-  - For headers and body: scan and replace all occurrences of any placeholder with the real secret value
-  - Block request if a placeholder appears for a secret not authorized for this host (403)
-  - Re-encrypt with upstream CA verification (set `NODE_TLS_REJECT_UNAUTHORIZED=0` for self-signed upstreams)
-  - Forward the modified request via Node `https` module
-  - Stream response back through the MITM path
-  - Chunked transfer-encoding rejected with 411 on secret hosts
-  - Keep-alive is handled natively by the `http.Server`
-
-- [x] **B4. Secret placeholder validation**
-  - If a placeholder appears in a request to a host not in the secret's `hosts` list → 403 Forbidden
-  - Log the blocked attempt with details (env name, host)
-  - Reject chunked transfer-encoding on secret hosts (must read/modify entire body)
-  - Implemented: `rewriteHeaders()` throws `PlaceholderViolation` for unauthorized hosts;
-    chunked body rejected with 411 in `handleMitmRequest`.
-
-- [x] **B5. Verify secret injection**
-  - Integration test `testMitmSecretInjection` validates end-to-end: CONNECT → TLS handshake → HTTP request with placeholder → upstream receives real value
-  - Test runs in `test/egress-proxy.integration.ts` (`NODE_TLS_REJECT_UNAUTHORIZED=0 npx tsx test/egress-proxy.integration.ts`)
-  - *Note:* guest-side curl verification requires a QEMU boot and is tracked in Phase C.
-
-- [x] **B6. Guest CA trust**
-  - CA cert passed to guest via `fw_cfg` entry `opt/org.valencebox/mitm-ca-cert.pem`
-  - In `mount-share.sh`, writes the CA cert to `/usr/local/share/ca-certificates/valencebox-mitm.crt` and runs `update-ca-certificates`
-  - Also sets `NODE_EXTRA_CA_CERTS` in `/etc/profile.d/valencebox-proxy.sh` — Node.js's bundled undici (used by `EnvHttpProxyAgent` in prime-agent and other Node tools) does not reliably pick up the system CA bundle after `update-ca-certificates`; the explicit env var bypasses this
-  - WebDAV share config also moved to `fw_cfg` (`opt/org.valencebox.config/raw`) — kernel cmdline now only carries proxy port/token/secrets
-
-## Phase C — Polish and hardening
-
-### Tasks
-
-- [x] **C1. Proxy connection pooling and timeouts**
-  - `keepAliveTimeout` (65s) / `headersTimeout` (66s) on both the main and MITM
-    inner `http.Server`; `requestTimeout` disabled (0) so long-lived downloads /
-    SSE streams are not killed mid-transfer.
-  - Upstream connect timeout (10s) in `connectUpstream`.
-  - Max concurrent connections enforced (see D8).
-
-- [x] **C2. Logging and observability**
-  - DENY/CONNECT/MITM/BLOCK events logged with ISO timestamps to console and a
-    rotating log file (`app.getPath("userData")/proxy.log`, truncated > 10 MB on
-    startup).
-  - Per-host byte counters (in/out) via `EgressProxy.getStats()`.
-  - Verbose per-event chatter gated behind `VERBOSE=1`.
-
-- [x] **C3. Error handling robustness**
-  - Upstream SSL/HTTP failures → 502 with logged cause; TLS handshake timeout
-    (5s) and error/close handlers on the MITM socket; mid-stream drop detection.
-
-- [x] **C4. Unit test suite**
-  - `hostAllowed`, `resolveSecrets` (value/fromFile/fromEnv), `rewriteHeaders`,
-    `rewriteBody`, `normalizeHost`, `sanitizeResponseHeaders`, config structure.
-
-- [x] **C5. Integration / smoke test**
-  - `test/egress-proxy.integration.ts`: cert generation (pure-Node), auth,
-    CONNECT policy, MITM secret injection, max-connection limit, rate limit,
-    custom upstream CA, log-file sink.
-
-- [x] **C6. Documentation**
-  - `sandbox/docs/mitm-plan.md`, `sandbox/README.md`, `AGENTS.md`,
-    `sandbox/docs/qemu.md` risk table updated.
-
-## Phase D — Security hardening (post-audit fixes)
-
-Security review findings and hardening items identified during the
-`feat/mitm-proxy` branch security audit. All HIGH and MEDIUM items should be
-resolved before merging to main.
-
-### Tasks
-
-- [x] **D1. Remove OPENSSL env var injection**
-  - `process.env.OPENSSL` allowed arbitrary binary execution as the CA signing
-    step, exposing the MITM CA private key. Hardcoded to `"openssl"`.
-  - File: `sandbox/src/main/egress-proxy.ts:353`
-
-- [x] **D2. Validate env_name in resolveSecrets()**
-  - Secret environment variable names from user config are validated against
-    `^[a-zA-Z_][a-zA-Z0-9_]*$` to prevent shell injection via the guest's
-    `mount-share.sh` eval path.
-  - File: `sandbox/src/main/egress-proxy.ts:101`
-
-- [x] **D3. Remove eval in mount-share.sh secrets parsing**
-  - Replaced `eval "export ${env_name}=\"${env_val}\""` with direct
-    `export "${env_name}=${env_val}"` and `printf` for the profile script.
-    Combined with D2, this closes the guest-side shell injection vector.
-  - File: `sandbox/guest/usr/local/libexec/mount-share.sh:104–109`
-
-- [x] **D4. Fix forwardRequest hardcoded port 443**
-  - Parses `req.url` as an absolute URL to extract the real target port and
-    path, instead of always forwarding to port 443. Also selects the correct
-    protocol module (`http` vs `https`) based on the URL scheme.
-  - File: `sandbox/src/main/egress-proxy.ts:570–608`
-
-- [x] **D5. Enforce allowPorts in CONNECT and forward handlers**
-  - The `allowPorts` field was defined in `EgressRuntimeConfig` but never
-    checked. Now both `handleConnect` and `forwardRequest` reject connections
-    to ports not in the allow list.
-  - Files: `sandbox/src/main/egress-proxy.ts:622`, `sandbox/src/main/egress-proxy.ts:560`
-
-- [x] **D6. Fix normalizeHost for bare IPv6 addresses**
-  - Bare IPv6 like `::1` was incorrectly stripped to empty string by the
-    port-stripping logic. Added a guard that detects multiple colons (IPv6)
-    before attempting port removal.
-  - File: `sandbox/src/main/egress-proxy.ts:35–43`
-
-- [x] **D7. Pure-Node fallback for certificate generation**
-  - MITM CA and leaf cert generation now use `selfsigned` (→ `@peculiar/x509`),
-    a pure-Node stack. The `openssl` subprocess dependency is removed entirely.
-    Leaf certs issue a DNS SAN for hostnames and an IP SAN for IP literals.
-  - `ensureMitmCa` / `ensureLeafCertificate` are now `async`.
-
-- [x] **D8. Rate limiting and connection limits**
-  - `maxConnections` (default 256): over-limit TCP connections get `503`.
-  - `rateLimitPerMin` (default 0 = off): per-client-IP requests/CONNECTs per
-    minute beyond the limit get `429`.
-
-- [x] **D9. Custom upstream CA support**
-  - `caCertFile` in `EgressConfig` (supports `~`) supplies a PEM bundle used to
-    verify upstream TLS servers, in addition to the system trust store
-    (`[...tls.rootCertificates, caCert]`). Lets internal/self-signed upstreams
-    verify without disabling `rejectUnauthorized`.
-
-- [x] **D10. Response header sanitization**
-  - `Strict-Transport-Security`, `Public-Key-Pins`, `Public-Key-Pins-Report-Only`,
-    and `Expect-CT` are stripped from upstream responses in both the plain-HTTP
-    forward path and the MITM path, so they cannot pin the guest against the MITM
-    leaf. (The encrypted non-MITM CONNECT tunnel is opaque and unaffected.)
-
-- [x] **D11. Add fromFile secret source**
-  - Added `fromFile?: string` to `SecretSpec` so secrets can be read from disk
-    files (e.g. `~/.secrets/gh.key`). Supports `~` expansion to the user's
-    home directory. Priority: `value` > `fromFile` > `fromEnv`.
-  - Files: `sandbox/src/config.ts:25–32`, `sandbox/src/main/egress-proxy.ts:105–145`
+- [x] **D1. Remove configurable certificate subprocess selection.** Superseded
+  by D7's runtime pure-Node generation; no host `OPENSSL` selector is used there.
+- [x] **D2. Validate secret env names.** POSIX-style env-name regex in
+  `resolveSecrets()`; unit assertions include invalid names.
+- [x] **D3. Remove eval from guest secret parsing.** Profile generation uses
+  `printf` and direct `export` for validated names/generated placeholders.
+- [x] **D4. Forward URL port/protocol handling.** `forwardRequest()` parses URL
+  port/path and chooses HTTP or HTTPS, rather than hardcoding port 443.
+- [x] **D5. Enforce `allowPorts`.** Checks exist in CONNECT and forwarding;
+  `none`/`allowAll` host bypass does not bypass them.
+- [x] **D6. Normalize bare IPv6 hosts.** Helper preserves bare IPv6; unit
+  assertions cover normalization, not full CONNECT IPv6 parsing/routing.
+- [x] **D7. Pure-Node runtime certificates.** Async `ensureMitmCa()` and
+  `ensureLeafCertificate()` use `selfsigned` / `@peculiar/x509`; the integration
+  upstream fixture still uses `openssl`.
+- [x] **D8. Connection/rate limits.** Rejection code and selected assertions exist;
+  the rejected-socket count decrement gap remains, as noted above.
+- [x] **D9. Custom upstream CA.** `caCertFile` supports `~` and extends Node root
+  certificates; verification can still be disabled by the host environment.
+- [x] **D10. Response sanitization.** Defined headers stripped in HTTP/MITM paths,
+  with helper assertions; opaque CONNECT traffic is unaffected.
+- [x] **D11. File-sourced secrets.** `fromFile` supports `~`, trims trailing
+  whitespace, rejects empty/unreadable files, and takes priority over `fromEnv`
+  but not inline `value`; unit assertions cover selected cases.
