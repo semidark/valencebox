@@ -57,3 +57,7 @@ Full build, test, and architecture docs live in
 The aarch64 guest is selected automatically on Apple Silicon when the QEMU
 binary and arm64 guest images are present. x86-64 TCG is the fallback path.
 See [`sandbox/docs/qemu.md`](sandbox/docs/qemu.md) for details.
+
+
+## Codeindex
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/semidark/valencebox)
