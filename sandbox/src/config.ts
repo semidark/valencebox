@@ -149,6 +149,16 @@ export interface SandboxAppConfig {
   smp?: number;
   balloonMinMb?: number;
 
+  /**
+   * Set false to disable Chromium GPU acceleration (app.disableHardwareAcceleration()).
+   * The renderer only needs the DOM/canvas path (xterm without the WebGL addon),
+   * so this is safe on displays where GLX is broken — e.g. SSH-forwarded X
+   * sessions missing XFree86-VidModeExtension, where the GPU process otherwise
+   * spams "eglGetMscRateANGLE: glXGetMscRateOML failed".
+   * Default: true (GPU acceleration enabled).
+   */
+  gpuEnabled?: boolean;
+
   /** Egress proxy configuration. Undefined = proxy started with policy=none (all traffic allowed). */
   egress?: EgressConfig;
 

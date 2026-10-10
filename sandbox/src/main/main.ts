@@ -78,6 +78,18 @@ let detectedAccel: { name: string; available: boolean } | undefined;
 // Loaded once at startup so both the IPC handlers and the VM launcher share it.
 let appCfg: SandboxAppConfig = {};
 
+// GPU acceleration must be toggled before app "ready". The renderer only uses
+// the DOM/canvas path (xterm without the WebGL addon), so disabling it is safe
+// and silences GLX errors on displays without XFree86-VidModeExtension (e.g.
+// SSH-forwarded X sessions).
+try {
+  if (loadAppConfig(app.getPath("userData")).gpuEnabled === false) {
+    app.disableHardwareAcceleration();
+  }
+} catch {
+  // userData path unavailable this early — leave GPU acceleration at default.
+}
+
 // Minimal menu: drops the default reload (Ctrl/Cmd+R) and force-reload
 // accelerators (which would reload the renderer and kick the terminal back
 // to the serial fallback) and the edit menu (Cmd+C/V would steal terminal
