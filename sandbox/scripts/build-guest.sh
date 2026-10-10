@@ -89,8 +89,10 @@ docker rm sandbox-export-"$ARCH" >/dev/null
 
 echo "==> creating root${SUFFIX}.qcow2"
 rm -f "images/root${SUFFIX}.qcow2"
-# Clean stale root-owned .ssh from previous failed builds
-docker run --rm --platform=linux/amd64 \
+# Clean stale root-owned .ssh from previous failed builds.
+# label=disable: SELinux (enforcing on RHEL hosts) would otherwise deny the
+# container access to host-mounted paths, and :Z relabeling of /tmp is refused.
+docker run --rm --platform=linux/amd64 --security-opt label=disable \
   -v /tmp:/tmproot \
   ubuntu:24.04 sh -c "rm -rf /tmproot/sandbox-rootfs${SUFFIX} 2>/dev/null || true"
 mkdir -p "/tmp/sandbox-rootfs${SUFFIX}"
@@ -133,7 +135,7 @@ SZ=$(du -sm "/tmp/sandbox-rootfs${SUFFIX}" | cut -f1); SZ=$((SZ + SZ / 4))
 # The mkfs container runs as root and fixes ownership of SSH authorized_keys
 # (created by the build user) inline before embedding them in the image.
 dd if=/dev/zero of="/tmp/sandbox-rootfs${SUFFIX}.img" bs=1M count="$SZ" status=none
-docker run --rm --platform="$PLATFORM_FLAG" \
+docker run --rm --platform="$PLATFORM_FLAG" --security-opt label=disable \
   -v "/tmp/sandbox-rootfs${SUFFIX}:/rootfs" \
   -v "/tmp/sandbox-rootfs${SUFFIX}.img:/rootfs.img" \
   ubuntu:24.04 sh -c '

@@ -42,6 +42,16 @@ fetch_qemu() {
     fi
 }
 
+fetch_libslirp() {
+    # Pre-fetch on the host: in-container HTTPS to gitlab.freedesktop.org can
+    # fail behind corporate TLS-intercepting proxies.
+    if [ ! -f "${BUILD_DIR}/libslirp-v4.8.0.tar.gz" ]; then
+        echo "==> fetching libslirp v4.8.0"
+        wget -q -O "${BUILD_DIR}/libslirp-v4.8.0.tar.gz" \
+            "https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.8.0/libslirp-v4.8.0.tar.gz"
+    fi
+}
+
 install_bin() {
     local platform="$1"
     local src="$2"
@@ -55,6 +65,7 @@ install_bin() {
 build_linux() {
     echo "==> building for linux (static, with KVM support)"
     fetch_qemu
+    fetch_libslirp
 
     # Build inside a Debian bookworm container with static deps.
     # The heredoc is NOT quoted so shell expands ${QEMU_VERSION} (and
@@ -101,10 +112,12 @@ RUN apk add --no-cache \
         zstd-static \
         zstd-dev
 
-# Build static libslirp (not in Alpine repos)
+# Build static libslirp (not in Alpine repos).
+# Tarball is pre-fetched by fetch_libslirp() on the host into ${BUILD_DIR};
+# in-container curl of the HTTPS URL is unreliable behind corporate TLS proxies.
 WORKDIR /src
-RUN curl -sL https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.8.0/libslirp-v4.8.0.tar.gz \
-    | tar -xz && \
+COPY "libslirp-v4.8.0.tar.gz" .
+RUN tar -xzf "libslirp-v4.8.0.tar.gz" && \
     cd libslirp-v4.8.0 && \
     meson setup build --default-library static --buildtype release -Dprefix=/usr && \
     ninja -C build install
@@ -129,6 +142,7 @@ RUN /src/qemu-\${QEMU_VERSION}/configure \
 RUN make -j"\${JOBS}"
 
 RUN for f in /src/build/qemu-system-*; do \
+        [ -f "\$f" ] || continue; \
         file "\$f" | grep -q -E "statically linked|static-pie" || { echo "NOT STATIC: \$f"; exit 1; }; \
     done
 

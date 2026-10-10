@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     systemd-sysv \
     dbus \
     openssh-server \
+    openssh-client \
     dhcpcd5 \
     apt-utils \
     curl \
@@ -36,23 +37,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     e2fsprogs && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# RTC driver for host-clock time on QEMU -machine virt (aarch64). QEMU's virt
-# machine exposes a PL031 RTC seeded with host UTC, but Ubuntu's linux-virt only
-# ships rtc-pl031 in linux-modules-extra. Install the extra-modules package whose
-# version is derived from the *installed* kernel, so apt version-locks the two:
-# a kernel upgrade forces a matching linux-modules-extra (apt refuses a mismatch).
-# This is the stable, apt-managed way to get an in-tree module that the base
-# linux-virtual metapackage omits — no hand-copied .ko, no version pinning, and
-# it survives kernel upgrades. The subsequent strip step trims the bulk we pulled
-# in. Without rtc-pl031 there is no /dev/rtc0, so the guest boots at the kernel
-# build epoch and the clock is wildly wrong. x86-64 (pc) uses the built-in
-# rtc_cmos, so this is only needed for arm64.
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      KREL=$(ls /lib/modules | head -1); \
-      apt-get update && \
-      apt-get install -y --no-install-recommends "linux-modules-extra-${KREL}" && \
-      apt-get clean && rm -rf /var/lib/apt/lists/*; \
-    fi
+# Extra kernel modules. Two in-tree modules the base linux-virtual metapackage
+# omits live in linux-modules-extra, and the version-locked install forces a
+# matching set when the kernel upgrades (apt refuses a mismatch):
+# - rtc-pl031: RTC for -machine virt (aarch64). QEMU's virt machine exposes a
+#   PL031 RTC seeded with host UTC; without it the guest boots at the kernel
+#   build epoch and the clock is wildly wrong. x86-64 (pc/microvm) uses the
+#   built-in rtc_cmos, so this one only matters on arm64.
+# - qemu_fw_cfg: fw_cfg sysfs glue, required on ALL architectures.
+#   mount-share.sh reads the WebDAV share config and MITM CA from -fw_cfg
+#   entries via /sys/firmware/qemu_fw_cfg/by_name. On x86-64 microvm the ACPI
+#   device (QEMU0002) is present, but without this module the sysfs tree never
+#   appears and the share config is silently lost.
+# The subsequent strip step trims the bulk we pulled in.
+RUN KREL=$(ls /lib/modules | head -1); \
+    apt-get update && \
+    apt-get install -y --no-install-recommends "linux-modules-extra-${KREL}" && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Explicit initramfs module list. Docker containers have no virtio devices,
 # so initramfs-tools auto-detection finds nothing — we must list them here.
@@ -160,7 +161,7 @@ RUN printf '\nsandbox login ready (Ubuntu 24.04)\n' > /etc/motd
 # keypair works for host SSH access without manual setup.
 RUN rm -f /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub && \
     ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N '' && \
-    printf 'HostKey /etc/ssh/ssh_host_ed25519_key\nPasswordAuthentication no\nPermitRootLogin prohibit-password\nClientAliveInterval 30\nCiphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\nMACs umac-64-etm@openssh.com\n' > /etc/ssh/sshd_config
+    printf 'HostKey /etc/ssh/ssh_host_ed25519_key\nPasswordAuthentication no\nPermitRootLogin prohibit-password\nClientAliveInterval 30\nCiphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\nMACs umac-64-etm@openssh.com\nSubsystem sftp internal-sftp\n' > /etc/ssh/sshd_config
 
 # DHCP on eth0 via dhcpcd (systemd-networkd is masked)
 RUN systemctl enable dhcpcd
