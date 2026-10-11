@@ -97,6 +97,7 @@ function buildProxyConfig(cfg: SandboxAppConfig, strict: boolean): EgressRuntime
     // TCP listener is loopback-only (host-side debugging).
     listenHost: egress.listenHost ?? (strict ? "127.0.0.1" : "0.0.0.0"),
     upstreamProxy: egress.upstreamProxy ? parseUpstreamProxy(egress.upstreamProxy) : undefined,
+    upstreamNoProxy: egress.upstreamNoProxy,
   };
 }
 

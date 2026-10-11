@@ -8,7 +8,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { generate as selfsignedGenerate } from "selfsigned";
-import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret, UpstreamProxy, parseUpstreamProxy } from "../config";
+import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret, UpstreamProxy, UpstreamNoProxySet, parseUpstreamProxy, parseUpstreamNoProxy, matchesUpstreamNoProxy, UPSTREAM_NO_PROXY_LOOPBACK } from "../config";
 
 // ---- Helpers ----
 
@@ -363,6 +363,8 @@ export class EgressProxy {
   private readonly config: EgressRuntimeConfig;
   /** Parsed upstream proxy (host-side chaining), or null. Accepts a raw URL too. */
   private readonly upstream: UpstreamProxy | null;
+  /** no_proxy exception set: hosts dialed directly even when chaining. */
+  private readonly upstreamNoProxy: UpstreamNoProxySet;
   private mitmCa: MitmCa | null = null;
   private caDir: string;
   private mitmServer: http.Server;
@@ -385,6 +387,10 @@ export class EgressProxy {
     this.upstream = up
       ? (typeof up === "string" ? parseUpstreamProxy(up) : up)
       : null;
+    const np = config.upstreamNoProxy as UpstreamNoProxySet | string | string[] | undefined;
+    this.upstreamNoProxy = parseUpstreamNoProxy(
+      [UPSTREAM_NO_PROXY_LOOPBACK, ...(np === undefined ? [] : Array.isArray(np) ? np : [np])].join(","),
+    );
     this.caDir = caDir || path.join(process.cwd(), ".mitm-ca");
     this.logFile = logFile;
     this.mitmServer = http.createServer((req, res) => {
@@ -1205,10 +1211,18 @@ export class EgressProxy {
    * tunnel carries whatever the caller speaks (TLS, HTTP, ssh …).
    */
   private connectUpstream(host: string, port: number): Promise<net.Socket> {
-    if (this.upstream) {
+    if (this.upstream && !this.isDirectUpstream(host)) {
       return this.connectViaUpstreamProxy(host, port);
     }
+    if (this.upstream) {
+      this.log("DEBUG", "CONNECT", `${host}:${port}`, "upstream bypassed (no_proxy match)");
+    }
     return this.connectDirect(host, port);
+  }
+
+  /** True when the target must be dialed directly despite upstream chaining. */
+  private isDirectUpstream(host: string): boolean {
+    return matchesUpstreamNoProxy(host, this.upstreamNoProxy);
   }
 
   private connectDirect(host: string, port: number): Promise<net.Socket> {
