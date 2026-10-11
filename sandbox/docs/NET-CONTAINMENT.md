@@ -138,6 +138,11 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
   chaining; MITM secret injection still works because TLS still terminates
   at `EgressProxy`. This replaces the interim guest-side `upstreamProxy`
   fw_cfg workaround (reverted at M2).
+- `egress.upstreamNoProxy?: string | string[]` — no_proxy-style exceptions
+  honored when chaining: matching targets (hostnames, `.suffix` domains, IP
+  literals, CIDR ranges, `*`) are dialed **directly** — internal hosts that
+  are not reachable through the corporate proxy stay on the normal network.
+  Loopback is always direct. Full configuration reference: `docs/CONFIG.md`.
 - Validation is fail-closed: `enforce: true` with any `protocol: "udp"`
   port forward is a config-load error and the VM refuses to start with a
   clear message. (Validation runs on the loaded config; it does not rely on

@@ -192,6 +192,7 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
       "listenPort": 0,                  // 0 = OS-assigned
       "enforce": true,                  // strict network containment (default true on Linux)
       "upstreamProxy": "http://proxy.corp.example:8080",  // optional host-side chaining; creds allowed
+      "upstreamNoProxy": ".corp.example, 10.0.0.0/8",  // direct-dial exceptions when chaining
       "guestCaFile": "/etc/pki/corp-root.pem",  // PEM installed into the guest trust store (inspection CAs)
       "secrets": []
     },
@@ -214,6 +215,11 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
   re-encryption) through this corporate proxy via HTTP CONNECT; credentials
   in the URL become the upstream `Proxy-Authorization`. Host policy and port
   policy still apply before chaining. Only `http://` upstreams are supported.
+- **`egress.upstreamNoProxy` (direct-dial exceptions):** no_proxy-style list
+  (hostnames, `.suffix.domains`, IP literals, CIDR ranges, `*`) honored when
+  `upstreamProxy` is set — matching targets bypass the corp proxy and are
+  dialed directly. Loopback (`localhost`, `127.0.0.0/8`, `::1`) is always
+  direct and cannot be removed.
 - **`egress.guestCaFile` (guest trust store):** PEM delivered to the guest via
   fw_cfg and installed with `update-ca-certificates` — for corporate TLS
   inspection CAs or internal roots. Independent of `enableMitm` (takes
@@ -282,6 +288,8 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
   microvm path).
 - `sandbox/docs/NET-CONTAINMENT.md` — strict networking architecture,
   decisions and status; `sandbox/docs/mux-protocol.md` — wire protocol.
+- `sandbox/docs/CONFIG.md` — full `sandbox.config.json` reference with
+  recipes (corporate chaining, guest CA, port forwards).
 - `sandbox/docs/mitm-plan.md` — MITM implementation plan.
 - `sandbox/HARDENING.md` — implementation evidence, limitations and follow-ups (not an audit).
 
