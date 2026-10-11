@@ -1,3 +1,12 @@
+# ── Stage 0: build the mux tunnel daemon (strict network mode) ──
+# Static musl binary, zero external crates (no network needed at build time).
+# Speaks docs/mux-protocol.md over /dev/virtio-ports/mux; bridges guest
+# loopback relays to the host proxy/share and serves host-initiated fwd dials.
+FROM rust:1-alpine AS muxbuild
+WORKDIR /src
+COPY guest-mux/ ./
+RUN cargo build --release --offline
+
 # ── Single-stage: Ubuntu guest rootfs (x86-64 or arm64) ──
 # Produces a bootable rootfs for QEMU pc/microvm (x86-64) or virt (aarch64)
 # with virtio-blk root, workspace qcow2 mount, WebDAV host share, bidir sync.
@@ -169,17 +178,22 @@ RUN systemctl enable dhcpcd
 # Enable SSH
 RUN systemctl enable ssh
 
-# Copy systemd unit files for mount-share, workspace-sync, and pty-daemon
+# Copy systemd unit files for mount-share, workspace-sync, pty-daemon, mux
 COPY etc/systemd/system/mount-share.service /etc/systemd/system/mount-share.service
 COPY etc/systemd/system/workspace-sync.service /etc/systemd/system/workspace-sync.service
 COPY etc/systemd/system/pty-daemon.service /etc/systemd/system/pty-daemon.service
-RUN systemctl enable mount-share && systemctl enable workspace-sync && systemctl enable pty-daemon
+COPY etc/systemd/system/valencebox-mux.service /etc/systemd/system/valencebox-mux.service
+RUN systemctl enable mount-share && systemctl enable workspace-sync && systemctl enable pty-daemon && systemctl enable valencebox-mux
 
 # Copy helper scripts
 COPY usr/local/libexec/mount-share.sh /usr/local/libexec/mount-share.sh
 COPY usr/local/libexec/workspace-sync.sh /usr/local/libexec/workspace-sync.sh
 COPY usr/local/libexec/pty-daemon.py /usr/local/libexec/pty-daemon.py
 RUN chmod +x /usr/local/libexec/mount-share.sh /usr/local/libexec/workspace-sync.sh /usr/local/libexec/pty-daemon.py
+
+# Mux tunnel daemon (static musl, no runtime deps)
+COPY --from=muxbuild /src/target/release/valencebox-mux /usr/local/sbin/valencebox-mux
+RUN chmod 0755 /usr/local/sbin/valencebox-mux
 
 # Strip bloat
 RUN rm -rf /usr/share/man /usr/share/doc /usr/share/info /usr/share/i18n \

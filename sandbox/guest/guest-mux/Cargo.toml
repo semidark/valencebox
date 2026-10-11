@@ -1,0 +1,15 @@
+[package]
+name = "valencebox-mux"
+version = "0.1.0"
+edition = "2021"
+description = "ValenceBox virtio-serial mux tunnel daemon (guest side)"
+
+[[bin]]
+name = "valencebox-mux"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true
+panic = "abort"
