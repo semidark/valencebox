@@ -100,9 +100,9 @@ validateNetworkConfig({ egress: { upstreamNoProxy: ["web.internal", "192.168.0.0
 const np = parseUpstreamNoProxy("localhost, .corp.example , 192.168.10.28, 127.0.0.0/8, fe80::/10");
 // Domain suffix semantics: .corp.example matches subdomains AND the bare domain.
 assert(matchesUpstreamNoProxy("svc.corp.example", np), "suffix subdomain match");
-assert(matchesUpstreamNoProxy(".corp.example", np), "suffix bare-domain match");
+assert(matchesUpstreamNoProxy("corp.example", np), "suffix bare-domain match");
 assert(matchesUpstreamNoProxy("CORP.EXAMPLE:8080", np), "case+port insensitive");
-assert(!matchesUpstreamNoProxy("not.corp.example", np), "suffix is dot-anchored");
+assert(!matchesUpstreamNoProxy("notcorp.example", np), "suffix is dot-anchored");
 // Hostname entries match the host and its subdomains.
 const np2 = parseUpstreamNoProxy("registry.internal");
 assert(matchesUpstreamNoProxy("registry.internal", np2), "exact hostname");
