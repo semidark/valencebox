@@ -1,9 +1,9 @@
 # Network Containment — Strict Egress via virtio-serial Tunnel
 
-Status: plan, not implemented. This document records the Phase 1 architecture
-for mandatory, fail-closed guest egress and the milestones that gate rollout.
-Phase 2 (transparent proxying of non-proxy-aware clients) is out of scope here
-and sketched at the end. Paths are relative to `sandbox/`.
+Status: **Phase 1 implemented** (strict mode default on Linux; SLIRP is the
+opt-out). See "Implementation status" at the end for verified behavior and
+known gaps. Phase 2 (transparent proxying of non-proxy-aware clients) remains
+out of scope and sketched at the end. Paths are relative to `sandbox/`.
 
 ## Problem
 
@@ -180,3 +180,47 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
   functional gate.
 - Migrating token delivery off the kernel cmdline (guest `/proc/cmdline` is
   world-readable) — the mux handshake is the natural carrier.
+
+## Implementation status (Phase 1)
+
+Implemented and verified on Linux x86-64 (KVM/microvm and TCG/pc):
+
+- **Config:** `egress.enforce` (default true), `egress.upstreamProxy`
+  (host-side chaining), UDP-portForward rejection at config load
+  (`validateNetworkConfig`), strict proxy listener defaults to `127.0.0.1`.
+- **QEMU args:** `-nic none` + mux chardev/virtserialport in strict mode
+  (golden-args cases 14–18); SLIRP path unchanged for legacy.
+- **Host tunnel:** `src/main/mux-channel.ts` (framing, credit flow control,
+  HELLO reset, PING/PONG liveness) injecting streams into `EgressProxy` and
+  `HttpShare` via `server.emit("connection", …)`; TCP port forwards via
+  `src/main/port-forwards.ts` (host listeners → `OPEN fwd:<port>`).
+- **Guest daemon:** `guest/guest-mux/` (static musl Rust, zero crates,
+  non-blocking + bounded poll), wired as `valencebox-mux.service`;
+  `mount-share.sh` and proxy env re-pointed to `127.0.0.1` relays in strict
+  mode; `network-online.target` dependency dropped.
+- **Upstream chaining:** CONNECT-through-upstream for tunnels, TLS-over-tunnel
+  for forwarded/intercepted requests, upstream auth; policy enforced before
+  chaining.
+
+Verified by: `test:unit` (config validation + strict golden args),
+`test:egress` (mux channel unit + injection/chaining unit),
+`test/guest-mux.integration.ts` (real daemon ↔ host channel, relays, fwd
+dial, 4 MiB roundtrip), `test:boot:strict` (full gate: no NIC, daemon active,
+WebDAV-over-tunnel sync active, curl → proxy relay → mux → EgressProxy →
+WebDAV = 207, SSH over a mux forward) on **both microvm/KVM and pc/TCG**, and
+the legacy `test:boot` (SLIRP path unchanged).
+
+Gaps / notes:
+
+- Full throughput re-benchmark of the production daemon was not rerun; the
+  earlier tunnel benchmarks plus a 4 MiB no-corruption roundtrip through the
+  real daemon stand in as functional evidence. The daemon deviates from the
+  benchmark harness in one important way: virtio_console returns **0-byte
+  reads when idle** (not EAGAIN) and its poll can miss wakeups, so the daemon
+  drains the port unconditionally and caps poll at 100 ms (benchmark
+  reader pattern).
+- A synchronous `execFile*` call on the host freezes the event loop and
+  starves the tunnel (surfaced as apparent 10 s stalls during testing);
+  Electron main-process code must stay async around the mux.
+- The mux debug logging is env-gated (`MUX_DEBUG` on the host); no debug
+  output in production defaults.

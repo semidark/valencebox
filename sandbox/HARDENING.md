@@ -48,13 +48,27 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
 
 ## Network and proxy policy
 
-- **Proxy use is configured, not mandatory egress enforcement.**
+- **Strict mode (default on Linux) mediates all guest egress by construction,
+  not by convention.** `egress.enforce` (default true) boots the VM with
+  `-nic none`: there is no SLIRP device, no guest NIC, and therefore no UDP or
+  ICMP path at all. The only guest↔host channel is the virtio-serial mux
+  tunnel (`src/main/mux-channel.ts` + `guest/guest-mux/`), whose streams are
+  injected into `EgressProxy` / `HttpShare` (protocol in `docs/mux-protocol.md`,
+  architecture and verification scope in `docs/NET-CONTAINMENT.md`).
+  `protocol: "udp"` port forwards are rejected at config load. The tunnel is
+  **not** a guest-compartment boundary: a compromised root guest can open
+  arbitrary mux streams either way — host policy (allowlist/denylist/ports,
+  rate limits) at `EgressProxy` is the enforcement point, and the guest can
+  only reach the two services the host routes. `test:boot:strict` asserts the
+  no-NIC state, daemon liveness, share-over-tunnel sync, a proxied HTTP round
+  trip, and SSH over a host-initiated mux forward on microvm/KVM and pc/TCG.
+- **Legacy SLIRP mode (egress.enforce: false) is NOT egress enforcement.**
   `src/main/qemu.ts` creates an unrestricted `-netdev user,id=net0` SLIRP
   backend with a virtio NIC; it does not set `restrict=on` or install a firewall
   forcing traffic through the proxy. `mount-share.sh` sets HTTP(S) proxy
   environment variables for cooperating clients. They do not constrain clients
   that ignore them or other protocols. The proxy's policy applies to requests
-  that reach it; this is not evidence that all guest egress is mediated.
+  that reach it; in this mode that is not all guest egress.
 - **WebDAV is separate from the egress proxy.** `NO_PROXY`/`no_proxy` includes
   `127.0.0.1,localhost,10.0.2.2,::1`. The share and proxy are separate HTTP
   servers. This configures proxy bypass for cooperating clients accessing the
