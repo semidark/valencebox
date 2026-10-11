@@ -1,0 +1,18 @@
+# ValenceBox Mux Tunnel Daemon
+# Bridges guest loopback services to the host over the virtio-serial mux port
+# (strict network mode). See docs/mux-protocol.md.
+[Unit]
+Description=ValenceBox Mux Tunnel Daemon
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/sbin/valencebox-mux
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=1
+User=root
+
+[Install]
+WantedBy=multi-user.target
