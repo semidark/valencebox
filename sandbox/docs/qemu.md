@@ -33,20 +33,27 @@ Electron main (Node)
  ├─ QEMU subprocess: qemu-system-x86_64 or qemu-system-aarch64
  │    ├─ machine/profile: x86 microvm (HW or bare tcg), pc (tcg,thread=multi); ARM virt
  │    ├─ drives: root + workspace qcow2 via virtio-blk
- │    ├─ net: -netdev user (SLIRP) + virtio-net
+ │    ├─ net (strict, default on Linux): -nic none; the only guest↔host path is
+ │    │    a multiplexed virtio-serial tunnel (docs/mux-protocol.md)
+ │    ├─ net (legacy, egress.enforce:false): -netdev user (SLIRP) + virtio-net
  │    ├─ serial + QMP + PTY: Unix sockets on Linux/macOS; loopback TCP on Windows
  │    └─ QMP client: lifecycle/events + balloon control (not a snapshot backend)
  ├─ WebDAV server: plain HTTP, Basic auth with per-session token
  │    └─ 127.0.0.1:<random_port>; port/token delivered via file-backed fw_cfg
+ │       (strict mode: the fw_cfg port is the guest's local mux relay port)
  └─ EgressProxy: authenticated HTTP/CONNECT proxy, optional MITM secret injection
-      └─ guest proxy environment is configuration, not enforced network isolation
+      └─ strict mode: all guest egress is injected into it over the mux tunnel
+         (configuration, not just steering; see docs/NET-CONTAINMENT.md)
 
 Guest (Ubuntu 24.04, x86-64 or aarch64, systemd)
  ├─ / on /dev/vda (root qcow2)
  ├─ /workspace on /dev/vdb (native ext4, formatted on first boot)
- ├─ workspace-sync mounts WebDAV at /host-workspace via SLIRP (10.0.2.2)
+ ├─ workspace-sync mounts WebDAV at /host-workspace (legacy: SLIRP 10.0.2.2;
+ │    strict: the local mux relay at 127.0.0.1:<share relay>)
  ├─ unison -repeat 2: /host-workspace ⇄ /workspace (poll-based)
  ├─ PTY daemon on /dev/virtio-ports/pty
+ ├─ valencebox-mux daemon on /dev/virtio-ports/mux (strict mode; relays the
+ │    egress proxy on 127.0.0.1:3128 and the share on 127.0.0.1:8081)
  └─ root auto-login via serial-getty: ttyS0 (x86) or ttyAMA0 (ARM)
 ```
 

@@ -25,3 +25,6 @@ sandbox/build/
 sandbox/resources/qemu/*
 # ...but keep source files (entitlements plist consumed by build-qemu.sh signing)
 !sandbox/resources/qemu/hvf-entitlement.plist
+
+# Rust guest mux daemon build artifacts (regenerate: cd sandbox/guest/guest-mux && cargo build --release)
+sandbox/guest/guest-mux/target/
