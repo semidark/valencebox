@@ -5,6 +5,7 @@
 // - plain-HTTP forward through the upstream (absolute-form)
 // - policy checked BEFORE chaining (disallowed host never reaches upstream)
 import * as net from "net";
+import * as os from "os";
 import * as http from "http";
 import { AddressInfo } from "net";
 import { EgressProxy } from "../src/main/egress-proxy";
@@ -34,14 +35,25 @@ function cfg(overrides: Partial<EgressRuntimeConfig> = {}): EgressRuntimeConfig 
   };
 }
 
-/** Echo server on a random loopback port. */
-async function echoServer(): Promise<number> {
+/** Echo server on a random port (loopback by default). */
+async function echoServer(bindHost = "127.0.0.1"): Promise<number> {
   const srv = net.createServer((s) => s.pipe(s));
-  await new Promise<void>((res) => srv.listen(0, "127.0.0.1", res));
+  await new Promise<void>((res) => srv.listen(0, bindHost, res));
   const port = (srv.address() as AddressInfo).port;
   (srv as any)._port = port;
   (srv as any).closeLater = () => srv.close();
   return port;
+}
+
+/** First non-internal IPv4 of this host, or null. */
+function nonLoopbackIPv4(): string | null {
+  const ifs = os.networkInterfaces();
+  for (const list of Object.values(ifs)) {
+    for (const a of list ?? []) {
+      if (a.family === "IPv4" && !a.internal) return a.address;
+    }
+  }
+  return null;
 }
 
 /** Minimal upstream CONNECT proxy: relays to the requested target, counts CONNECTs. */
@@ -142,16 +154,20 @@ async function main() {
 
   // ---- 3. Upstream chaining: CONNECT tunneled through upstream with auth ----
   {
+    const hostIp = nonLoopbackIPv4();
+    if (!hostIp) {
+      console.log("skip upstream-chaining e2e (no non-loopback IPv4)");
+    } else {
     const upstream = await mockUpstreamProxy({ requireAuth: "Basic " + Buffer.from("corp:p@ss").toString("base64") });
     const proxy = new EgressProxy(cfg({
       upstreamProxy: `http://corp:p%40ss@127.0.0.1:${upstream.port}`,
     }));
     await proxy.start();
-    const target = await echoServer();
+    const target = await echoServer(hostIp);
 
     const auth = "Basic " + Buffer.from("valencebox:tok123").toString("base64");
     const s = net.createConnection(proxy.port, "127.0.0.1");
-    s.write(`CONNECT 127.0.0.1:${target} HTTP/1.1\r\nHost: 127.0.0.1:${target}\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+    s.write(`CONNECT ${hostIp}:${target} HTTP/1.1\r\nHost: ${hostIp}:${target}\r\nProxy-Authorization: ${auth}\r\n\r\n`);
     await new Promise<string>((res) => {
       let buf = "";
       s.on("data", (c: Buffer) => { buf += c.toString(); if (buf.includes("200 Connection Established")) res(buf); });
@@ -167,6 +183,7 @@ async function main() {
     await proxy.stop();
     upstream.close();
     console.log("✓ upstream chaining: CONNECT through upstream proxy with auth");
+    }
   }
 
   // ---- 4. Policy checked BEFORE chaining ----
@@ -223,6 +240,29 @@ async function main() {
     await proxy.stop();
     upstreamSrv.close();
     console.log("✓ plain-HTTP forward through upstream (absolute-form)");
+  }
+
+  // ---- 6. upstreamNoProxy: routing — matching targets dial direct, others chain ----
+  {
+    // Spy on the two dial paths; no real sockets needed for routing decisions.
+    const proxy = new EgressProxy(cfg({
+      upstreamProxy: "http://127.0.0.1:1",
+      upstreamNoProxy: ".direct.test",
+    }));
+    const calls: string[] = [];
+    (proxy as any).connectDirect = async () => { calls.push("direct"); return new net.Socket(); };
+    (proxy as any).connectViaUpstreamProxy = async () => { calls.push("upstream"); return new net.Socket(); };
+
+    await (proxy as any).connectUpstream("svc.direct.test", 443);   // matches suffix → direct
+    await (proxy as any).connectUpstream("direct.test", 443);       // bare domain → direct
+    await (proxy as any).connectUpstream("chained.example", 443);   // not matched → upstream
+    await (proxy as any).connectUpstream("127.0.0.1", 8081);        // loopback default → direct
+    await (proxy as any).connectUpstream("notdirect.test", 443);    // dot-anchored → upstream
+    assert(
+      JSON.stringify(calls) === JSON.stringify(["direct", "direct", "upstream", "direct", "upstream"]),
+      `routing decisions (got ${JSON.stringify(calls)})`,
+    );
+    console.log("✓ upstreamNoProxy: suffix-matched and loopback targets dial direct, others chain");
   }
 
   console.log("ALL EGRESS INJECTION/CHAINING TESTS PASSED");

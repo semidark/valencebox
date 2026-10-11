@@ -80,4 +80,47 @@ assertThrows(
   "socks upstream rejected at config load",
 );
 
+// ---- upstreamNoProxy: parsing + matching ----
+import { parseUpstreamNoProxy, matchesUpstreamNoProxy, UPSTREAM_NO_PROXY_LOOPBACK } from "../src/config";
+
+// Malformed entries fail at config load.
+assertThrows(
+  () => validateNetworkConfig({ egress: { upstreamNoProxy: "10.0.0.0/64" } }),
+  "exceeds /32",
+  "bad v4 CIDR rejected",
+);
+assertThrows(
+  () => validateNetworkConfig({ egress: { upstreamNoProxy: "not a host!" } }),
+  "invalid host entry",
+  "garbage host rejected",
+);
+validateNetworkConfig({ egress: { upstreamNoProxy: "localhost, .corp.example ,10.0.0.0/8, ::1" } });
+validateNetworkConfig({ egress: { upstreamNoProxy: ["web.internal", "192.168.0.0/16"] } });
+
+const np = parseUpstreamNoProxy("localhost, .corp.example , 192.168.10.28, 127.0.0.0/8, fe80::/10");
+// Domain suffix semantics: .corp.example matches subdomains AND the bare domain.
+assert(matchesUpstreamNoProxy("svc.corp.example", np), "suffix subdomain match");
+assert(matchesUpstreamNoProxy(".corp.example", np), "suffix bare-domain match");
+assert(matchesUpstreamNoProxy("CORP.EXAMPLE:8080", np), "case+port insensitive");
+assert(!matchesUpstreamNoProxy("not.corp.example", np), "suffix is dot-anchored");
+// Hostname entries match the host and its subdomains.
+const np2 = parseUpstreamNoProxy("registry.internal");
+assert(matchesUpstreamNoProxy("registry.internal", np2), "exact hostname");
+assert(matchesUpstreamNoProxy("mirror.registry.internal", np2), "hostname subdomain");
+// IP literals and CIDRs (v4 + v6), brackets and ports tolerated.
+assert(matchesUpstreamNoProxy("192.168.10.28", np), "ip literal");
+assert(matchesUpstreamNoProxy("127.200.1.2", np), "v4 cidr in range");
+assert(!matchesUpstreamNoProxy("128.0.0.1", np), "v4 cidr out of range");
+assert(matchesUpstreamNoProxy("fe80::1234", np), "v6 cidr in range");
+assert(!matchesUpstreamNoProxy("fec0::1", np), "v6 cidr out of range");
+assert(matchesUpstreamNoProxy("[::1]:8081", parseUpstreamNoProxy("::1")), "bracketed v6 with port");
+// Loopback default is always direct.
+const loopback = parseUpstreamNoProxy(UPSTREAM_NO_PROXY_LOOPBACK);
+assert(matchesUpstreamNoProxy("localhost", loopback), "loopback default: localhost");
+assert(matchesUpstreamNoProxy("127.0.0.1", loopback), "loopback default: 127.0.0.1");
+assert(matchesUpstreamNoProxy("[::1]", loopback), "loopback default: ::1");
+assert(!matchesUpstreamNoProxy("example.com", loopback), "loopback default: external not matched");
+// Wildcard bypasses everything.
+assert(matchesUpstreamNoProxy("anything.example", parseUpstreamNoProxy("*")), "wildcard matches all");
+
 console.log("ALL CONFIG VALIDATION TESTS PASSED");

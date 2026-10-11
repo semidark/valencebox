@@ -1,3 +1,4 @@
+import * as net from "net";
 import { GuestArch } from "./main/guest-profile";
 
 // ---- Egress proxy types ----
@@ -118,6 +119,22 @@ export interface EgressConfig {
   upstreamProxy?: string;
 
   /**
+   * Hosts that must be dialed DIRECTLY even when `upstreamProxy` is set —
+   * the equivalent of the standard `no_proxy` environment variable. Entries
+   * are comma/space separated (or a string array) and may be:
+   *   - plain hostnames:           `localhost`
+   *   - domain suffixes:           `.corp.example` (matches `*.corp.example` and `.corp.example`)
+   *   - IP literals:               `10.1.2.3`, `::1`
+   *   - CIDR ranges (v4 and v6):   `127.0.0.0/8`, `fe80::/10`
+   *   - `*` (everything bypasses the upstream proxy)
+   *
+   * Loopback (`localhost`, `127.0.0.0/8`, `::1`) is always direct — host-local
+   * services must never be routed through an external proxy — and cannot be
+   * removed. Everything else defaults to chained through the upstream proxy.
+   */
+  upstreamNoProxy?: string | string[];
+
+  /**
    * PEM certificate (or bundle) installed into the GUEST trust store at boot
    * via fw_cfg. Use this when corporate TLS inspection (e.g. an intercepting
    * proxy) presents certificates the guest must trust, or to provision an
@@ -135,6 +152,153 @@ export interface UpstreamProxy {
   port: number;
   /** Pre-rendered "Basic ..." Proxy-Authorization header value, or undefined. */
   authHeader?: string;
+}
+
+/** Parsed no_proxy exception set for upstream proxy chaining. */
+export interface UpstreamNoProxySet {
+  /** Lowercase domains (leading dot stripped); match host and *.host. "*" = all. */
+  domains: string[];
+  /** Normalized IP literals (v4/v6, no brackets). */
+  ips: string[];
+  /** CIDR ranges. */
+  cidrs: { family: 4 | 6; prefix: string; bits: number }[];
+}
+
+const HOSTNAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
+
+function ipv4ToBigInt(ip: string): bigint | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let v = 0n;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null;
+    const n = Number(p);
+    if (n > 255) return null;
+    v = (v << 8n) | BigInt(n);
+  }
+  return v;
+}
+
+function ipv6ToBigInt(ip: string): bigint | null {
+  // Strip a zone suffix (fe80::1%eth0) and expand "::".
+  const bare = ip.split("%")[0];
+  if (!bare.includes(":")) return null;
+  const halves = bare.split("::");
+  if (halves.length > 2) return null;
+  const parseGroup = (g: string): number | null =>
+    /^[0-9a-fA-F]{1,4}$/.test(g) ? parseInt(g, 16) : null;
+  if (halves.length === 2) {
+    const head = halves[0] === "" ? [] : halves[0].split(":");
+    const tail = halves[1] === "" ? [] : halves[1].split(":");
+    if (head.some((g) => parseGroup(g) === null) || tail.some((g) => parseGroup(g) === null)) return null;
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) return null;
+    const groups = [...head, ...Array<string>(fill).fill("0"), ...tail];
+    let v = 0n;
+    for (const g of groups) v = (v << 16n) | BigInt(parseInt(g, 16));
+    return v;
+  }
+  const groups = bare.split(":");
+  if (groups.length !== 8) return null;
+  let v = 0n;
+  for (const g of groups) {
+    const n = parseGroup(g);
+    if (n === null) return null;
+    v = (v << 16n) | BigInt(n);
+  }
+  return v;
+}
+
+function ipToBigInt(ip: string): { family: 4 | 6; value: bigint } | null {
+  if (net.isIPv4(ip)) {
+    const v = ipv4ToBigInt(ip);
+    return v === null ? null : { family: 4, value: v };
+  }
+  if (net.isIPv6(ip)) {
+    const v = ipv6ToBigInt(ip);
+    return v === null ? null : { family: 6, value: v };
+  }
+  return null;
+}
+
+/**
+ * Parse a no_proxy-style exception list for upstream chaining.
+ * Throws with a clear message on malformed entries (fail-closed config load).
+ */
+export function parseUpstreamNoProxy(spec: string | string[]): UpstreamNoProxySet {
+  const raw = Array.isArray(spec) ? spec : spec.split(/[,\s]+/);
+  const out: UpstreamNoProxySet = { domains: [], ips: [], cidrs: [] };
+  for (const entryRaw of raw) {
+    const entry = entryRaw.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+    if (!entry) continue;
+    if (entry === "*") {
+      out.domains.push("*");
+      continue;
+    }
+    if (entry.includes("/")) {
+      const [prefixRaw, bitsRaw] = entry.split("/");
+      const bits = Number(bitsRaw);
+      const ip = ipToBigInt(prefixRaw);
+      if (ip === null || !Number.isInteger(bits) || bits < 0) {
+        throw new Error(`egress.upstreamNoProxy: invalid CIDR '${entryRaw.trim()}'`);
+      }
+      const maxBits = ip.family === 4 ? 32 : 128;
+      if (bits > maxBits) {
+        throw new Error(`egress.upstreamNoProxy: CIDR '${entryRaw.trim()}' exceeds /${maxBits} for IPv${ip.family}`);
+      }
+      out.cidrs.push({ family: ip.family, prefix: prefixRaw, bits });
+      continue;
+    }
+    if (ipToBigInt(entry) !== null) {
+      out.ips.push(entry);
+      continue;
+    }
+    const domain = entry.replace(/^\./, "");
+    if (!HOSTNAME_RE.test(domain)) {
+      throw new Error(`egress.upstreamNoProxy: invalid host entry '${entryRaw.trim()}'`);
+    }
+    out.domains.push(domain);
+  }
+  return out;
+}
+
+/** Loopback entries that are always direct (cannot be overridden). */
+export const UPSTREAM_NO_PROXY_LOOPBACK = "localhost,127.0.0.0/8,::1";
+
+/** Strip brackets/port and lowercase a host for no_proxy matching. */
+function noProxyHost(host: string): string {
+  const h = host.toLowerCase();
+  // Bracketed IPv6 ([::1]:8080) — everything inside the brackets is the host.
+  if (h.startsWith("[")) {
+    const end = h.indexOf("]");
+    return end === -1 ? h.slice(1) : h.slice(1, end);
+  }
+  // Strip a trailing :port when present (bare IPv6 without port has multiple colons).
+  if ((h.match(/:/g) ?? []).length === 1) {
+    return h.slice(0, h.indexOf(":"));
+  }
+  return h;
+}
+
+/** True when `host` (host[:port], brackets allowed) must bypass the upstream proxy. */
+export function matchesUpstreamNoProxy(host: string, set: UpstreamNoProxySet): boolean {
+  if (set.domains.includes("*")) return true;
+  const h = noProxyHost(host);
+  if (set.ips.includes(h)) return true;
+  for (const d of set.domains) {
+    if (h === d || h.endsWith("." + d)) return true;
+  }
+  const ip = ipToBigInt(h);
+  if (ip !== null) {
+    for (const c of set.cidrs) {
+      const base = ipToBigInt(c.prefix);
+      if (base === null || base.family !== ip.family) continue;
+      const bits = BigInt(ip.family === 4 ? 32 : 128);
+      const shift = bits - BigInt(c.bits);
+      if (ip.value >> shift === base.value >> shift) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -198,6 +362,8 @@ export interface EgressRuntimeConfig {
   listenHost: string;
   /** Parsed upstream proxy for host-side chaining, or undefined. */
   upstreamProxy?: UpstreamProxy;
+  /** Parsed no_proxy exception set (or raw spec); loopback always appended. */
+  upstreamNoProxy?: UpstreamNoProxySet | string | string[];
 }
 
 // ---- Port forwarding ----
@@ -288,5 +454,10 @@ export function validateNetworkConfig(cfg: SandboxAppConfig): void {
   if (egress.upstreamProxy !== undefined) {
     // Parse eagerly so a bad URL fails at config load, not on first request.
     parseUpstreamProxy(egress.upstreamProxy);
+  }
+
+  if (egress.upstreamNoProxy !== undefined) {
+    // Parse eagerly so malformed entries fail at config load.
+    parseUpstreamNoProxy(egress.upstreamNoProxy);
   }
 }
