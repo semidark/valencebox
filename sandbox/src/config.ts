@@ -123,7 +123,7 @@ export interface EgressConfig {
    * the equivalent of the standard `no_proxy` environment variable. Entries
    * are comma/space separated (or a string array) and may be:
    *   - plain hostnames:           `localhost`
-   *   - domain suffixes:           `.corp.example` (matches `*.corp.example` and `.corp.example`)
+   *   - domain suffixes:           `.corp.example` (matches `*.corp.example` and `corp.example`)
    *   - IP literals:               `10.1.2.3`, `::1`
    *   - CIDR ranges (v4 and v6):   `127.0.0.0/8`, `fe80::/10`
    *   - `*` (everything bypasses the upstream proxy)

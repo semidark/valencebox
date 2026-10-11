@@ -113,25 +113,26 @@ mode). Requests must speak the standard proxy dialect — most tools do this via
 **Loopback is always direct** (`localhost`, `127.0.0.0/8`, `::1`) — it cannot
 be routed through an external proxy and is not affected by this setting.
 
-### Corporate network recipe (corporate networks)
+### Corporate network recipe
 
 ```jsonc
 {
   "egress": {
     "upstreamProxy": "http://proxy.corp.example:8080",
     "upstreamNoProxy": ".corp.example, .corp.internal, 10.0.0.0/8",
-    "guestCaFile": "/etc/pki/ca-trust/source/anchors/CORP-ROOT-CA.crt"
+    "guestCaFile": "/etc/pki/corp-inspection-root.pem"
   }
 }
 ```
 
 - External names (pypi, apt mirrors, …): guest → tunnel → EgressProxy →
-  `proxy.corp.example` (with TLS inspection → `guestCaFile` makes the guest trust it).
-- Internal hosts (`*.corp.example`, `*.corp.internal`, the `10.0.0.0/8` intranet):
-  dialed **directly** from the host, bypassing the corp proxy.
-- Note: package registries such as `registry.npmjs.org` may be blocked by
-  corporate proxy policy itself (HTTP 403) — that is outside the sandbox's
-  control; point package managers at the approved mirror instead.
+  `proxy.corp.example` (with TLS inspection → `guestCaFile` makes the guest
+  trust the inspection certificate chain).
+- Internal hosts (`*.corp.example`, `*.corp.internal`, the `10.0.0.0/8`
+  intranet): dialed **directly** from the host, bypassing the corp proxy.
+- Note: package registries may be blocked by corporate proxy policy itself
+  (HTTP 403) — that is outside the sandbox's control; point package managers
+  at the approved internal mirror instead.
 
 ### Secrets
 
