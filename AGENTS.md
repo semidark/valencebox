@@ -192,6 +192,7 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
       "listenPort": 0,                  // 0 = OS-assigned
       "enforce": true,                  // strict network containment (default true on Linux)
       "upstreamProxy": "http://proxy.corp.example:8080",  // optional host-side chaining; creds allowed
+      "guestCaFile": "/etc/pki/corp-root.pem",  // PEM installed into the guest trust store (inspection CAs)
       "secrets": []
     },
     "portForwards": [
@@ -213,6 +214,10 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
   re-encryption) through this corporate proxy via HTTP CONNECT; credentials
   in the URL become the upstream `Proxy-Authorization`. Host policy and port
   policy still apply before chaining. Only `http://` upstreams are supported.
+- **`egress.guestCaFile` (guest trust store):** PEM delivered to the guest via
+  fw_cfg and installed with `update-ca-certificates` — for corporate TLS
+  inspection CAs or internal roots. Independent of `enableMitm` (takes
+  precedence for guest delivery when both are set).
 - **Strict-mode defaults:** the proxy binds `127.0.0.1` (the guest reaches it
   through the mux tunnel, not TCP); guest-side mux relays are fixed loopback
   ports (proxy `3128`, share `8081`), passed to the guest on the kernel

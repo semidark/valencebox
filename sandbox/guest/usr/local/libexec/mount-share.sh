@@ -88,7 +88,11 @@ if [ -n "$proxy_port" ] && [ -n "$proxy_token" ]; then
 # Set by mount-share.sh from kernel cmdline parameters.
 HTTP_PROXY="http://valencebox:PROXY_TOKEN@PROXY_HOST:PROXY_PORT/"
 HTTPS_PROXY="http://valencebox:PROXY_TOKEN@PROXY_HOST:PROXY_PORT/"
+# curl honors only lowercase http_proxy for plain-HTTP URLs; export both cases.
+http_proxy="$HTTP_PROXY"
+https_proxy="$HTTPS_PROXY"
 NO_PROXY="127.0.0.1,localhost,10.0.2.2,::1"
+no_proxy="$NO_PROXY"
 NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/valencebox-mitm.crt
 export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy NODE_EXTRA_CA_CERTS
 PROXYEOF
