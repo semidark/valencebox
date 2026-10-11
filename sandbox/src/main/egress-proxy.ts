@@ -8,7 +8,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { generate as selfsignedGenerate } from "selfsigned";
-import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret } from "../config";
+import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret, UpstreamProxy, parseUpstreamProxy } from "../config";
 
 // ---- Helpers ----
 
@@ -361,12 +361,14 @@ const mitmTargetMap = new WeakMap<tls.TLSSocket, { host: string; port: number }>
 export class EgressProxy {
   private server: http.Server | null = null;
   private readonly config: EgressRuntimeConfig;
+  /** Parsed upstream proxy (host-side chaining), or null. Accepts a raw URL too. */
+  private readonly upstream: UpstreamProxy | null;
   private mitmCa: MitmCa | null = null;
   private caDir: string;
   private mitmServer: http.Server;
   private logFile: string | undefined;
   private activeConnections = 0;
-  private sockets = new Set<net.Socket>();
+  private sockets = new Set<Duplex>();
   private requests = new Set<http.ClientRequest>();
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
@@ -379,6 +381,10 @@ export class EgressProxy {
     logFile?: string,
   ) {
     this.config = config;
+    const up = config.upstreamProxy as UpstreamProxy | string | undefined;
+    this.upstream = up
+      ? (typeof up === "string" ? parseUpstreamProxy(up) : up)
+      : null;
     this.caDir = caDir || path.join(process.cwd(), ".mitm-ca");
     this.logFile = logFile;
     this.mitmServer = http.createServer((req, res) => {
@@ -452,12 +458,27 @@ export class EgressProxy {
     });
   }
 
+  /**
+   * Inject a connection stream directly (no TCP listener). Used in strict
+   * network mode to hand mux-tunnel streams to the proxy's HTTP/CONNECT
+   * handling: the same pattern the MITM server already uses to receive
+   * sockets. The injected stream keeps speaking the proxy dialect (CONNECT +
+   * Proxy-Authorization), so no protocol changes are needed.
+   */
+  injectConnection(socket: Duplex): void {
+    if (!this.server) throw new Error("EgressProxy not started");
+    // Emits through the same "connection" path as a TCP accept: trackConnection
+    // (limits, bookkeeping) and the http.Server request parser both run.
+    this.server.emit("connection", socket);
+  }
+
   forceStop(): void {
     this.stopping = true;
     this.server?.closeAllConnections();
     this.mitmServer.closeAllConnections();
     for (const request of this.requests) request.destroy();
-    // Includes upgraded CONNECT sockets, which closeAllConnections omits.
+    // Includes upgraded CONNECT sockets and injected mux streams, which
+    // closeAllConnections omits (injected streams are Duplex, not TCP).
     for (const socket of this.sockets) socket.destroy();
   }
 
@@ -493,7 +514,7 @@ export class EgressProxy {
     }
   }
 
-  private trackSocket(socket: net.Socket): void {
+  private trackSocket(socket: Duplex): void {
     if (this.sockets.has(socket)) return;
     this.sockets.add(socket);
     socket.once("close", () => this.sockets.delete(socket));
@@ -663,12 +684,18 @@ export class EgressProxy {
       return;
     }
 
+    const headers: Record<string, string | string[] | undefined> = { ...req.headers };
+
+    // Strip proxy-specific headers before forwarding.
+    delete headers["proxy-authorization"];
+    delete headers["proxy-connection"];
+
     const options: https.RequestOptions = {
       hostname: targetHost,
       port,
       path,
       method: req.method,
-      headers: { ...req.headers },
+      headers,
     };
 
     // Custom upstream CA bundle (D9): verify internal/self-signed upstreams
@@ -677,9 +704,31 @@ export class EgressProxy {
       options.ca = [...tls.rootCertificates, this.config.caCert];
     }
 
-    // Strip proxy-specific headers before forwarding.
-    delete (options.headers as any)["proxy-authorization"];
-    delete (options.headers as any)["proxy-connection"];
+    // Host-side upstream proxy chaining.
+    const up = this.upstream;
+    if (up) {
+      if (!useTls) {
+        // Plain HTTP: absolute-form request sent to the upstream proxy.
+        options.hostname = up.host;
+        options.port = up.port;
+        options.path = rawUrl;
+        if (up.authHeader) headers["proxy-authorization"] = up.authHeader;
+      } else {
+        // TLS: CONNECT tunnel through the upstream, then speak TLS inside it.
+        const tunnel = await this.connectUpstream(targetHost, port);
+        if (this.stopping) { tunnel.destroy(); throw new Error("Proxy is stopping"); }
+        options.agent = false;
+        options.createConnection = () => tls.connect({
+          socket: tunnel,
+          servername: targetHost,
+          host: targetHost,
+          port,
+          ...(options.ca ? { ca: options.ca } : {}),
+        });
+        // One request per tunnel; the socket has no pooling agent.
+        headers["connection"] = "close";
+      }
+    }
 
     return new Promise((resolve, reject) => {
       const mod = useTls ? https : http;
@@ -763,6 +812,15 @@ export class EgressProxy {
         method,
         headers,
       };
+
+      // Host-side upstream proxy chaining (plain HTTP only on this path).
+      const up = this.upstream;
+      if (up) {
+        options.hostname = up.host;
+        options.port = up.port;
+        options.path = `http://${targetHost}:${port}${path}`;
+        if (up.authHeader) headers["proxy-authorization"] = up.authHeader;
+      }
 
       const forwardReq = http.request(options, (forwardRes) => {
         this.log("HTTP-SECRET", method, `${targetHost}:${port}`, `upstream responded ${forwardRes.statusCode}`);
@@ -1061,6 +1119,23 @@ export class EgressProxy {
       if (this.config.caCert) {
         upstreamOpts.ca = [...tls.rootCertificates, this.config.caCert];
       }
+      // Host-side upstream proxy chaining: CONNECT tunnel, then TLS inside.
+      if (this.upstream) {
+        const tunnel = await this.connectUpstream(targetHost, targetPort);
+        if (this.stopping) {
+          tunnel.destroy();
+          this.sendMitmError(res, 502, "Bad Gateway: proxy is stopping");
+          return;
+        }
+        upstreamOpts.agent = false;
+        upstreamOpts.createConnection = () => tls.connect({
+          socket: tunnel,
+          servername: targetHost,
+          host: targetHost,
+          port: targetPort,
+          ...(upstreamOpts.ca ? { ca: upstreamOpts.ca } : {}),
+        });
+      }
       const upstreamReq = https.request(upstreamOpts, (upstreamRes) => {
         const statusCode = upstreamRes.statusCode || 200;
         this.log("MITM", method, `${targetHost}:${targetPort}`, `upstream responded ${statusCode}`);
@@ -1124,7 +1199,19 @@ export class EgressProxy {
     }
   }
 
+  /**
+   * Open a raw connection to `host:port` — directly, or tunneled through the
+   * configured upstream proxy via HTTP CONNECT (host-side chaining). The
+   * tunnel carries whatever the caller speaks (TLS, HTTP, ssh …).
+   */
   private connectUpstream(host: string, port: number): Promise<net.Socket> {
+    if (this.upstream) {
+      return this.connectViaUpstreamProxy(host, port);
+    }
+    return this.connectDirect(host, port);
+  }
+
+  private connectDirect(host: string, port: number): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
       const socket = new net.Socket();
       this.trackSocket(socket);
@@ -1140,6 +1227,58 @@ export class EgressProxy {
         socket.destroy();
         reject(new Error(`upstream connection timeout: ${host}:${port}`));
       });
+    });
+  }
+
+  private connectViaUpstreamProxy(targetHost: string, targetPort: number): Promise<net.Socket> {
+    const upstream = this.upstream!;
+    return new Promise((resolve, reject) => {
+      const socket = new net.Socket();
+      this.trackSocket(socket);
+      if (this.stopping) { reject(new Error("Proxy is stopping")); return; }
+      let settled = false;
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(err);
+      };
+      socket.setTimeout(10000);
+      socket.connect(upstream.port, upstream.host, () => {
+        let req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
+        if (upstream.authHeader) req += `Proxy-Authorization: ${upstream.authHeader}\r\n`;
+        req += "\r\n";
+        socket.write(req);
+      });
+      let buf = Buffer.alloc(0);
+      const onData = (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        const idx = buf.indexOf("\r\n\r\n");
+        if (idx === -1) {
+          if (buf.length > 16384) {
+            socket.removeListener("data", onData);
+            fail(new Error("upstream proxy CONNECT response too large"));
+          }
+          return;
+        }
+        socket.removeListener("data", onData);
+        const statusLine = buf.subarray(0, buf.indexOf("\r\n")).toString("utf8");
+        const m = statusLine.match(/^HTTP\/\d\.\d (\d{3})/);
+        if (!m || m[1][0] !== "2") {
+          fail(new Error(`upstream proxy CONNECT failed: ${statusLine.trim()}`));
+          return;
+        }
+        settled = true;
+        socket.setTimeout(0);
+        // Bytes after the header belong to the tunnel payload; push them back.
+        const rest = buf.subarray(idx + 4);
+        if (rest.length > 0) socket.unshift(rest);
+        resolve(socket);
+      };
+      socket.on("data", onData);
+      socket.on("error", fail);
+      socket.on("timeout", () => fail(new Error(`upstream proxy timeout: ${upstream.host}:${upstream.port}`)));
+      socket.once("close", () => fail(new Error(`upstream proxy connection closed: ${upstream.host}:${upstream.port}`)));
     });
   }
 

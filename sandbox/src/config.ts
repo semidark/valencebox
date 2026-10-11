@@ -85,8 +85,73 @@ export interface EgressConfig {
    * Host interface the proxy binds to. Default "0.0.0.0" so the guest can reach
    * it via the SLIRP gateway (10.0.2.2). Set to "127.0.0.1" to restrict to
    * loopback only if your SLIRP setup delivers guest connections via loopback.
+   * In strict network mode (egress.enforce, default true on verified platforms)
+   * the default becomes "127.0.0.1": the guest reaches the proxy through the
+   * virtio-serial mux tunnel, not through SLIRP.
    */
   listenHost?: string;
+
+  /**
+   * Strict network containment. When true (the default on verified platforms),
+   * the VM boots with `-nic none`: no SLIRP, no guest NIC, no UDP, no ICMP.
+   * The only guest↔host data path is a multiplexed virtio-serial tunnel, and
+   * all guest egress is forced through EgressProxy where host policy applies.
+   * TCP port forwards are implemented as host-initiated mux streams.
+   *
+   * Set false to opt in to the legacy SLIRP path (unrestricted guest network
+   * with proxy environment variables steering cooperating clients).
+   *
+   * On platforms where the tunnel is not yet verified (macOS, Windows) a
+   * requested strict mode falls back to legacy SLIRP with a warning — never a
+   * silent strict boot.
+   */
+  enforce?: boolean;
+
+  /**
+   * Optional corporate/parent HTTP proxy (e.g. `http://proxy.corp.example:8080`,
+   * credentials allowed as `http://user:pass@host:port`). When set, EgressProxy
+   * dials all upstream connections (CONNECT tunnels, plain-HTTP forwarding,
+   * MITM re-encryption) through this proxy via HTTP CONNECT. Host policy and
+   * port policy are still enforced before chaining. Only `http://` upstreams
+   * are supported. Default: unset (direct upstream connections).
+   */
+  upstreamProxy?: string;
+}
+
+/** Parsed upstream proxy for host-side chaining. */
+export interface UpstreamProxy {
+  /** Upstream proxy hostname. */
+  host: string;
+  /** Upstream proxy port. */
+  port: number;
+  /** Pre-rendered "Basic ..." Proxy-Authorization header value, or undefined. */
+  authHeader?: string;
+}
+
+/**
+ * Parse an `http://[user:pass@]host:port` upstream proxy URL.
+ * Only http CONNECT proxies are supported; anything else throws.
+ */
+export function parseUpstreamProxy(url: string): UpstreamProxy {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`egress.upstreamProxy: invalid URL '${url}'`);
+  }
+  if (parsed.protocol !== "http:") {
+    throw new Error(`egress.upstreamProxy: only http:// upstream proxies are supported (got '${parsed.protocol}')`);
+  }
+  if (!parsed.hostname) {
+    throw new Error(`egress.upstreamProxy: missing host in '${url}'`);
+  }
+  const port = parseInt(parsed.port, 10) || 80;
+  let authHeader: string | undefined;
+  if (parsed.username || parsed.password) {
+    const creds = `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`;
+    authHeader = "Basic " + Buffer.from(creds, "utf-8").toString("base64");
+  }
+  return { host: parsed.hostname, port, authHeader };
 }
 
 /**
@@ -122,6 +187,8 @@ export interface EgressRuntimeConfig {
   rateLimitPerMin: number;
   /** Interface the proxy binds to. */
   listenHost: string;
+  /** Parsed upstream proxy for host-side chaining, or undefined. */
+  upstreamProxy?: UpstreamProxy;
 }
 
 // ---- Port forwarding ----
@@ -186,4 +253,31 @@ export interface SandboxAppConfig {
    * terminal control, physical Cmd = `metaKey` is suppressed.
    */
   swapCtrlCmd?: boolean;
+}
+
+/**
+ * Fail-closed network config validation. Runs on the loaded config (not the
+ * silent JSON fallback) before the VM is started. Throws with a clear message
+ * when the configuration cannot be honored — the VM refuses to start.
+ */
+export function validateNetworkConfig(cfg: SandboxAppConfig): void {
+  const egress = cfg.egress ?? {};
+  const enforce = egress.enforce ?? true;
+
+  if (enforce) {
+    for (const fwd of cfg.portForwards ?? []) {
+      if ((fwd.protocol ?? "tcp") !== "tcp") {
+        throw new Error(
+          `strict network mode (egress.enforce) does not support protocol: "udp" ` +
+          `port forwards (hostPort ${fwd.hostPort} → guestPort ${fwd.guestPort}). ` +
+          `Remove the rule or set egress.enforce: false for legacy SLIRP networking.`
+        );
+      }
+    }
+  }
+
+  if (egress.upstreamProxy !== undefined) {
+    // Parse eagerly so a bad URL fails at config load, not on first request.
+    parseUpstreamProxy(egress.upstreamProxy);
+  }
 }

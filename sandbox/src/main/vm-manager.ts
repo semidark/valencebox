@@ -4,6 +4,7 @@ import { QemuProcess, QemuOptions } from "./qemu";
 import { GuestProfile } from "./guest-profile";
 import { PortForward } from "../config";
 import { PtyChannel } from "./pty-channel";
+import { MuxChannel } from "./mux-channel";
 
 
 export interface VmManagerOptions {
@@ -26,6 +27,8 @@ export interface VmManagerOptions {
   mitmCaFile?: string;
   balloonMinMb?: number;
   portForwards: PortForward[];
+  /** Strict network containment: -nic none + virtio-serial mux tunnel. */
+  strictNet?: boolean;
 }
 
 export class VmManager extends EventEmitter {
@@ -33,6 +36,7 @@ export class VmManager extends EventEmitter {
   private serialClient: net.Socket | null = null;
   private _serialLog = "";
   private ptyChannel: PtyChannel | null = null;
+  private muxChannel: MuxChannel | null = null;
   private stopPromise: Promise<void> | null = null;
 
   constructor(private opts: VmManagerOptions) {
@@ -47,6 +51,7 @@ export class VmManager extends EventEmitter {
     if (this.stopPromise) return;
     this.connectSerial();
     this.connectPty();
+    this.connectMux();
   }
 
   get qemuProcess(): QemuProcess {
@@ -66,6 +71,8 @@ export class VmManager extends EventEmitter {
   private disconnectChannels(): void {
     this.ptyChannel?.disconnect();
     this.ptyChannel = null;
+    this.muxChannel?.disconnect();
+    this.muxChannel = null;
     this.serialClient?.destroy();
     this.serialClient = null;
   }
@@ -117,6 +124,21 @@ export class VmManager extends EventEmitter {
 
   get ptyConnected(): boolean {
     return this.ptyChannel?.connected ?? false;
+  }
+
+  /** The virtio-serial mux channel (strict network mode), or null. */
+  get mux(): MuxChannel | null {
+    return this.muxChannel;
+  }
+
+  private connectMux(): void {
+    const transport = this.qemu.muxTransport;
+    if (!transport) return;
+    this.muxChannel = new MuxChannel("host", transport);
+    this.muxChannel.on("error", (err) => console.error("[mux] channel error:", err));
+    this.muxChannel.on("ready", () => this.emit("mux:ready"));
+    this.muxChannel.on("closed", () => this.emit("mux:closed"));
+    this.muxChannel.connect();
   }
 
   /** Query current balloon state. Returns { currentMB, ceilingMB, minMB } or null. */
