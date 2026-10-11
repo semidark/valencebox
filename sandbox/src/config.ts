@@ -116,6 +116,15 @@ export interface EgressConfig {
    * are supported. Default: unset (direct upstream connections).
    */
   upstreamProxy?: string;
+
+  /**
+   * PEM certificate (or bundle) installed into the GUEST trust store at boot
+   * via fw_cfg. Use this when corporate TLS inspection (e.g. an intercepting
+   * proxy) presents certificates the guest must trust, or to provision an
+   * internal root CA. Independent of `enableMitm`: when both apply, this file
+   * takes precedence for guest delivery. Supports `~` for the home directory.
+   */
+  guestCaFile?: string;
 }
 
 /** Parsed upstream proxy for host-side chaining. */

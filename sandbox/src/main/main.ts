@@ -291,9 +291,24 @@ async function startVm() {
     { mode: 0o600 },
   );
 
-  // If MITM is enabled, copy the CA cert for delivery via fw_cfg.
+  // If MITM is enabled, copy the CA cert for delivery via fw_cfg. A configured
+  // egress.guestCaFile takes precedence (corporate inspection CA / internal
+  // root provisioned into the guest trust store).
   let mitmCaFile: string | undefined;
-  if (proxy.runtimeConfig.enableMitm && proxy.ca) {
+  if (appCfg.egress?.guestCaFile) {
+    const p = appCfg.egress.guestCaFile.startsWith("~")
+      ? path.join(os.homedir(), appCfg.egress.guestCaFile.slice(1))
+      : appCfg.egress.guestCaFile;
+    try {
+      fs.accessSync(p);
+    } catch {
+      throw new Error(`egress.guestCaFile: file not found: ${p}`);
+    }
+    mitmCaFile = path.join(tmpDir, "mitm-ca.pem");
+    fs.copyFileSync(p, mitmCaFile);
+    fs.chmodSync(mitmCaFile, 0o600);
+    console.log(`[egress-proxy] guest CA cert copied for fw_cfg: ${mitmCaFile} (from ${p})`);
+  } else if (proxy.runtimeConfig.enableMitm && proxy.ca) {
     mitmCaFile = path.join(tmpDir, "mitm-ca.pem");
     fs.copyFileSync(proxy.ca.cert, mitmCaFile);
     fs.chmodSync(mitmCaFile, 0o600);
