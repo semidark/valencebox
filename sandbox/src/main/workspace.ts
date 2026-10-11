@@ -13,7 +13,7 @@ export function resolveWorkspaceDir(cfg: SandboxAppConfig, userDataDir: string):
 
 /** Never recurse into a workspace, including one left by an older app version. */
 export async function cleanupRuntimeDir(tmpDir: string): Promise<void> {
-  const runtimeFiles = ["serial.sock", "qmp.sock", "pty.sock", "share-config.json", "mitm-ca.pem"];
+  const runtimeFiles = ["serial.sock", "qmp.sock", "pty.sock", "mux.sock", "share-config.json", "mitm-ca.pem"];
   await Promise.all(runtimeFiles.map(async (name) => {
     try { await fsp.unlink(path.join(tmpDir, name)); }
     catch (err: any) { if (err.code !== "ENOENT") throw err; }

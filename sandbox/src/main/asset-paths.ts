@@ -96,6 +96,22 @@ export async function allocPtyTransport(tmpDir: string): Promise<VmTransport> {
   return { type: "unix", local: sock, connectPath: sock };
 }
 
+/**
+ * Allocate a platform-appropriate transport for the virtio-serial mux tunnel
+ * (virtserialport name=mux).
+ *
+ * - Linux / macOS: Unix domain socket inside tmpDir, chmod 0600 after creation.
+ * - Windows: TCP on 127.0.0.1 (same reason as serial).
+ */
+export async function allocMuxTransport(tmpDir: string): Promise<VmTransport> {
+  if (process.platform === "win32") {
+    const port = await getRandomFreePort();
+    return { type: "tcp", local: String(port), connectPath: String(port) };
+  }
+  const sock = path.join(tmpDir, "mux.sock");
+  return { type: "unix", local: sock, connectPath: sock };
+}
+
 export function getRandomFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();

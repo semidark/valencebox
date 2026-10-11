@@ -9,10 +9,17 @@ import { HttpShare } from "./http-share";
 import { EgressProxy, resolveSecrets, generatePlaceholder } from "./egress-proxy";
 import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
-import { SandboxAppConfig, EgressRuntimeConfig } from "../config";
+import { SandboxAppConfig, EgressRuntimeConfig, validateNetworkConfig, parseUpstreamProxy } from "../config";
 import { GuestArch, selectGuest, x86_64Profile, aarch64Profile } from "./guest-profile";
 import { ShutdownCoordinator, withTimeout } from "./shutdown";
 import { cleanupRuntimeDir, resolveWorkspaceDir } from "./workspace";
+import { startTcpPortForwards, PortForwardHandle } from "./port-forwards";
+
+// Guest-side mux relay ports (strict mode). The mux daemon binds these on the
+// guest loopback; the host passes them via kernel cmdline / fw_cfg so the
+// guest's proxy env and davfs2 config point at the relays.
+const GUEST_PROXY_RELAY_PORT = 3128;
+const GUEST_SHARE_RELAY_PORT = 8081;
 
 function loadAppConfig(root: string): SandboxAppConfig {
   const p = path.join(root, "sandbox.config.json");
@@ -24,11 +31,33 @@ function loadAppConfig(root: string): SandboxAppConfig {
 }
 
 /**
+ * Platforms where the virtio-serial mux tunnel has been verified (boot test
+ * on KVM and TCG). On unverified platforms a requested strict mode falls back
+ * to legacy SLIRP with a warning — never a silent strict boot.
+ */
+function strictNetSupportedForPlatform(): boolean {
+  return process.platform === "linux";
+}
+
+function resolveNetworkMode(cfg: SandboxAppConfig): { strict: boolean; requested: boolean } {
+  const requested = cfg.egress?.enforce ?? true;
+  if (!requested) return { strict: false, requested: false };
+  if (!strictNetSupportedForPlatform()) {
+    console.warn(
+      "[network] strict egress (virtio-serial tunnel) is not verified on this platform yet — " +
+      "falling back to legacy SLIRP networking. UDP and ICMP are NOT contained in this mode.",
+    );
+    return { strict: false, requested: true };
+  }
+  return { strict: true, requested: true };
+}
+
+/**
  * Build the egress proxy runtime config from the app config.
  * Resolves secret values (inline or from host env), picks a random port, and
  * generates an auth token.
  */
-function buildProxyConfig(cfg: SandboxAppConfig): EgressRuntimeConfig {
+function buildProxyConfig(cfg: SandboxAppConfig, strict: boolean): EgressRuntimeConfig {
   const egress = cfg.egress || {};
 
   const resolvedSecrets = egress.secrets ? resolveSecrets(egress.secrets) : [];
@@ -64,7 +93,10 @@ function buildProxyConfig(cfg: SandboxAppConfig): EgressRuntimeConfig {
     caCert,
     maxConnections: egress.maxConnections ?? 256,
     rateLimitPerMin: egress.rateLimitPerMin ?? 0,
-    listenHost: egress.listenHost ?? "0.0.0.0",
+    // Strict mode: the guest reaches the proxy through the mux tunnel, so the
+    // TCP listener is loopback-only (host-side debugging).
+    listenHost: egress.listenHost ?? (strict ? "127.0.0.1" : "0.0.0.0"),
+    upstreamProxy: egress.upstreamProxy ? parseUpstreamProxy(egress.upstreamProxy) : undefined,
   };
 }
 
@@ -72,6 +104,7 @@ let win: BrowserWindow | null = null;
 let vm: VmManager | null = null;
 let share: HttpShare | null = null;
 let proxy: EgressProxy | null = null;
+let forwardHandle: PortForwardHandle | null = null;
 let runtimeDir: string | null = null;
 let quitting = false;
 let detectedAccel: { name: string; available: boolean } | undefined;
@@ -176,6 +209,15 @@ function registerIpc() {
 
 async function startVm() {
   if (quitting) return;
+  try {
+    validateNetworkConfig(appCfg);
+  } catch (err: any) {
+    console.error("[network] config validation failed:", err.message);
+    sendToWindow(IPC.onStatus, { phase: "error", error: err.message });
+    return;
+  }
+  const networkMode = resolveNetworkMode(appCfg);
+  console.log(`[network] mode: ${networkMode.strict ? "strict (virtio-serial mux tunnel, no NIC)" : "legacy SLIRP"}`);
   const tmpDir = fs.mkdtempSync(path.join(app.getPath("userData"), "qemu-"));
   runtimeDir = tmpDir;
 
@@ -229,7 +271,7 @@ async function startVm() {
       );
 
   // ---- Egress proxy setup ----
-  const proxyCfg = buildProxyConfig(appCfg);
+  const proxyCfg = buildProxyConfig(appCfg, networkMode.strict);
   // buildProxyConfig already returns port=0 (OS-assign) unless egress.listenPort is set.
   const caDir = path.join(app.getPath("userData"), "mitm-ca");
   const proxyLogFile = path.join(app.getPath("userData"), "proxy.log");
@@ -237,11 +279,17 @@ async function startVm() {
   await proxy.start();
   if (quitting) return;
   const proxyPort = proxy.port;
-  console.log(`[egress-proxy] listening on 0.0.0.0:${proxyPort} (policy=${proxyCfg.policy})`);
+  console.log(`[egress-proxy] listening on ${proxyCfg.listenHost}:${proxyPort} (policy=${proxyCfg.policy}${proxyCfg.upstreamProxy ? ", upstream chaining" : ""})`);
 
-  // Write WebDAV share config to a temp file for delivery via QEMU fw_cfg.
+  // Write WebDAV share config for delivery via QEMU fw_cfg. In strict mode the
+  // guest reaches the share through its local mux relay, so the fw_cfg port is
+  // the guest relay port, not the host TCP port.
   const shareConfigFile = path.join(tmpDir, "share-config.json");
-  fs.writeFileSync(shareConfigFile, JSON.stringify({ port: shareCfg.port, token: shareCfg.token }), { mode: 0o600 });
+  fs.writeFileSync(
+    shareConfigFile,
+    JSON.stringify({ port: networkMode.strict ? GUEST_SHARE_RELAY_PORT : shareCfg.port, token: shareCfg.token }),
+    { mode: 0o600 },
+  );
 
   // If MITM is enabled, copy the CA cert for delivery via fw_cfg.
   let mitmCaFile: string | undefined;
@@ -272,10 +320,14 @@ async function startVm() {
     shareConfigFile,
     mitmCaFile,
     balloonMinMb: appCfg.balloonMinMb,
-    proxyPort,
+    // Strict mode: the guest relays through local mux ports; the cmdline
+    // carries the guest relay ports (the daemon reads them, with fallbacks).
+    proxyPort: networkMode.strict ? GUEST_PROXY_RELAY_PORT : proxyPort,
+    sharePort: networkMode.strict ? GUEST_SHARE_RELAY_PORT : undefined,
     proxyToken: proxyCfg.authToken,
     proxySecrets: secretPlaceholders,
     portForwards,
+    strictNet: networkMode.strict,
   });
 
   vm.on("serial:data", (chunk: string) => sendToWindow(IPC.onSerial, chunk));
@@ -301,6 +353,27 @@ async function startVm() {
   try {
     await vm.start();
     if (quitting) return;
+
+    // Strict mode: route mux streams into the in-process proxy/share servers
+    // and expose host→guest TCP port forwards over the tunnel.
+    if (networkMode.strict && vm.mux) {
+      const mux = vm.mux;
+      mux.onStream((target, stream) => {
+        if (target === "proxy" && proxy) {
+          proxy.injectConnection(stream);
+        } else if (target === "share" && share) {
+          share.injectConnection(stream);
+        } else {
+          throw new Error(`unknown mux target '${target}'`);
+        }
+      });
+      forwardHandle = startTcpPortForwards(mux, portForwards);
+      mux.on("closed", () => {
+        console.log("[mux] channel closed");
+        forwardHandle?.close();
+      });
+    }
+
     sendToWindow(IPC.onStatus, {
       phase: "ready", bootMs: vm.bootMs,
       accel: detectedAccel?.name, accelAvailable: detectedAccel?.available,
@@ -333,6 +406,7 @@ const shutdown = new ShutdownCoordinator([
       catch (err) { vm?.forceStop(); throw err; }
     },
   },
+  { name: "port forwards", timeoutMs: 2_000, stop: async () => { forwardHandle?.close(); } },
   { name: "proxy stop", timeoutMs: 2_000, stop: async () => { await proxy?.stop(); } },
   { name: "share stop", timeoutMs: 2_000, stop: async () => { await share?.stop(); } },
   {
@@ -344,6 +418,7 @@ const shutdown = new ShutdownCoordinator([
   },
 ], (code) => app.exit(code), () => {
   vm?.forceStop();
+  forwardHandle?.close();
   proxy?.forceStop();
   share?.forceStop();
 });

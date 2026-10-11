@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as fsp from "fs/promises";
 import { EventEmitter } from "events";
-import { qemuBinaryPath, firmwareDir, qemuPlatformDir, allocSerialTransport, allocQmpTransport, allocPtyTransport, VmTransport } from "./asset-paths";
+import { qemuBinaryPath, firmwareDir, qemuPlatformDir, allocSerialTransport, allocQmpTransport, allocPtyTransport, allocMuxTransport, VmTransport } from "./asset-paths";
 import { QmpClient } from "./qmp";
 import { GuestProfile } from "./guest-profile";
 import { PortForward } from "../config";
@@ -28,6 +28,12 @@ export interface QemuOptions {
   proxySecrets?: string;
   mitmCaFile?: string;
   portForwards?: PortForward[];
+  /**
+   * Strict network containment: boot with `-nic none` (no SLIRP, no guest NIC)
+   * and expose a virtio-serial mux port instead. Port forwards are handled
+   * host-side over the mux channel, not via SLIRP hostfwd.
+   */
+  strictNet?: boolean;
 }
 
 export interface QemuStats {
@@ -48,6 +54,7 @@ export class QemuProcess extends EventEmitter {
   public serialTransport: VmTransport | null = null;
   public qmpTransport: VmTransport | null = null;
   public ptyTransport: VmTransport | null = null;
+  public muxTransport: VmTransport | null = null;
   public machineType: "microvm" | "pc" | "virt" = "pc";
 
   get running(): boolean {
@@ -72,6 +79,7 @@ export class QemuProcess extends EventEmitter {
     this.serialTransport = await allocSerialTransport(opts.tmpDir);
     this.qmpTransport = await allocQmpTransport(opts.tmpDir);
     this.ptyTransport = await allocPtyTransport(opts.tmpDir);
+    this.muxTransport = opts.strictNet ? await allocMuxTransport(opts.tmpDir) : null;
     if (this.stopping) throw new Error("QEMU startup cancelled");
 
     const detected = QemuProcess.checkAccel(process.platform, opts.guestProfile.arch);
@@ -140,6 +148,9 @@ export class QemuProcess extends EventEmitter {
       this.chmodSocket(this.serialTransport.connectPath).catch(() => {});
       this.chmodSocket(this.qmpTransport.connectPath).catch(() => {});
       this.chmodSocket(this.ptyTransport.connectPath).catch(() => {});
+      if (this.muxTransport?.type === "unix") {
+        this.chmodSocket(this.muxTransport.connectPath).catch(() => {});
+      }
     }
 
     const qmpLabel = this.qmpTransport.type === "unix"
@@ -257,7 +268,7 @@ export class QemuProcess extends EventEmitter {
     if (fwDir) args.push("-L", fwDir);
 
     // Delegate pure-argument construction to the static method (testable)
-    args.push(...QemuProcess.buildArgs(opts, machineType, resolvedAccel, this.ptyTransport));
+    args.push(...QemuProcess.buildArgs(opts, machineType, resolvedAccel, this.ptyTransport, this.muxTransport));
 
     return args;
   }
@@ -276,7 +287,7 @@ export class QemuProcess extends EventEmitter {
     // Non-fatal — socket works, just less restrictive
   }
 
-  static buildArgs(opts: QemuOptions, machineType: string, resolvedAccel?: string, ptyTransport?: VmTransport | null): string[] {
+  static buildArgs(opts: QemuOptions, machineType: string, resolvedAccel?: string, ptyTransport?: VmTransport | null, muxTransport?: VmTransport | null): string[] {
     const profile = opts.guestProfile;
     const args: string[] = [];
 
@@ -312,6 +323,11 @@ export class QemuProcess extends EventEmitter {
           cmdline += ` valencebox.secrets=${opts.proxySecrets}`;
         }
       }
+      // Strict mode: guest-side relay ports for the mux daemon (the WebDAV
+      // share port inside fw_cfg carries the same guest relay port).
+      if (opts.sharePort) {
+        cmdline += ` valencebox.share_port=${opts.sharePort}`;
+      }
       args.push("-append", cmdline);
     }
 
@@ -345,13 +361,21 @@ export class QemuProcess extends EventEmitter {
       );
     }
 
-    const netdevParts = [`user,id=net0`];
-    for (const fwd of opts.portForwards ?? []) {
-      const proto = fwd.protocol ?? "tcp";
-      const ip = fwd.hostIp ?? "127.0.0.1";
-      netdevParts.push(`hostfwd=${proto}:${ip}:${fwd.hostPort}-:${fwd.guestPort}`);
+    if (opts.strictNet) {
+      // Strict network containment: no NIC at all. `-nic none` is mandatory on
+      // `virt` (which skips -nodefaults above) and explicit everywhere else.
+      // The only guest↔host path is the virtio-serial mux port below; TCP port
+      // forwards are host-side listeners bridged over the mux channel.
+      args.push("-nic", "none");
+    } else {
+      const netdevParts = [`user,id=net0`];
+      for (const fwd of opts.portForwards ?? []) {
+        const proto = fwd.protocol ?? "tcp";
+        const ip = fwd.hostIp ?? "127.0.0.1";
+        netdevParts.push(`hostfwd=${proto}:${ip}:${fwd.hostPort}-:${fwd.guestPort}`);
+      }
+      args.push("-netdev", netdevParts.join(","), "-device", `${netDev},netdev=net0`);
     }
-    args.push("-netdev", netdevParts.join(","), "-device", `${netDev},netdev=net0`);
     args.push("-device", rngDev);
     args.push("-device", `virtio-balloon${suffix}`);
 
@@ -364,6 +388,17 @@ export class QemuProcess extends EventEmitter {
       args.push("-chardev", ptyArg);
       args.push("-device", `virtio-serial${suffix}`);
       args.push("-device", `virtserialport,chardev=pty,name=pty`);
+    }
+
+    // Mux tunnel via a second virtio-serial port (strict network mode)
+    if (opts.strictNet && muxTransport) {
+      const muxTr = muxTransport;
+      const muxArg = muxTr.type === "unix"
+        ? `socket,id=mux,path=${muxTr.local},server=on,wait=off`
+        : `socket,id=mux,host=127.0.0.1,port=${muxTr.local},server=on,wait=off`;
+      args.push("-chardev", muxArg);
+      args.push("-device", `virtio-serial${suffix}`);
+      args.push("-device", `virtserialport,chardev=mux,name=mux`);
     }
 
     return args;
