@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     vim-tiny \
     iproute2 \
+    iptables \
     ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 

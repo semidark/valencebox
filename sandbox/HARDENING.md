@@ -55,6 +55,12 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
   tunnel (`src/main/mux-channel.ts` + `guest/guest-mux/`), whose streams are
   injected into `EgressProxy` / `HttpShare` (protocol in `docs/mux-protocol.md`,
   architecture and verification scope in `docs/NET-CONTAINMENT.md`).
+  Non-proxy-aware guest TCP clients are steered through the same `EgressProxy`
+  policy via Fake-DNS (`127.0.0.1:53`, `198.18.0.0/15`), a default route over
+  guest `lo`, and netfilter `OUTPUT REDIRECT` to `valencebox-mux` (`127.0.0.1:3129`,
+  `SO_ORIGINAL_DST` → `tproxy:<host>:<port>` → `injectTransparentConnection`);
+  raw-IP connects are evaluated strictly as IP literals (TLS SNI is not trusted
+  for policy).
   `protocol: "udp"` port forwards are rejected at config load. The tunnel is
   **not** a guest-compartment boundary: a compromised root guest can open
   arbitrary mux streams either way — host policy (allowlist/denylist/ports,

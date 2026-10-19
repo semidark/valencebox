@@ -8,7 +8,7 @@ import * as net from "net";
 import * as os from "os";
 import * as http from "http";
 import { AddressInfo } from "net";
-import { EgressProxy } from "../src/main/egress-proxy";
+import { EgressProxy, parseTransparentTarget } from "../src/main/egress-proxy";
 import { EgressRuntimeConfig } from "../src/config";
 
 function assert(cond: boolean, msg: string): void {
@@ -263,6 +263,112 @@ async function main() {
       `routing decisions (got ${JSON.stringify(calls)})`,
     );
     console.log("✓ upstreamNoProxy: suffix-matched and loopback targets dial direct, others chain");
+  }
+
+  // ---- 7. parseTransparentTarget ----
+  {
+    assert(
+      JSON.stringify(parseTransparentTarget("tproxy:PyPI.org.:443")) === JSON.stringify({ host: "pypi.org", port: 443 }),
+      "hostname + port normalized",
+    );
+    assert(
+      JSON.stringify(parseTransparentTarget("tproxy:198.18.0.2:80")) === JSON.stringify({ host: "198.18.0.2", port: 80 }),
+      "IPv4 + port",
+    );
+    assert(parseTransparentTarget("proxy") === null, "non-tproxy rejected");
+    assert(parseTransparentTarget("tproxy:example.com:0") === null, "port 0 rejected");
+    assert(parseTransparentTarget("tproxy:example.com:99999") === null, "port >65535 rejected");
+    assert(parseTransparentTarget("tproxy::80") === null, "empty host rejected");
+    console.log("✓ parseTransparentTarget: valid targets normalized, malformed rejected");
+  }
+
+  // ---- 8. injectTransparentConnection: origin-form plain HTTP + upstreamProxy chaining + policy ----
+  {
+    let seenUrl = "";
+    const upstreamSrv = http.createServer((req, res) => {
+      seenUrl = req.url || "";
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("tproxy-http-ok");
+    });
+    await new Promise<void>((res) => upstreamSrv.listen(0, "127.0.0.1", res));
+    const upstreamPort = (upstreamSrv.address() as AddressInfo).port;
+
+    const proxy = new EgressProxy(cfg({
+      policy: "allowlist",
+      allowHosts: ["allowed.example"],
+      allowPorts: [80, 443],
+      upstreamProxy: `http://127.0.0.1:${upstreamPort}`,
+    }));
+    await proxy.start();
+
+    // Allowed host over transparent connection (origin-form GET /v1/ping, no Proxy-Authorization)
+    const allowSrv = net.createServer((s) => proxy.injectTransparentConnection(s, "allowed.example", 80));
+    await new Promise<void>((res) => allowSrv.listen(0, "127.0.0.1", res));
+    const allowPort = (allowSrv.address() as AddressInfo).port;
+    const s1 = net.createConnection(allowPort, "127.0.0.1");
+    s1.write("GET /v1/ping?a=1 HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n");
+    const r1 = await new Promise<string>((res) => {
+      let buf = "";
+      s1.on("data", (c: Buffer) => { buf += c.toString(); });
+      s1.on("close", () => res(buf));
+    });
+    assert(r1.includes("tproxy-http-ok"), `transparent HTTP response received (got '${r1.slice(0, 80)}')`);
+    assert(seenUrl === "http://allowed.example:80/v1/ping?a=1", `origin-form rewritten to absolute URL for upstream proxy (got '${seenUrl}')`);
+
+    // Denied host over transparent connection is destroyed before contacting upstream
+    seenUrl = "";
+    const denySrv = net.createServer((s) => proxy.injectTransparentConnection(s, "denied.example", 80));
+    await new Promise<void>((res) => denySrv.listen(0, "127.0.0.1", res));
+    const denyPort = (denySrv.address() as AddressInfo).port;
+    const s2 = net.createConnection(denyPort, "127.0.0.1");
+    s2.on("error", () => {});
+    s2.write("GET / HTTP/1.1\r\nHost: denied.example\r\n\r\n");
+    const r2 = await new Promise<string>((res) => {
+      let buf = "";
+      s2.on("data", (c: Buffer) => { buf += c.toString(); });
+      s2.on("close", () => res(buf));
+    });
+    assert(r2 === "", `denied transparent connection closed with no response (got '${r2}')`);
+    assert(seenUrl === "", "upstream never contacted for denied transparent host");
+
+    allowSrv.close();
+    denySrv.close();
+    await proxy.stop();
+    upstreamSrv.close();
+    console.log("✓ injectTransparentConnection: plain HTTP origin-form forwarded & policy enforced");
+  }
+
+  // ---- 9. injectTransparentConnection: raw TCP / TLS tunnel + port policy ----
+  {
+    const targetPort = await echoServer();
+    const proxy = new EgressProxy(cfg({
+      policy: "allowlist",
+      allowHosts: ["127.0.0.1"],
+      allowPorts: [targetPort],
+    }));
+    await proxy.start();
+
+    const tSrv = net.createServer((s) => proxy.injectTransparentConnection(s, "127.0.0.1", targetPort));
+    await new Promise<void>((res) => tSrv.listen(0, "127.0.0.1", res));
+    const tp = (tSrv.address() as AddressInfo).port;
+    const s = net.createConnection(tp, "127.0.0.1");
+    // Send non-HTTP bytes (e.g. TLS ClientHello starts with 0x16 0x03 0x01)
+    const payload = Buffer.from([0x16, 0x03, 0x01, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+    s.write(payload);
+    const echoed = await new Promise<Buffer>((res) => {
+      const chunks: Buffer[] = [];
+      let len = 0;
+      s.on("data", (c: Buffer) => {
+        chunks.push(c);
+        len += c.length;
+        if (len >= payload.length) res(Buffer.concat(chunks));
+      });
+    });
+    assert(echoed.equals(payload), "transparent non-HTTP tunnel relays bytes intact");
+    s.destroy();
+    tSrv.close();
+    await proxy.stop();
+    console.log("✓ injectTransparentConnection: transparent TLS/TCP tunnel relays bytes intact");
   }
 
   console.log("ALL EGRESS INJECTION/CHAINING TESTS PASSED");

@@ -26,14 +26,14 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 // ---- libc externs (no crates) ----
 
 mod sys {
-    use std::os::raw::c_int;
+    use std::os::raw::{c_int, c_uint, c_void};
 
     pub const POLLIN: i16 = 0x001;
     pub const POLLOUT: i16 = 0x004;
@@ -43,6 +43,11 @@ mod sys {
 
     pub const SHUT_WR: c_int = 1;
 
+    // Linux netfilter original destination (include/uapi/linux/netfilter_ipv4.h)
+    pub const SOL_IP: c_int = 0;
+    pub const SO_ORIGINAL_DST: c_int = 80;
+    pub const AF_INET: u16 = 2;
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct PollFd {
@@ -51,11 +56,27 @@ mod sys {
         pub revents: i16,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct SockAddrIn {
+        pub sin_family: u16,
+        pub sin_port: u16,
+        pub sin_addr: u32,
+        pub sin_zero: [u8; 8],
+    }
+
     pub type NfdsT = u64;
 
     unsafe extern "C" {
         pub fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: c_int) -> c_int;
         pub fn shutdown(fd: c_int, how: c_int) -> c_int;
+        pub fn getsockopt(
+            sockfd: c_int,
+            level: c_int,
+            optname: c_int,
+            optval: *mut c_void,
+            optlen: *mut c_uint,
+        ) -> c_int;
     }
 }
 
@@ -81,8 +102,162 @@ const DATA_FRAME_CHUNK: usize = 64 * 1024;
 
 const DEFAULT_PROXY_PORT: u32 = 3128;
 const DEFAULT_SHARE_PORT: u32 = 8081;
+const DEFAULT_TPROXY_PORT: u32 = 3129;
+const DEFAULT_DNS_PORT: u32 = 53;
 
 const MUX_DEVICE: &str = "/dev/virtio-ports/mux";
+
+// ---- Fake-DNS (RFC 2544 198.18.0.0/15) + SO_ORIGINAL_DST ----
+//
+// 198.18.0.0 is network, 198.18.0.1 is assigned to guest `lo` as the route
+// source address, and 198.18.0.2..=198.19.255.254 (131,069 addresses) are
+// handed out for A queries and mapped back to the queried hostname when a
+// transparent TCP connection arrives on 127.0.0.1:<tproxy_port>.
+const FAKE_DNS_BASE: u32 = 0xC612_0000; // 198.18.0.0
+const FAKE_DNS_FIRST_OFFSET: u32 = 2;   // 198.18.0.2
+const FAKE_DNS_LAST_OFFSET: u32 = 0x0001_FFFE; // 198.19.255.254
+const FAKE_DNS_TTL_SECS: u32 = 60;
+
+struct FakeDns {
+    name_to_ip: HashMap<String, Ipv4Addr>,
+    ip_to_name: HashMap<Ipv4Addr, String>,
+    next_offset: u32,
+}
+
+impl FakeDns {
+    fn new() -> Self {
+        FakeDns {
+            name_to_ip: HashMap::new(),
+            ip_to_name: HashMap::new(),
+            next_offset: FAKE_DNS_FIRST_OFFSET,
+        }
+    }
+
+    fn resolve_or_alloc(&mut self, raw_name: &str) -> Ipv4Addr {
+        let name = raw_name.trim_end_matches('.').to_ascii_lowercase();
+        if name == "localhost" || name.ends_with(".localhost") {
+            return Ipv4Addr::new(127, 0, 0, 1);
+        }
+        if let Ok(ip) = name.parse::<Ipv4Addr>() {
+            return ip;
+        }
+        if let Some(&ip) = self.name_to_ip.get(&name) {
+            return ip;
+        }
+        let ip = Ipv4Addr::from(FAKE_DNS_BASE + self.next_offset);
+        self.next_offset += 1;
+        if self.next_offset > FAKE_DNS_LAST_OFFSET {
+            self.next_offset = FAKE_DNS_FIRST_OFFSET;
+        }
+        if let Some(old_name) = self.ip_to_name.insert(ip, name.clone()) {
+            self.name_to_ip.remove(&old_name);
+        }
+        self.name_to_ip.insert(name, ip);
+        ip
+    }
+
+    fn lookup_ip(&self, ip: Ipv4Addr) -> Option<&str> {
+        self.ip_to_name.get(&ip).map(|s| s.as_str())
+    }
+
+    /// Parse a raw UDP DNS query and build a DNS response packet.
+    /// - `A` (qtype 1): returns a synthetic 198.18.x.y address.
+    /// - `AAAA` (qtype 28) or other types: returns NOERROR with 0 answers
+    ///   (NODATA) so dual-stack resolvers immediately use the IPv4 `A` record.
+    fn handle_packet(&mut self, req: &[u8]) -> Option<Vec<u8>> {
+        if req.len() < 12 {
+            return None;
+        }
+        let flags = u16::from_be_bytes([req[2], req[3]]);
+        if flags & 0x8000 != 0 {
+            return None; // ignore responses
+        }
+        let qdcount = u16::from_be_bytes([req[4], req[5]]);
+        if qdcount == 0 {
+            return None;
+        }
+        let (qname, after_name) = parse_dns_qname(req, 12)?;
+        if after_name + 4 > req.len() {
+            return None;
+        }
+        let qtype = u16::from_be_bytes([req[after_name], req[after_name + 1]]);
+        let qclass = u16::from_be_bytes([req[after_name + 2], req[after_name + 3]]);
+        let q_end = after_name + 4;
+
+        let rd = flags & 0x0100;
+        let resp_flags: u16 = 0x8000 | rd | 0x0080; // QR=1, RA=1, RCODE=0 (NOERROR)
+        let include_a = qtype == 1 && (qclass == 1 || qclass == 255) && !qname.is_empty();
+        let ancount: u16 = if include_a { 1 } else { 0 };
+
+        let mut resp = Vec::with_capacity(q_end + 16);
+        resp.extend_from_slice(&req[0..2]); // Transaction ID
+        resp.extend_from_slice(&resp_flags.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+        resp.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT
+        resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+        resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+        resp.extend_from_slice(&req[12..q_end]); // Question section verbatim
+
+        if include_a {
+            let ip = self.resolve_or_alloc(&qname);
+            resp.extend_from_slice(&0xC00Cu16.to_be_bytes()); // Name pointer to offset 12
+            resp.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+            resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+            resp.extend_from_slice(&FAKE_DNS_TTL_SECS.to_be_bytes());
+            resp.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH = 4
+            resp.extend_from_slice(&ip.octets());
+        }
+        Some(resp)
+    }
+}
+
+/// Parse a DNS question name starting at `start` (no compression pointers in
+/// the single first question, RFC 1035 §4.1.2). Returns `(name, next_offset)`.
+fn parse_dns_qname(pkt: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut pos = start;
+    let mut labels: Vec<String> = Vec::new();
+    loop {
+        if pos >= pkt.len() {
+            return None;
+        }
+        let len = pkt[pos] as usize;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if len & 0xC0 != 0 || pos + len > pkt.len() {
+            return None;
+        }
+        let label = std::str::from_utf8(&pkt[pos..pos + len]).ok()?;
+        labels.push(label.to_string());
+        pos += len;
+        if pos - start > 255 {
+            return None;
+        }
+    }
+    Some((labels.join("."), pos))
+}
+
+/// Query netfilter `SO_ORIGINAL_DST` on a redirected IPv4 TCP socket.
+fn orig_dst_of(sock: &TcpStream) -> Option<SocketAddrV4> {
+    let mut addr = sys::SockAddrIn::default();
+    let mut len = std::mem::size_of::<sys::SockAddrIn>() as std::os::raw::c_uint;
+    let rc = unsafe {
+        sys::getsockopt(
+            sock.as_raw_fd(),
+            sys::SOL_IP,
+            sys::SO_ORIGINAL_DST,
+            (&mut addr as *mut sys::SockAddrIn).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || addr.sin_family != sys::AF_INET {
+        return None;
+    }
+    let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr));
+    let port = u16::from_be(addr.sin_port);
+    Some(SocketAddrV4::new(ip, port))
+}
 
 // ---- frame queue to the mux port ----
 
@@ -189,6 +364,15 @@ fn run() -> i32 {
     let share_port = cmdline_u32("valencebox.share_port")
         .or_else(|| std::env::var("VALENCEBOX_SHARE_PORT").ok()?.parse().ok())
         .unwrap_or(DEFAULT_SHARE_PORT);
+    let tproxy_port = cmdline_u32("valencebox.tproxy_port")
+        .or_else(|| std::env::var("VALENCEBOX_TPROXY_PORT").ok()?.parse().ok())
+        .unwrap_or(DEFAULT_TPROXY_PORT);
+    let dns_port_explicit = cmdline_u32("valencebox.dns_port")
+        .or_else(|| std::env::var("VALENCEBOX_DNS_PORT").ok()?.parse().ok());
+    let dns_port = dns_port_explicit.unwrap_or(DEFAULT_DNS_PORT);
+    // Dev/test affordance: override target when connecting directly to
+    // tproxy_listener without netfilter REDIRECT (e.g. "198.18.0.2:80" or "example.com:80").
+    let tproxy_test_dst = std::env::var("VALENCEBOX_TPROXY_DEFAULT_DST").ok();
 
     // Dev/test affordance: VALENCEBOX_MUX_TCP=host:port connects to a TCP peer
     // instead of the virtio port, so the daemon can be integration-tested on a
@@ -237,12 +421,46 @@ fn run() -> i32 {
             return 1;
         }
     };
-    for l in [&proxy_listener, &share_listener] {
+    let tproxy_listener = match TcpListener::bind(("127.0.0.1", tproxy_port as u16)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("valencebox-mux: cannot bind tproxy 127.0.0.1:{tproxy_port}: {e}");
+            return 1;
+        }
+    };
+    let tproxy_bound_port = tproxy_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(tproxy_port as u16);
+    for l in [&proxy_listener, &share_listener, &tproxy_listener] {
         if let Err(e) = l.set_nonblocking(true) {
             eprintln!("valencebox-mux: set_nonblocking: {e}");
             return 1;
         }
     }
+
+    let dns_sock: Option<UdpSocket> = if dns_port == 0 {
+        None
+    } else {
+        match UdpSocket::bind(("127.0.0.1", dns_port as u16)) {
+            Ok(s) => {
+                if let Err(e) = s.set_nonblocking(true) {
+                    eprintln!("valencebox-mux: dns set_nonblocking: {e}");
+                    return 1;
+                }
+                Some(s)
+            }
+            Err(e) if dns_port_explicit.is_none() && e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("valencebox-mux: skipping privileged DNS bind 127.0.0.1:{dns_port} ({e})");
+                None
+            }
+            Err(e) => {
+                eprintln!("valencebox-mux: cannot bind DNS 127.0.0.1:{dns_port}: {e}");
+                return 1;
+            }
+        }
+    };
+    let mut fake_dns = FakeDns::new();
 
     let mut out = OutQueue::new();
     let mut in_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
@@ -256,14 +474,20 @@ fn run() -> i32 {
 
     out.push_frame(MT_HELLO, 0, b"1");
     eprintln!(
-        "valencebox-mux: started (proxy relay 127.0.0.1:{proxy_port}, share relay 127.0.0.1:{share_port})"
+        "valencebox-mux: started (proxy relay 127.0.0.1:{proxy_port}, share relay 127.0.0.1:{share_port}, tproxy 127.0.0.1:{tproxy_bound_port}, dns {})",
+        dns_sock
+            .as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
     );
 
     let mut mux_read_buf = vec![0u8; 256 * 1024];
     let mut sock_read_buf = vec![0u8; 64 * 1024];
+    let mut dns_buf = [0u8; 2048];
     loop {
         // ---- build poll set ----
-        let mut pollfds: Vec<sys::PollFd> = Vec::with_capacity(4 + streams.len());
+        let mut pollfds: Vec<sys::PollFd> = Vec::with_capacity(6 + streams.len());
         let mut mux_events = sys::POLLIN;
         if !out.is_empty() {
             mux_events |= sys::POLLOUT;
@@ -271,6 +495,15 @@ fn run() -> i32 {
         pollfds.push(sys::PollFd { fd: mux_fd, events: mux_events, revents: 0 });
         pollfds.push(sys::PollFd { fd: proxy_listener.as_raw_fd(), events: sys::POLLIN, revents: 0 });
         pollfds.push(sys::PollFd { fd: share_listener.as_raw_fd(), events: sys::POLLIN, revents: 0 });
+        pollfds.push(sys::PollFd { fd: tproxy_listener.as_raw_fd(), events: sys::POLLIN, revents: 0 });
+        let dns_poll_idx = if let Some(ref ds) = dns_sock {
+            let idx = pollfds.len();
+            pollfds.push(sys::PollFd { fd: ds.as_raw_fd(), events: sys::POLLIN, revents: 0 });
+            Some(idx)
+        } else {
+            None
+        };
+        let stream_poll_base = pollfds.len();
 
         // (fd, stream_id) parallel table for stream pollfds.
         let mut poll_stream_ids: Vec<u32> = Vec::with_capacity(streams.len());
@@ -348,7 +581,27 @@ fn run() -> i32 {
             }
         }
 
-        // ---- listener events ----
+        // ---- Fake-DNS UDP events ----
+        if let (Some(idx), Some(ds)) = (dns_poll_idx, dns_sock.as_ref()) {
+            if pollfds[idx].revents & sys::POLLIN != 0 {
+                loop {
+                    match ds.recv_from(&mut dns_buf) {
+                        Ok((n, peer)) => {
+                            if let Some(resp) = fake_dns.handle_packet(&dns_buf[..n]) {
+                                let _ = ds.send_to(&resp, peer);
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            eprintln!("valencebox-mux: dns recv_from failed: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- listener events (explicit proxy + share relays) ----
         for (idx, listener) in [&proxy_listener, &share_listener].into_iter().enumerate() {
             let re = pollfds[1 + idx].revents;
             if re & sys::POLLIN == 0 {
@@ -388,10 +641,53 @@ fn run() -> i32 {
             }
         }
 
+        // ---- transparent proxy listener events (SO_ORIGINAL_DST + Fake-DNS) ----
+        if pollfds[3].revents & sys::POLLIN != 0 {
+            loop {
+                match tproxy_listener.accept() {
+                    Ok((sock, _peer)) => {
+                        let _ = sock.set_nonblocking(true);
+                        let Some(target) = resolve_tproxy_target(
+                            &sock,
+                            tproxy_bound_port,
+                            &fake_dns,
+                            tproxy_test_dst.as_deref(),
+                        ) else {
+                            continue;
+                        };
+                        let id = next_id;
+                        next_id = next_id.wrapping_add(2);
+                        if next_id == 0 {
+                            next_id = 2;
+                        }
+                        out.push_frame(MT_OPEN, id, target.as_bytes());
+                        streams.insert(
+                            id,
+                            Stream {
+                                sock,
+                                out_buf: Vec::new(),
+                                credit: MUX_WINDOW,
+                                unacked: 0,
+                                received: 0,
+                                awaiting_ok: true,
+                                fin_from_host: false,
+                                fin_sent: false,
+                            },
+                        );
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        eprintln!("valencebox-mux: tproxy accept failed: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+
         // ---- stream socket events ----
         let mut dead: Vec<u32> = Vec::new();
         for (i, id) in poll_stream_ids.iter().enumerate() {
-            let re = pollfds[3 + i].revents;
+            let re = pollfds[stream_poll_base + i].revents;
             if re == 0 {
                 continue;
             }
@@ -624,6 +920,45 @@ fn maybe_grant(s: &mut Stream, id: u32, out: &mut OutQueue) {
     }
 }
 
+fn resolve_tproxy_target(
+    sock: &TcpStream,
+    tproxy_bound_port: u16,
+    fake_dns: &FakeDns,
+    test_default_dst: Option<&str>,
+) -> Option<String> {
+    let orig = orig_dst_of(sock);
+    let is_self_connect = match orig {
+        Some(dst) => *dst.ip() == Ipv4Addr::new(127, 0, 0, 1) && dst.port() == tproxy_bound_port,
+        None => true,
+    };
+    if is_self_connect {
+        // Without netfilter REDIRECT, SO_ORIGINAL_DST returns the listener's
+        // own 127.0.0.1:<tproxy_bound_port> address (or fails). Allow a dev/test
+        // override (`VALENCEBOX_TPROXY_DEFAULT_DST=host_or_ip:port`); otherwise
+        // drop to prevent a self-connect loop.
+        let raw = test_default_dst?;
+        let (h, p_str) = raw.rsplit_once(':')?;
+        let port: u16 = p_str.parse().ok()?;
+        let host = if let Ok(ip) = h.parse::<Ipv4Addr>() {
+            fake_dns
+                .lookup_ip(ip)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| ip.to_string())
+        } else {
+            h.to_string()
+        };
+        return Some(format!("tproxy:{host}:{port}"));
+    }
+    let dst = orig?;
+    let ip = *dst.ip();
+    let port = dst.port();
+    let host = fake_dns
+        .lookup_ip(ip)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| ip.to_string());
+    Some(format!("tproxy:{host}:{port}"))
+}
+
 fn cmdline_u32(key: &str) -> Option<u32> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
     for part in cmdline.split_whitespace() {
@@ -632,4 +967,62 @@ fn cmdline_u32(key: &str) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_dns_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&id.to_be_bytes());
+        pkt.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
+        for label in name.trim_end_matches('.').split('.') {
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+        pkt.push(0);
+        pkt.extend_from_slice(&qtype.to_be_bytes());
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
+        pkt
+    }
+
+    #[test]
+    fn fake_dns_allocates_and_reuses_198_18_addresses() {
+        let mut dns = FakeDns::new();
+        let ip1 = dns.resolve_or_alloc("PyPI.org.");
+        assert_eq!(ip1, Ipv4Addr::new(198, 18, 0, 2));
+        let ip1_again = dns.resolve_or_alloc("pypi.org");
+        assert_eq!(ip1, ip1_again);
+        assert_eq!(dns.lookup_ip(ip1), Some("pypi.org"));
+
+        let ip2 = dns.resolve_or_alloc("registry.npmjs.org");
+        assert_eq!(ip2, Ipv4Addr::new(198, 18, 0, 3));
+        assert_eq!(dns.lookup_ip(ip2), Some("registry.npmjs.org"));
+
+        assert_eq!(dns.resolve_or_alloc("localhost"), Ipv4Addr::new(127, 0, 0, 1));
+    }
+
+    #[test]
+    fn fake_dns_packet_a_and_aaaa() {
+        let mut dns = FakeDns::new();
+        let q_a = build_dns_query(0x1234, "api.example.com", 1);
+        let resp_a = dns.handle_packet(&q_a).expect("A response");
+        assert_eq!(&resp_a[0..2], &[0x12, 0x34]);
+        assert_eq!(u16::from_be_bytes([resp_a[6], resp_a[7]]), 1); // ANCOUNT=1
+        let rdata = &resp_a[resp_a.len() - 4..];
+        assert_eq!(rdata, &[198, 18, 0, 2]);
+        assert_eq!(dns.lookup_ip(Ipv4Addr::new(198, 18, 0, 2)), Some("api.example.com"));
+
+        // AAAA query returns NOERROR with ANCOUNT=0 (NODATA)
+        let q_aaaa = build_dns_query(0x5678, "api.example.com", 28);
+        let resp_aaaa = dns.handle_packet(&q_aaaa).expect("AAAA response");
+        assert_eq!(&resp_aaaa[0..2], &[0x56, 0x78]);
+        assert_eq!(resp_aaaa[3] & 0x0f, 0); // RCODE=0 (NOERROR)
+        assert_eq!(u16::from_be_bytes([resp_aaaa[6], resp_aaaa[7]]), 0); // ANCOUNT=0
+    }
 }

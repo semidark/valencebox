@@ -1,9 +1,8 @@
 # Network Containment — Strict Egress via virtio-serial Tunnel
 
-Status: **Phase 1 implemented** (strict mode default on Linux; SLIRP is the
-opt-out). See "Implementation status" at the end for verified behavior and
-known gaps. Phase 2 (transparent proxying of non-proxy-aware clients) remains
-out of scope and sketched at the end. Paths are relative to `sandbox/`.
+Status: **Phase 1 + Phase 2 implemented** (strict mode default on Linux; SLIRP
+is the opt-out). See "Implementation status" at the end for verified behavior
+and known gaps. Paths are relative to `sandbox/`.
 
 ## Problem
 
@@ -60,7 +59,7 @@ host → 127.0.0.1:2222 (SSH debug) ─────── OPEN fwd:22 → guest 
 | ICMP (ping, traceroute) | **No.** |
 | TCP port forwards (SSH debug) | Yes, host-initiated over the tunnel |
 | UDP port forwards | **Rejected at config load (fail-closed)** |
-| Non-proxy-aware clients | Fail until Phase 2 transparent proxy |
+| Non-proxy-aware TCP clients | Yes (Phase 2: Fake-DNS `198.18.0.0/15` on `127.0.0.1:53` + `lo` default route + `iptables OUTPUT REDIRECT` to `127.0.0.1:3129` → `tproxy:<host>:<port>`) |
 
 ### Security notes
 
@@ -176,11 +175,10 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
 
 ## Out of scope / follow-ups
 
-- **Phase 2 transparent proxy:** fake-DNS + `iptables REDIRECT` in the guest
-  so non-proxy-aware clients work without per-tool setup (Clash/sing-box
-  technique). The M3 daemon architecture leaves room for a second listen
-  path. Real UDP egress would need a datagram path in `EgressProxy` and is
-  explicitly rejected for now.
+- **Real UDP / ICMP egress:** explicitly rejected by design. `valencebox-mux`
+  answers DNS `A`/`AAAA` queries locally on `127.0.0.1:53` (and `iptables`
+  redirects non-loopback UDP `:53` to it), while arbitrary UDP and ICMP have no
+  path out of the VM.
 - macOS HVF, Windows and TCG performance measurement beyond the M3
   functional gate.
 - Migrating token delivery off the kernel cmdline (guest `/proc/cmdline` is
@@ -240,14 +238,26 @@ Implemented and verified on Linux x86-64 (KVM/microvm and TCG/pc):
 - **Upstream chaining:** CONNECT-through-upstream for tunnels, TLS-over-tunnel
   for forwarded/intercepted requests, upstream auth; policy enforced before
   chaining.
+- **Phase 2 transparent proxy (always-on in strict mode):** `valencebox-mux`
+  serves Fake-DNS on `127.0.0.1:53` (`A` → `198.18.0.2..198.19.255.254`, `AAAA`
+  → empty `NOERROR`) and listens on `127.0.0.1:3129` (`SO_ORIGINAL_DST`).
+  `mount-share.sh` sets `/etc/resolv.conf` to `127.0.0.1`, adds a default route
+  over `lo` (`src 198.18.0.1`) so non-proxy-aware `connect()` calls do not fail
+  with `ENETUNREACH` under `-nic none`, and installs `iptables -t nat OUTPUT
+  REDIRECT` rules steering non-loopback UDP `:53` to `:53` and non-loopback TCP
+  to `:3129`. `EgressProxy.injectTransparentConnection` enforces the same
+  host/port/rate policies (evaluating literal-IP connects strictly by IP, never
+  trusting client-supplied TLS SNI) and dispatches origin-form plain HTTP,
+  TLS/MITM secret injection, and raw TCP tunnels.
 
 Verified by: `test:unit` (config validation + strict golden args),
-`test:egress` (mux channel unit + injection/chaining unit),
+`test:egress` (mux channel unit + injection/chaining/tproxy unit),
 `test/guest-mux.integration.ts` (real daemon ↔ host channel, relays, fwd
-dial, 4 MiB roundtrip), `test:boot:strict` (full gate: no NIC, daemon active,
-WebDAV-over-tunnel sync active, curl → proxy relay → mux → EgressProxy →
-WebDAV = 207, SSH over a mux forward) on **both microvm/KVM and pc/TCG**, and
-the legacy `test:boot` (SLIRP path unchanged).
+dial, 4 MiB roundtrip, Fake-DNS + `tproxy:` mapping), `test:boot:strict` (full
+gate: no NIC, daemon active, WebDAV-over-tunnel sync active, explicit proxy
+relay roundtrip, Fake-DNS resolution, env-stripped transparent `curl` allowed +
+denied host checks, SSH over a mux forward) on **both microvm/KVM and pc/TCG**,
+and the legacy `test:boot` (SLIRP path unchanged).
 
 Gaps / notes:
 

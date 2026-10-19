@@ -226,8 +226,11 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
   precedence for guest delivery when both are set).
 - **Strict-mode defaults:** the proxy binds `127.0.0.1` (the guest reaches it
   through the mux tunnel, not TCP); guest-side mux relays are fixed loopback
-  ports (proxy `3128`, share `8081`), passed to the guest on the kernel
-  cmdline / fw_cfg.
+  ports (proxy `3128`, share `8081`, transparent TCP `3129`, Fake-DNS `53`),
+  passed to the guest on the kernel cmdline / fw_cfg. Non-proxy-aware guest
+  clients are transparently steered via Fake-DNS (`198.18.0.0/15`), a `lo`
+  default route, and `iptables -t nat OUTPUT REDIRECT` into `127.0.0.1:3129`
+  (`SO_ORIGINAL_DST` → `tproxy:<host>:<port>`).
 
 - Legacy SLIRP mode: the proxy listens on `0.0.0.0:<port>`; the guest reaches
   it via the SLIRP gateway at `10.0.2.2:<port>` with `HTTP_PROXY`/`HTTPS_PROXY`.

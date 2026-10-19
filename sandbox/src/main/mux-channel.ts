@@ -563,6 +563,9 @@ export class MuxChannel extends EventEmitter {
       this.sendFrame(MT_OPEN_FAIL, id, Buffer.from(String(err?.message ?? "refused").slice(0, 128)));
       return;
     }
+    if (st.destroyed) {
+      return;
+    }
     this.streams.set(id, st);
     this.sendFrame(MT_OPEN_OK, id);
   }

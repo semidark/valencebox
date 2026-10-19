@@ -6,7 +6,7 @@ import * as os from "os";
 import * as path from "path";
 import { VmManager } from "./vm-manager";
 import { HttpShare } from "./http-share";
-import { EgressProxy, resolveSecrets, generatePlaceholder } from "./egress-proxy";
+import { EgressProxy, resolveSecrets, generatePlaceholder, parseTransparentTarget } from "./egress-proxy";
 import * as assetPaths from "./asset-paths";
 import { IPC } from "../shared/ipc";
 import { SandboxAppConfig, EgressRuntimeConfig, validateNetworkConfig, parseUpstreamProxy } from "../config";
@@ -379,6 +379,12 @@ async function startVm() {
           proxy.injectConnection(stream);
         } else if (target === "share" && share) {
           share.injectConnection(stream);
+        } else if (target.startsWith("tproxy:") && proxy) {
+          const parsed = parseTransparentTarget(target);
+          if (!parsed) {
+            throw new Error(`malformed tproxy target '${target}'`);
+          }
+          proxy.injectTransparentConnection(stream, parsed.host, parsed.port);
         } else {
           throw new Error(`unknown mux target '${target}'`);
         }

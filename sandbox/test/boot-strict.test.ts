@@ -16,7 +16,7 @@ import * as os from "os";
 import * as path from "path";
 import { VmManager } from "../src/main/vm-manager";
 import { HttpShare } from "../src/main/http-share";
-import { EgressProxy } from "../src/main/egress-proxy";
+import { EgressProxy, parseTransparentTarget } from "../src/main/egress-proxy";
 import { startTcpPortForwards } from "../src/main/port-forwards";
 import { imagesDir, rootQcow2Path, workspaceQcow2Path, getRandomFreePort } from "../src/main/asset-paths";
 import { x86_64Profile } from "../src/main/guest-profile";
@@ -52,7 +52,7 @@ async function main() {
     console.log(`[share] WebDAV on 127.0.0.1:${shareCfg.port}`);
 
     const proxyCfg: EgressRuntimeConfig = {
-      policy: "none", allowHosts: [], denyHosts: [], allowPorts: [],
+      policy: "denylist", allowHosts: [], denyHosts: ["blocked.valencebox.test"], allowPorts: [],
       allowAll: false, enableMitm: false, secrets: [], port: 0,
       authToken: "testtoken123", maxConnections: 64, rateLimitPerMin: 0,
       listenHost: "127.0.0.1",
@@ -102,11 +102,21 @@ async function main() {
     mux.on("ready", () => { helloSeen = true; console.log("[mux] ready"); });
     mux.on("closed", () => { console.log("[mux] CHANNEL CLOSED"); });
     mux.on("error", (e) => { console.log("[mux] channel error:", e.message); });
+    const seenTproxyTargets: string[] = [];
     // Route mux streams into the in-process servers, as main.ts does.
     mux.onStream((target, stream) => {
       if (target === "proxy" && proxy) proxy.injectConnection(stream);
       else if (target === "share" && share) share.injectConnection(stream);
-      else throw new Error(`unknown mux target '${target}'`);
+      else if (target.startsWith("tproxy:") && proxy) {
+        seenTproxyTargets.push(target);
+        const parsed = parseTransparentTarget(target);
+        if (!parsed) throw new Error(`malformed tproxy target '${target}'`);
+        // Map the synthetic test hostname to 127.0.0.1 on the host so the test
+        // requires no external DNS while still exercising the full guest
+        // Fake-DNS + iptables OUTPUT REDIRECT + SO_ORIGINAL_DST path.
+        const dialHost = parsed.host === "tproxy.valencebox.test" ? "127.0.0.1" : parsed.host;
+        proxy.injectTransparentConnection(stream, dialHost, parsed.port);
+      } else throw new Error(`unknown mux target '${target}'`);
     });
     forwards = startTcpPortForwards(mux, [{ hostPort: sshHostPort, guestPort: 22, label: "SSH debug (mux)" }]);
 
@@ -175,6 +185,49 @@ async function main() {
     const code = curlOut.match(/HTTPCODE_(\d{3})/)?.[1];
     if (code !== "207") throw new Error(`PROPFIND via proxy relay returned ${code ?? "?"} (expected 207)`);
     console.log("✓ egress round trip: curl → proxy relay → mux → EgressProxy → WebDAV (207)");
+
+    // Phase 2 transparent proxy gate:
+    // 1. Fake-DNS on 127.0.0.1:53 resolves synthetic hostnames into 198.18.0.0/15.
+    const dnsOut = await run(
+      `getent ahostsv4 tproxy.valencebox.test | head -1 | awk '{print $1}'; echo "DNS_"'DONE'`,
+      /198\.18\.\d+\.\d+[\s\S]*DNS_DONE/,
+      15000,
+    );
+    const fakeIp = dnsOut.match(/(198\.18\.\d+\.\d+)/)?.[1];
+    if (!fakeIp) throw new Error(`Fake-DNS did not return 198.18.x.y: ${dnsOut}`);
+    console.log(`✓ Fake-DNS resolved tproxy.valencebox.test → ${fakeIp}`);
+
+    // 2. Non-proxy-aware client (env -i strips HTTP_PROXY/http_proxy, no -x flag)
+    //    connects to hostname → Fake-DNS → lo OUTPUT REDIRECT → valencebox-mux:3129
+    //    (SO_ORIGINAL_DST) → mux "tproxy:<host>:<port>" → EgressProxy → WebDAV (207).
+    const tproxyAllowCmd =
+      `tcode=$(env -i PATH=/usr/bin:/bin curl -s -o /dev/null -w '%{http_code}' ` +
+      `-u valence:${shareCfg.token} -X PROPFIND -H 'Depth: 0' ` +
+      `-H 'Host: 127.0.0.1:${shareCfg.port}' ` +
+      `http://tproxy.valencebox.test:${shareCfg.port}/); echo "TPROXY_ALLOW_$tcode"`;
+    const tproxyAllowOut = await run(tproxyAllowCmd, /TPROXY_ALLOW_\d{3}/, 30000);
+    const tAllowCode = tproxyAllowOut.match(/TPROXY_ALLOW_(\d{3})/)?.[1];
+    if (tAllowCode !== "207") {
+      throw new Error(`transparent PROPFIND (no HTTP_PROXY) returned ${tAllowCode ?? "?"} (expected 207)`);
+    }
+    if (!seenTproxyTargets.includes(`tproxy:tproxy.valencebox.test:${shareCfg.port}`)) {
+      throw new Error(`expected tproxy:tproxy.valencebox.test:${shareCfg.port} in ${JSON.stringify(seenTproxyTargets)}`);
+    }
+    console.log("✓ transparent proxy: env-stripped curl → Fake-DNS → iptables REDIRECT → tproxy → WebDAV (207)");
+
+    // 3. Disallowed host fails closed over the transparent path.
+    const tproxyDenyCmd =
+      `dcode=$(env -i PATH=/usr/bin:/bin curl -s -o /dev/null -w '%{http_code}' --max-time 5 ` +
+      `http://blocked.valencebox.test:${shareCfg.port}/ || true); echo "TPROXY_DENY_$dcode"`;
+    const tproxyDenyOut = await run(tproxyDenyCmd, /TPROXY_DENY_\d{3}/, 20000);
+    const tDenyCode = tproxyDenyOut.match(/TPROXY_DENY_(\d{3})/)?.[1];
+    if (tDenyCode !== "000" && tDenyCode !== "403") {
+      throw new Error(`transparent denied host returned ${tDenyCode ?? "?"} (expected 000 or 403)`);
+    }
+    if (!seenTproxyTargets.includes(`tproxy:blocked.valencebox.test:${shareCfg.port}`)) {
+      throw new Error(`expected tproxy:blocked.valencebox.test:${shareCfg.port} in ${JSON.stringify(seenTproxyTargets)}`);
+    }
+    console.log(`✓ transparent proxy policy: denied host blocked (${tDenyCode})`);
 
     // Raw TCP probe of the SSH forward (captures the mux failure reason).
     console.log("[probe] starting; state:", mux.connected, (mux as any).stopped);

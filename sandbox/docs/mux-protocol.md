@@ -61,15 +61,18 @@ the stream is unrecoverable.
 
 | Target | Meaning | Opener |
 |---|---|---|
-| `proxy` | Host `EgressProxy` (HTTP CONNECT / forward proxy) | guest |
+| `proxy` | Host `EgressProxy` (explicit HTTP CONNECT / forward proxy) | guest |
+| `tproxy:<host>:<port>` | Host `EgressProxy` transparent stream (redirected via Fake-DNS + `SO_ORIGINAL_DST`) | guest |
 | `share` | Host WebDAV share (workspace sync) | guest |
 | `fwd:<guestPort>` | Guest loopback service (e.g. `fwd:22` → sshd) | host |
 
 Host-side injection: an accepted `proxy` stream is handed to
-`EgressProxy.injectConnection()`, a `share` stream to
-`HttpShare.injectConnection()` — both feed the stream to their in-process
-HTTP server via `server.emit("connection", stream)`. Guest-side: the daemon
-dials `127.0.0.1:<port>` for `fwd:` targets.
+`EgressProxy.injectConnection()`, a `tproxy:<host>:<port>` stream to
+`EgressProxy.injectTransparentConnection(stream, host, port)`, and a `share`
+stream to `HttpShare.injectConnection()`. Guest-side: the daemon dials
+`127.0.0.1:<port>` for `fwd:` targets, answers Fake-DNS queries on
+`127.0.0.1:53` (`198.18.0.0/15`), and maps `SO_ORIGINAL_DST` on
+`127.0.0.1:3129` back to `<host>:<port>` for `tproxy:` streams.
 
 ## Flow control
 
