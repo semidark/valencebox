@@ -48,6 +48,7 @@ function generateTestKeyPair(tmpDir: string): { key: string; cert: string } {
 
   const { privateKey } = crypto.generateKeyPairSync("rsa", {
     modulusLength: 2048,
+    publicKeyEncoding: { type: "spki", format: "pem" },
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
   fs.writeFileSync(keyFile, privateKey);
@@ -316,9 +317,8 @@ async function testMitmSecretInjection() {
       });
     });
 
-    // Send an HTTPS request with placeholders in both a header and the body.
-    // The body replacement changes its byte length, exercising Content-Length repair.
-    const requestBody = "token=psbx-sec-test-abc";
+    // Send an HTTPS request with a placeholder in a header and a streamed body.
+    const requestBody = "payload-data-streamed";
     const request = [
       "POST /test HTTP/1.1",
       "Host: 127.0.0.1",
@@ -353,7 +353,7 @@ async function testMitmSecretInjection() {
 
     // Verify the upstream received the rewritten token (real value, not placeholder).
     assert(capturedHeaders !== undefined, "upstream received headers");
-    assertEq(capturedBody, "token=real-token-value", "placeholder replaced in upstream body");
+    assertEq(capturedBody, "payload-data-streamed", "body streamed through unmodified");
     if (capturedHeaders) {
       const authHeader = capturedHeaders["authorization"] as string | undefined;
       assert(authHeader !== undefined, "authorization header present in upstream");
@@ -538,6 +538,236 @@ async function testLogFileSink() {
   }
 }
 
+// ---- Repeated headers preservation on HTTP & MITM forwarding ----
+
+async function testRepeatedHeadersPreserved() {
+  let capturedPlainHeaders: http.IncomingHttpHeaders | undefined;
+  let capturedMitmHeaders: http.IncomingHttpHeaders | undefined;
+  let plainUpstream: http.Server | undefined;
+  let mitmUpstream: https.Server | undefined;
+  let proxy: EgressProxy | undefined;
+  let tmpDir: string | undefined;
+
+  try {
+    plainUpstream = http.createServer((req, res) => {
+      capturedPlainHeaders = req.headers;
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("plain-ok");
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      plainUpstream!.once("error", reject);
+      plainUpstream!.listen(0, "127.0.0.1", () => resolve());
+    });
+    const plainPort = (plainUpstream.address() as any).port;
+
+    tmpDir = fs.mkdtempSync("mitm-rep-");
+    const upstreamDir = path.join(tmpDir, "upstream");
+    fs.mkdirSync(upstreamDir, { recursive: true });
+    const upstreamKeyPair = generateTestKeyPair(upstreamDir);
+
+    mitmUpstream = https.createServer(
+      { key: fs.readFileSync(upstreamKeyPair.key), cert: fs.readFileSync(upstreamKeyPair.cert) },
+      (req, res) => {
+        capturedMitmHeaders = req.headers;
+        req.resume();
+        req.on("end", () => {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("mitm-ok");
+        });
+      },
+    );
+    await new Promise<void>((resolve, reject) => {
+      mitmUpstream!.once("error", reject);
+      mitmUpstream!.listen(0, "127.0.0.1", () => resolve());
+    });
+    const mitmPort = (mitmUpstream.address() as any).port;
+
+    const proxyConfig: EgressRuntimeConfig = {
+      policy: "allowlist",
+      allowHosts: ["127.0.0.1"],
+      denyHosts: [],
+      allowPorts: [plainPort, mitmPort, 443],
+      allowAll: false,
+      enableMitm: true,
+      secrets: [
+        { env: "SEC", value: "real-secret", placeholder: "psbx-sec-rep-1", hosts: ["127.0.0.1"] },
+      ],
+      port: 0,
+      authToken: "test",
+      maxConnections: 256,
+      rateLimitPerMin: 0,
+      listenHost: "127.0.0.1",
+    };
+
+    proxy = new EgressProxy(proxyConfig, path.join(tmpDir, "ca"));
+    await proxy.start();
+    const proxyPort = proxy.port;
+    const auth = "Basic " + Buffer.from("psbx:test").toString("base64");
+
+    // 1. Plain HTTP forward with repeated Cookie and Accept headers
+    const plainSock = net.connect(proxyPort, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("plainSock connect timeout")), 3000);
+      plainSock.once("connect", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      plainSock.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    const plainReq = [
+      `GET http://127.0.0.1:${plainPort}/ HTTP/1.1`,
+      `Host: 127.0.0.1:${plainPort}`,
+      `Proxy-Authorization: ${auth}`,
+      "Cookie: session=abc",
+      "Cookie: csrf=xyz",
+      "Accept: application/json",
+      "Accept: text/plain",
+      "Connection: close",
+      "",
+      "",
+    ].join("\r\n");
+    plainSock.write(plainReq);
+
+    const plainResp = await new Promise<string>((resolve, reject) => {
+      let data = "";
+      const timer = setTimeout(() => {
+        plainSock.destroy();
+        reject(new Error("plainResp read timeout"));
+      }, 4000);
+      plainSock.on("data", (c) => (data += c.toString("utf-8")));
+      plainSock.on("end", () => {
+        clearTimeout(timer);
+        resolve(data);
+      });
+      plainSock.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    plainSock.destroy();
+
+    assert(plainResp.includes("200 OK"), "plain HTTP responded 200 OK");
+    assert(capturedPlainHeaders !== undefined, "plain upstream received headers");
+    assertEq(capturedPlainHeaders!["cookie"], "session=abc; csrf=xyz", "repeated Cookie preserved on plain HTTP");
+    assertEq(capturedPlainHeaders!["accept"], "application/json, text/plain", "repeated Accept preserved on plain HTTP");
+
+    // 2. MITM HTTPS forward with repeated Cookie and Accept headers plus secret injection
+    const mitmSock = net.connect(proxyPort, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("mitmSock connect timeout")), 3000);
+      mitmSock.once("connect", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      mitmSock.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    mitmSock.write(`CONNECT 127.0.0.1:${mitmPort} HTTP/1.1\r\nHost: 127.0.0.1:${mitmPort}\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+    const connectResp = await new Promise<string>((resolve, reject) => {
+      let buf = "";
+      const cleanup = () => {
+        clearTimeout(timer);
+        mitmSock.removeListener("data", onData);
+        mitmSock.removeListener("error", onError);
+        mitmSock.removeListener("close", onClose);
+      };
+      const onData = (data: Buffer) => {
+        buf += data.toString("utf-8");
+        if (buf.includes("\r\n\r\n")) {
+          cleanup();
+          resolve(buf);
+        }
+      };
+      const onError = (err: Error) => {
+        cleanup();
+        reject(err);
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error("mitm socket closed before CONNECT response finished"));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        mitmSock.destroy();
+        reject(new Error("mitm CONNECT response timeout"));
+      }, 3000);
+
+      mitmSock.on("data", onData);
+      mitmSock.on("error", onError);
+      mitmSock.on("close", onClose);
+    });
+    assert(connectResp.startsWith("HTTP/1.1 200 Connection Established"), `mitm CONNECT responded 200 (got: ${connectResp.slice(0, 50)})`);
+
+    const clientTls = tls.connect({ socket: mitmSock, host: "127.0.0.1", rejectUnauthorized: false });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("TLS timeout")), 3000);
+      clientTls.once("secureConnect", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      clientTls.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    const mitmReq = [
+      "GET / HTTP/1.1",
+      `Host: 127.0.0.1:${mitmPort}`,
+      "Authorization: Bearer psbx-sec-rep-1",
+      "Cookie: session=abc",
+      "Cookie: csrf=xyz",
+      "Accept: application/json",
+      "Accept: text/plain",
+      "Connection: close",
+      "",
+      "",
+    ].join("\r\n");
+    clientTls.write(mitmReq);
+
+    const mitmResp = await new Promise<string>((resolve, reject) => {
+      let data = "";
+      const timer = setTimeout(() => {
+        clientTls.destroy();
+        reject(new Error("mitmResp read timeout"));
+      }, 4000);
+      clientTls.on("data", (c) => (data += c.toString("utf-8")));
+      clientTls.on("end", () => {
+        clearTimeout(timer);
+        resolve(data);
+      });
+      clientTls.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    clientTls.destroy();
+
+    assert(mitmResp.includes("200 OK"), "MITM responded 200 OK");
+    assert(capturedMitmHeaders !== undefined, "MITM upstream received headers");
+    assertEq(capturedMitmHeaders!["cookie"], "session=abc; csrf=xyz", "repeated Cookie preserved on MITM");
+    assertEq(capturedMitmHeaders!["accept"], "application/json, text/plain", "repeated Accept preserved on MITM");
+    assertEq(capturedMitmHeaders!["authorization"], "Bearer real-secret", "secret placeholder replaced on MITM");
+
+    console.log("✓ repeated headers preserved across plain HTTP and MITM");
+  } finally {
+    if (proxy) await proxy.stop();
+    if (plainUpstream) await new Promise<void>((resolve) => plainUpstream!.close(() => resolve()));
+    if (mitmUpstream) await new Promise<void>((resolve) => mitmUpstream!.close(() => resolve()));
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 // ---- Run all ----
 
 async function main() {
@@ -546,6 +776,7 @@ async function main() {
     await testAuthTokenValidation();
     await testConnectPolicyEnforcement();
     await testMitmSecretInjection();
+    await testRepeatedHeadersPreserved();
     await testMaxConnectionLimit();
     await testRateLimit();
     await testCustomUpstreamCa();

@@ -7,7 +7,12 @@ export interface GuestProfile {
   /**
    * CPU model for the guest. Called with the resolved accel so aarch64 can
    * return "host" under HVF pass-through and "max" under TCG.
-   * Returns undefined when no explicit -cpu is needed (x86_64 default).
+   * x86_64 returns "host" under KVM/HVF (exposes native ISA extensions —
+   * SSE4.2/POPCNT/AVX/AVX2, required by X86-64-v2 baseline wheels like
+   * numpy >= 2.0), "max" under TCG, and the QEMU default under WHPX:
+   * QEMU 9.2.4's accel_uses_host_cpuid() only accepts -cpu host with
+   * KVM or HVF, so WHPX + host fails at startup.
+   * Returns undefined when no explicit -cpu is needed.
    */
   cpuFor(accel: string): string | undefined;
 
@@ -34,7 +39,13 @@ export function x86_64Profile(
     arch: "x86_64",
     qemuBinary: "qemu-system-x86_64",
 
-    cpuFor(): undefined { return undefined; },
+    cpuFor(accel: string): string | undefined {
+      if (accel === "kvm" || accel === "hvf") return "host";
+      // QEMU 9.2.4: -cpu host requires KVM or HVF (accel_uses_host_cpuid()).
+      // WHPX keeps the default model rather than failing at startup.
+      if (accel === "whpx") return undefined;
+      return "max";
+    },
 
     machineFor(accel: string): "microvm" | "pc" {
       if (accel !== "tcg,thread=multi") return "microvm";

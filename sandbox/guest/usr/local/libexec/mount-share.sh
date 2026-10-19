@@ -23,6 +23,18 @@ if [ -b /dev/vdb ] && ! mountpoint -q /workspace; then
   mount -o noatime /dev/vdb /workspace
 fi
 
+# ---- Grow filesystems if the qcow2 was resized larger on the host ----
+# resize2fs with no size argument grows the fs to the device size and is a
+# no-op (exit 0) when already full. Online resize is supported for mounted
+# ext4. Grow-only: never shrinks, never reformats. Failures are logged, not
+# fatal — the existing filesystem still mounts and works.
+if [ -b /dev/vda ]; then
+  resize2fs /dev/vda >/dev/null 2>&1 || echo "WARNING: resize2fs /dev/vda failed (root fs unchanged)" >&2
+fi
+if [ -b /dev/vdb ] && mountpoint -q /workspace; then
+  resize2fs /dev/vdb >/dev/null 2>&1 || echo "WARNING: resize2fs /dev/vdb failed (workspace fs unchanged)" >&2
+fi
+
 # ---- Read kernel cmdline parameters ----
 # These are set by the host in qemu.ts -append.
 proxy_port=$(sed -n 's/.*valencebox\.proxy_port=\([0-9]*\).*/\1/p' /proc/cmdline)
@@ -74,8 +86,16 @@ if [ -n "$proxy_port" ] && [ -n "$proxy_token" ]; then
 HTTP_PROXY="http://valencebox:PROXY_TOKEN@10.0.2.2:PROXY_PORT/"
 HTTPS_PROXY="http://valencebox:PROXY_TOKEN@10.0.2.2:PROXY_PORT/"
 NO_PROXY="127.0.0.1,localhost,10.0.2.2,::1"
+http_proxy="$HTTP_PROXY"
+https_proxy="$HTTPS_PROXY"
+no_proxy="$NO_PROXY"
 NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/valencebox-mitm.crt
-export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy NODE_EXTRA_CA_CERTS
+# Python (requests/httpx/uv/litellm) and Rust/Go tools that ignore the system
+# trust store read these instead of /etc/ssl/certs. Point them at the merged
+# bundle so the MITM CA installed via update-ca-certificates is honored.
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy NODE_EXTRA_CA_CERTS SSL_CERT_FILE REQUESTS_CA_BUNDLE
 PROXYEOF
 
   # Substitute actual values sed -i is portable across Linux distros.

@@ -121,24 +121,22 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
   `update-ca-certificates` (failure is tolerated), and configures
   `NODE_EXTRA_CA_CERTS`. Host-side integration tests disable verification on
   their client-to-proxy TLS sockets; they do not verify actual guest CA trust.
-- **Placeholder replacement is not uniformly host-scoped.** `resolveSecrets()`
+- **Secret placeholder replacement is header-only and host-scoped.** `resolveSecrets()`
   validates env names and resolves `value` > `fromFile` > `fromEnv`; guest boot
   receives placeholders, not those resolved values. `rewriteHeaders()` checks
   each encountered placeholder against that secret's declared hosts and throws
-  `PlaceholderViolation` on mismatch. **`rewriteBody()` takes no host argument**
-  and replaces placeholders from the full secret list. Both MITM and plain-HTTP
-  secret forwarding call it with all configured secrets once the target matches
-  any secret host. Unit assertions cover header mismatch and body replacement,
-  not cross-host body authorization. Opaque tunnels and ordinary forwards do
+  `PlaceholderViolation` on mismatch. Secret injection is performed exclusively
+  on HTTP request headers; request bodies are streamed directly without buffering,
+  size limits, or body inspection. Both MITM and plain-HTTP
+  forwarding call `rewriteHeaders()`. Opaque tunnels and CONNECT bypasses do
   not provide global placeholder scanning. Do not infer that every unauthorized
   placeholder use returns 403, or that real credentials can never reach a guest.
-- **Plain HTTP can inject real secrets, even with MITM disabled.**
-  `forwardRequest()` selects `forwardRequestWithSecrets()` for non-TLS requests
-  to a declared secret host independently of `enableMitm`; that path forwards
+- **Plain HTTP requests inspect headers and inject real secrets, even with MITM disabled.**
+  `forwardRequest()` runs `forwardRequestWithSecrets()` for plain HTTP requests;
+  that path validates placeholders and forwards
   rewritten credentials via `http.request`, in plaintext to the upstream.
-  Both rewriting paths buffer up to 10 MB. MITM rejects chunked bodies with
-  411 and oversized bodies with 413; the plain-HTTP secret path uses 403 for
-  those cases. These are implementation observations, not exploit tests.
+  Request bodies are streamed via `req.pipe()` without buffering; chunked transfer
+  encoding is supported on both HTTP and HTTPS MITM paths. These are implementation observations, not exploit tests.
 - **Upstream TLS verification depends on the host environment.** MITM sets
   `rejectUnauthorized` to `process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0"`.
   Ordinary HTTPS forwarding uses Node's default behavior. A configured
@@ -164,7 +162,10 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
   `-prefer /host-workspace` express reconciliation behavior; they do not prove
   crash safety, prevention of deletion on later disconnects, or preservation
   of unsynced guest edits. The exclusions are `node_modules`, `.git`,
-  `.DS_Store`, `lost+found`, and the marker. No current end-to-end durability
+  `.DS_Store`, `lost+found`, `.nephelemeta`, and the marker. In addition, the
+  `HttpShare` filesystem adapter is configured with `properties: "disallow"` and
+  `locks: "disallow"` to prevent `.nephelemeta` metadata sidecars from being
+  created in the host workspace. No current end-to-end durability
   test was found in `test/`.
 - **Snapshots are unimplemented.** The renderer button calls preload
   `saveSnapshot`, but `main.ts` registers a no-op IPC handler. Current

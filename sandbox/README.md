@@ -190,17 +190,17 @@ Runtime MITM CA and leaf generation uses pure Node (`selfsigned` →
 2. The CA certificate is passed to the guest via QEMU `fw_cfg` and installed by
    `mount-share.sh` at boot (`update-ca-certificates`).
 3. For each host listed in `secrets[*].hosts`, the proxy TLS-terminates the
-   connection, replaces placeholder strings in headers/body with the real secret
-   values, and re-encrypts upstream.
+   connection, replaces placeholder strings in request headers with the real secret
+   values, and re-encrypts upstream while streaming the request body without buffering.
 4. Guest environment variables are provisioned with placeholders, not real
    credentials. This does not prevent an upstream from echoing a credential
-   back to the guest. Secret-rewriting paths buffer bodies and reject chunked
-   transfer encoding.
+   back to the guest. Request bodies are streamed directly without size limits;
+   chunked transfer encoding is supported.
 
-**Important current limitations:** plain HTTP secret-host requests also rewrite
-credentials even when MITM is off, transmitting them without upstream TLS.
-Body rewriting lacks the destination authorization check present in header
-rewriting. Upstream MITM TLS verification follows `NODE_TLS_REJECT_UNAUTHORIZED`;
+**Important current limitations:** plain HTTP requests also rewrite
+credentials in headers (or block unauthorized placeholders) even when MITM is off,
+transmitting them without upstream TLS.
+Upstream MITM TLS verification follows `NODE_TLS_REJECT_UNAUTHORIZED`;
 never set it to `0` during normal app use. See [HARDENING.md](HARDENING.md) for
 source evidence and follow-ups before using real credentials.
 
@@ -235,11 +235,11 @@ npm run test:unit     # guest profiles and generated QEMU argument assertions
 npm run test:share    # WebDAV auth/CRUD/traversal assertions, no VM
 npm run test:egress   # proxy policy and rewriting helpers (unit)
 npm run test:qmp      # frozen QEMU query-status and process stop, no snapshots
-npm run test:boot     # x86-64 login, /workspace disk layout and service status
+npm run test:boot     # x86-64 login, /workspace disk layout, fw_cfg share reading, and sync round-trip
 ```
 
 QMP requires staged QEMU/firmware; boot also requires x86-64 guest images.
-`test:boot` starts no host WebDAV share and does not verify a sync round-trip.
+`test:boot` starts a host WebDAV share to exercise fw_cfg and verify a file-sync round-trip.
 Neither `test:e2e` nor `test:snapshot` exists as an npm script; these are future
 proposals, with no current full-lifecycle equivalent.
 
