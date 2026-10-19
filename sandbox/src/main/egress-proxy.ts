@@ -15,11 +15,6 @@ import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret } from "../config";
 const COPY_CHUNK_SIZE = 65536;
 
 /**
- * Maximum body size we are willing to buffer for MITM placeholder rewriting.
- */
-const MITM_MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
-
-/**
  * Constant-time comparison to prevent timing attacks on the proxy auth token.
  */
 function constantTimeEqual(a: string, b: string): boolean {
@@ -195,21 +190,6 @@ export function rewriteHeaders(
   }
 
   return rewritten;
-}
-
-/**
- * Rewrite body bytes, replacing any placeholder with the real secret value.
- */
-export function rewriteBody(body: Buffer, secrets: ResolvedSecret[]): Buffer {
-  let data = body.toString("utf-8");
-  let modified = false;
-  for (const secret of secrets) {
-    if (secret.placeholder && data.includes(secret.placeholder)) {
-      data = data.replaceAll(secret.placeholder, secret.value);
-      modified = true;
-    }
-  }
-  return modified ? Buffer.from(data, "utf-8") : body;
 }
 
 /**
@@ -656,9 +636,11 @@ export class EgressProxy {
       return;
     }
 
-    // Secret hosts over plain HTTP: buffer and rewrite headers/body so
-    // placeholders are swapped for real secrets without TLS interception.
-    if (!useTls && this.isSecretHost(targetHost)) {
+    // Check and rewrite headers for secrets/placeholders on plain HTTP requests.
+    // If placeholders are present for an unauthorized host, rewriteHeaders throws
+    // PlaceholderViolation so we reject with 403 before contacting upstream.
+    // Secret hosts swap placeholders for real secrets without TLS interception.
+    if (!useTls) {
       await this.forwardRequestWithSecrets(req, res, targetHost, port, path);
       return;
     }
@@ -707,51 +689,12 @@ export class EgressProxy {
   private async forwardRequestWithSecrets(req: http.IncomingMessage, res: http.ServerResponse, targetHost: string, port: number, path: string): Promise<void> {
     const method = req.method || "GET";
     try {
-      const transferEncoding = req.headers["transfer-encoding"];
-      if (transferEncoding && transferEncoding.toLowerCase().includes("chunked")) {
-        this.log("BLOCK", method, targetHost, "chunked encoding not supported for secret hosts");
-        this.send403(res, "chunked encoding is not supported for secret hosts");
-        return;
-      }
-
-      const chunks: Buffer[] = [];
-      let totalLen = 0;
-      for await (const chunk of req) {
-        totalLen += chunk.length;
-        if (totalLen > MITM_MAX_BODY_SIZE) {
-          this.send403(res, "payload too large");
-          return;
-        }
-        chunks.push(chunk as Buffer);
-      }
-      const body = Buffer.concat(chunks);
-
       const rawHeaders: [string, string][] = [];
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         rawHeaders.push([req.rawHeaders[i], req.rawHeaders[i + 1]]);
       }
 
       const rewrittenHeaders = rewriteHeaders(rawHeaders, this.config.secrets, targetHost);
-      const rewrittenBody = rewriteBody(body, this.config.secrets);
-
-      const origContentLength = req.headers["content-length"];
-      if (rewrittenBody !== body && origContentLength) {
-        const origLen = parseInt(origContentLength, 10);
-        let clFixed = false;
-        for (let i = 0; i < rewrittenHeaders.length; i++) {
-          if (rewrittenHeaders[i][0].toLowerCase() === "content-length") {
-            rewrittenHeaders[i][1] = rewrittenBody.length.toString();
-            clFixed = true;
-            break;
-          }
-        }
-        if (!clFixed) {
-          rewrittenHeaders.push(["content-length", rewrittenBody.length.toString()]);
-        }
-        this.log("DEBUG", method, `${targetHost}:${port}`,
-          `Content-Length adjusted: ${origLen} → ${rewrittenBody.length}`);
-      }
-
       const headers: Record<string, string> = Object.fromEntries(rewrittenHeaders);
       delete headers["proxy-authorization"];
       delete headers["proxy-connection"];
@@ -780,11 +723,17 @@ export class EgressProxy {
       });
 
       this.trackRequest(forwardReq);
-      forwardReq.write(rewrittenBody);
-      forwardReq.end();
+
+      req.on("data", (c: Buffer) => this.addBytes(targetHost, c.length, 0));
+      req.on("error", (err) => {
+        this.log("ERROR", method, `${targetHost}:${port}`, `client request stream error: ${err.message}`);
+        forwardReq.destroy(err);
+      });
+      req.pipe(forwardReq);
 
       this.log("HTTP-SECRET", method, `${targetHost}:${port}`, "secret injection active");
     } catch (err: any) {
+      req.resume();
       if (err instanceof PlaceholderViolation) {
         this.log("BLOCK", method, targetHost, `placeholder(s) not authorized: ${err.envNames.join(", ")}`);
         this.send403(res, `Egress denied: ${err.message}`);
@@ -996,56 +945,14 @@ export class EgressProxy {
     const method = req.method || "GET";
 
     try {
-      // Reject chunked bodies: we must buffer and rewrite the whole body.
-      const transferEncoding = req.headers["transfer-encoding"];
-      if (transferEncoding && transferEncoding.toLowerCase().includes("chunked")) {
-        this.log("BLOCK", method, targetHost, "chunked encoding not supported for secret hosts");
-        this.sendMitmError(res, 411, "Length Required: chunked encoding is not supported for secret hosts");
-        return;
-      }
-
-      // Read the whole body so we can scan it for placeholders.
-      const chunks: Buffer[] = [];
-      let totalLen = 0;
-      for await (const chunk of req) {
-        totalLen += chunk.length;
-        if (totalLen > MITM_MAX_BODY_SIZE) {
-          this.sendMitmError(res, 413, "Payload Too Large");
-          return;
-        }
-        chunks.push(chunk as Buffer);
-      }
-      const body = Buffer.concat(chunks);
-
       // Convert rawHeaders to [name, value] pairs for rewriting.
       const rawHeaders: [string, string][] = [];
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         rawHeaders.push([req.rawHeaders[i], req.rawHeaders[i + 1]]);
       }
 
-      // Rewrite headers and body, swapping placeholders for real secrets.
+      // Rewrite headers, swapping placeholders for real secrets.
       const rewrittenHeaders = rewriteHeaders(rawHeaders, this.config.secrets, targetHost);
-      const rewrittenBody = rewriteBody(body, this.config.secrets);
-
-      // Fix Content-Length if body size changed after placeholder replacement.
-      const origContentLength = req.headers["content-length"];
-      if (rewrittenBody !== body && origContentLength) {
-        const origLen = parseInt(origContentLength, 10);
-        // Remove the stale Content-Length; Node.js will recalculate (or we set the correct value).
-        let clRemoved = false;
-        for (let i = 0; i < rewrittenHeaders.length; i++) {
-          if (rewrittenHeaders[i][0].toLowerCase() === "content-length") {
-            rewrittenHeaders[i][1] = rewrittenBody.length.toString();
-            clRemoved = true;
-            break;
-          }
-        }
-        if (!clRemoved) {
-          rewrittenHeaders.push(["content-length", rewrittenBody.length.toString()]);
-        }
-        this.log("DEBUG", method, `${targetHost}:${targetPort}`,
-          `Content-Length adjusted: ${origLen} → ${rewrittenBody.length}`);
-      }
 
       // Forward to the upstream server over TLS.
       const upstreamOpts: https.RequestOptions = {
@@ -1109,15 +1016,21 @@ export class EgressProxy {
         this.log("DEBUG", method, `${targetHost}:${targetPort}`, "keepalive set on socket (async)");
       });
 
-      upstreamReq.write(rewrittenBody);
-      upstreamReq.end();
+      req.on("data", (c: Buffer) => this.addBytes(targetHost, c.length, 0));
+      req.on("error", (err) => {
+        this.log("ERROR", method, `${targetHost}:${targetPort}`, `client request stream error: ${err.message}`);
+        upstreamReq.destroy(err);
+      });
+      req.pipe(upstreamReq);
 
       this.log("MITM", method, `${targetHost}:${targetPort}`, "secret injection active");
     } catch (err: any) {
       if (err instanceof PlaceholderViolation) {
+        req.resume();
         this.log("BLOCK", method, targetHost, `placeholder(s) not authorized: ${err.envNames.join(", ")}`);
         this.sendMitmError(res, 403, `Egress denied: ${err.message}`);
       } else {
+        req.resume();
         this.log("ERROR", method, `${targetHost}:${targetPort}`, err.message);
         this.sendMitmError(res, 502, `Bad Gateway: ${err.message}`);
       }

@@ -316,9 +316,8 @@ async function testMitmSecretInjection() {
       });
     });
 
-    // Send an HTTPS request with placeholders in both a header and the body.
-    // The body replacement changes its byte length, exercising Content-Length repair.
-    const requestBody = "token=psbx-sec-test-abc";
+    // Send an HTTPS request with a placeholder in a header and a streamed body.
+    const requestBody = "payload-data-streamed";
     const request = [
       "POST /test HTTP/1.1",
       "Host: 127.0.0.1",
@@ -353,7 +352,7 @@ async function testMitmSecretInjection() {
 
     // Verify the upstream received the rewritten token (real value, not placeholder).
     assert(capturedHeaders !== undefined, "upstream received headers");
-    assertEq(capturedBody, "token=real-token-value", "placeholder replaced in upstream body");
+    assertEq(capturedBody, "payload-data-streamed", "body streamed through unmodified");
     if (capturedHeaders) {
       const authHeader = capturedHeaders["authorization"] as string | undefined;
       assert(authHeader !== undefined, "authorization header present in upstream");
