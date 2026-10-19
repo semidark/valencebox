@@ -126,28 +126,42 @@ cp "/tmp/sandbox-rootfs${SUFFIX}/boot/vmlinuz-$KREL" "images/vmlinuz${SUFFIX}.bi
 cp "/tmp/sandbox-rootfs${SUFFIX}/boot/initrd.img-$KREL" "images/initramfs${SUFFIX}.bin"
 rm -rf "/tmp/sandbox-rootfs${SUFFIX}/boot/*"
 
-# Root image size: at least 5 GiB for growth (qcow2 is sparse). 25% slack.
-MIN_ROOT_MB=5120
+# Root image size: at least 25 GiB for growth (qcow2 is sparse — the virtual
+# ceiling costs nothing on the host until written). 5 GiB ran out as soon as
+# Node + Python + uv + toolchains were installed inside the VM. 25% slack.
+MIN_ROOT_MB="${MIN_ROOT_MB:-25600}"
 SZ=$(du -sm "/tmp/sandbox-rootfs${SUFFIX}" | cut -f1); SZ=$((SZ + SZ / 4))
 [ "$SZ" -lt "$MIN_ROOT_MB" ] && SZ=$MIN_ROOT_MB
 
 # Create raw ext4 image via Docker, then convert to qcow2.
+# The image is created sparse (count=0 + seek) so a 25 GiB staging file
+# does not write 25 GiB of zeros to the host disk.
 # The mkfs container runs as root and fixes ownership of SSH authorized_keys
 # (created by the build user) inline before embedding them in the image.
-dd if=/dev/zero of="/tmp/sandbox-rootfs${SUFFIX}.img" bs=1M count="$SZ" status=none
+dd if=/dev/zero of="/tmp/sandbox-rootfs${SUFFIX}.img" bs=1M count=0 seek="$SZ" status=none
 docker run --rm --platform="$PLATFORM_FLAG" --security-opt label=disable \
   -v "/tmp/sandbox-rootfs${SUFFIX}:/rootfs" \
   -v "/tmp/sandbox-rootfs${SUFFIX}.img:/rootfs.img" \
   ubuntu:24.04 sh -c '
     apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null
     chown -R root:root /rootfs/root/.ssh
+    # The ubuntu base image ships /usr/sbin/policy-rc.d (exit 101) to stop
+    # invoke-rc.d from starting daemons during Docker builds. A bootable VM
+    # must not inherit it — every apt-installed service (postgresql, polkit,
+    # ...) refuses to start until it is removed.
+    rm -f /rootfs/usr/sbin/policy-rc.d
+    # mkfs.ext4 -d copies the top-level directory ownership onto / inside
+    # the guest. The staging dir was created by the unprivileged build user
+    # (uid 1000); without this, / ends up 1000:1000 and sshd StrictModes,
+    # systemd-tmpfiles, and davfs2 all misbehave.
+    chown 0:0 /rootfs
     mkfs.ext4 -q -d /rootfs -L sandboxroot /rootfs.img
   '
 "$QEMU_IMG" convert -f raw -O qcow2 "/tmp/sandbox-rootfs${SUFFIX}.img" "images/root${SUFFIX}.qcow2"
 rm -f "/tmp/sandbox-rootfs${SUFFIX}.img"
 
-# Workspace disk
-WSZ="${WORKSPACE_MB:-1024}"
+# Workspace disk (sparse qcow2; 1 GiB was too small for real projects)
+WSZ="${WORKSPACE_MB:-10240}"
 rm -f "images/workspace${SUFFIX}.qcow2"
 "$QEMU_IMG" create -f qcow2 "images/workspace${SUFFIX}.qcow2" "${WSZ}M"
 

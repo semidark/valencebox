@@ -43,7 +43,16 @@ export class HttpShare {
     app.use(
       "/",
       nepheleServer({
-        adapter: new FileSystemAdapter({ root: workspaceDir }),
+        adapter: new FileSystemAdapter({
+          root: workspaceDir,
+          // The adapter default ("meta-files") stores WebDAV dead properties
+          // and locks as .nephelemeta sidecars *inside the served tree* —
+          // which is the user's real host repo, so they leak into git.
+          // davfs2 keeps unix attributes locally (use_locks 0 is set in the
+          // guest), so honest refusal is tolerated and keeps the repo clean.
+          properties: "disallow",
+          locks: "disallow",
+        }),
         authenticator: new CustomAuthenticator({
           getUser: async (username: string) => {
             if (username === "valence") return new User({ username });

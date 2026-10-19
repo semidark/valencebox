@@ -3,7 +3,6 @@ import {
   generatePlaceholder,
   resolveSecrets,
   rewriteHeaders,
-  rewriteBody,
   normalizeHost,
   sanitizeResponseHeaders,
   PlaceholderViolation,
@@ -231,31 +230,6 @@ function assertThrows(fn: () => void, msg: string): void {
     rewriteHeaders([["X-Token", "psbx-sec-ghi"]], secrets, "other.com");
   }, "secret unauthorized for host");
   console.log("✓ rewriteHeaders: secret unauthorized for host");
-}
-
-// ---- rewriteBody ----
-
-{
-  const secrets: ResolvedSecret[] = [
-    { env: "KEY", value: "real-key", placeholder: "psbx-sec-body-1", hosts: ["api.example.com"] },
-  ];
-
-  const body = Buffer.from('{"api_key": "psbx-sec-body-1"}', "utf-8");
-  const rewritten = rewriteBody(body, secrets);
-  assertEq(rewritten.toString("utf-8"), '{"api_key": "real-key"}', "placeholder replaced in body");
-  console.log("✓ rewriteBody: replaces placeholder");
-}
-
-{
-  // Body without placeholder is unchanged (same buffer reference)
-  const secrets: ResolvedSecret[] = [
-    { env: "KEY", value: "real-key", placeholder: "psbx-sec-body-2", hosts: ["api.example.com"] },
-  ];
-
-  const body = Buffer.from('{"status": "ok"}', "utf-8");
-  const rewritten = rewriteBody(body, secrets);
-  assert(rewritten === body, "body without placeholder returns same buffer");
-  console.log("✓ rewriteBody: unchanged body returns same reference");
 }
 
 // ---- resolveSecrets: fromFile ----

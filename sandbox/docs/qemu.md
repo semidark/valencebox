@@ -96,8 +96,8 @@ x86 guests on Intel Macs.
   not cross-platform boot validation.
 - `test:qmp`: minimal frozen x86 QEMU, connect/capabilities, query status and
   process-stop assertion; not graceful guest powerdown or snapshot verification.
-- `test:boot`: x86 serial login, hostname, workspace disk and systemd unit state;
-  no host share/proxy or actual file-sync round-trip. Details are in Phases 1–2.
+- `test:boot`: x86 serial login, hostname, workspace disk and systemd unit state,
+  fw_cfg share config reading, and host-guest sync round-trip. Details are in Phases 1–2.
 - `test:share`: host WebDAV auth/CRUD/traversal checks without a guest (Phase 3).
 - `test:ui`: existing **legacy renderer-stub** script (`ui-smoke.js` plus
   `fake-preload.js`), replaying old restored/sync/conflict/Wisp and serial/input
@@ -120,8 +120,8 @@ mappings are:
 
 | Guest / resolved accel | Machine | Virtio transport / details |
 |---|---|---|
-| x86-64 hardware-accel branch (KVM / WHPX when resolved available) | `microvm` | `virtio-*-device` (MMIO); adds `reboot=t` |
-| x86-64 `tcg,thread=multi` (including forced `accel=tcg`) | `pc` (i440fx) | `virtio-*-pci`; HPET + ACPI PM timer for TSC calibration |
+| x86-64 hardware-accel branch (KVM / WHPX when resolved available) | `microvm` | `virtio-*-device` (MMIO); adds `reboot=t`; CPU `host` on KVM/HVF, default on WHPX |
+| x86-64 `tcg,thread=multi` (including forced `accel=tcg`) | `pc` (i440fx) | `virtio-*-pci`; HPET + ACPI PM timer for TSC calibration; CPU `max` |
 | aarch64 HVF | `virt,gic-version=3` | `virtio-*-pci`, CPU `host`, console `ttyAMA0` |
 | aarch64 `tcg,thread=multi` | `virt,gic-version=3` | `virtio-*-pci`, CPU `max`, console `ttyAMA0` |
 
@@ -376,10 +376,11 @@ accels.push("tcg,thread=multi");   // always last (fallback)
 **Current verification (`npm run test:boot`):** `test/boot.test.ts` explicitly
 uses the **x86-64** profile and unsuffixed images, defaulting to TCG (`ACCEL`
 can override it). It waits for the serial login prompt and root auto-login,
-checks hostname `sandbox`, `/workspace` mounted from `/dev/vdb` as ext4, and
-active `mount-share` / `workspace-sync` systemd units. Cleanup calls
-`VmManager.stop()`. It does **not** start a host WebDAV share or proxy, verify
-file synchronization, test ARM/HVF, or prove graceful guest shutdown.
+checks hostname `sandbox`, `/workspace` mounted from `/dev/vdb` as ext4,
+active `mount-share` / `workspace-sync` systemd units, validates reading the
+WebDAV share config from `fw_cfg` sysfs, confirms a host seed file synchronizes
+to `/workspace`, and checks that no `.nephelemeta` sidecars were created. Cleanup calls
+`VmManager.stop()` and stops the host share. It does not test ARM/HVF or prove graceful guest shutdown.
 
 ### Phase 2 — QMP control plane
 

@@ -70,7 +70,10 @@ RUN KREL=$(ls /lib/modules | head -1); \
 # virtio_mmio is needed for -machine microvm (non-PCI transport);
 # virtio_blk/ virtio_net are built-in on x86_64 but listed for safety;
 # rtc_pl031 provides host-clock time on aarch64 virt (harmless no-op on x86_64,
-# where it simply won't load); port/token passed via kernel cmdline.
+# where it simply won't load); qemu_fw_cfg is baked in (from
+# linux-modules-extra) so the fw_cfg sysfs tree exists even if /lib/modules
+# in root.qcow2 drifts from the booted kernel — without it mount-share.sh
+# silently loses the share config and MITM CA; port/token passed via kernel cmdline.
 RUN printf '%s\n' \
     virtio_blk \
     virtio_net \
@@ -80,6 +83,7 @@ RUN printf '%s\n' \
     virtio_rng \
     virtio_balloon \
     rtc_pl031 \
+    qemu_fw_cfg \
     > /etc/initramfs-tools/modules
 
 # MODULES=list keeps only the modules named above in the initramfs. The default
@@ -92,6 +96,11 @@ RUN sed -i 's/^MODULES=.*/MODULES=list/' /etc/initramfs-tools/initramfs.conf
 # Rebuild initramfs with the explicit module list baked in
 RUN KREL=$(ls /lib/modules | head -1) && \
     mkinitramfs -o /boot/initrd.img-"$KREL" "$KREL"
+
+# Fail the build if qemu_fw_cfg did not make it into the initramfs — a silent
+# miss here loses the WebDAV share config and MITM CA at every VM boot.
+RUN KREL=$(ls /lib/modules | head -1) && \
+    lsinitramfs /boot/initrd.img-"$KREL" | grep -q 'qemu_fw_cfg'
 
 # Strip irrelevant kernel modules (microvm/pc: no sound, GPU, USB, wireless)
 RUN KREL=$(ls /lib/modules | head -1) && \
@@ -123,9 +132,15 @@ RUN KREL=$(ls /lib/modules | head -1) && \
 # Create mount points for workspace disk mount and WebDAV mount-share
 RUN mkdir -p /workspace /host-workspace
 
-# davfs2 config: no locking, no Expect:100 (SLIRP), short timeouts, cache on root fs
+# davfs2 config: no locking, no Expect:100 (SLIRP), short timeouts, cache on root fs.
+# NOTE: davfs2 has no "[DEFAULT]" section — options are global only when they
+# appear before any [mountpoint] section. A literal [DEFAULT] header made every
+# option below it apply to a mount point named "DEFAULT", so the defaults
+# (dir_refresh 60, delay_upload 10) silently won. dir_refresh/file_refresh 1
+# make unison see host changes promptly; delay_upload 0 pushes guest edits back
+# without the 10s hold.
 RUN mkdir -p /etc/davfs2 && \
-    printf '[DEFAULT]\nuse_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\ngui_optimize 1\ncache_dir /var/cache/davfs2\ncache_size 50\n' > /etc/davfs2/davfs2.conf && \
+    printf 'use_locks 0\nuse_expect100 0\nconnect_timeout 10\nread_timeout 30\ngui_optimize 1\ndir_refresh 1\nfile_refresh 1\ndelay_upload 0\ncache_dir /var/cache/davfs2\ncache_size 50\n' > /etc/davfs2/davfs2.conf && \
     chmod 0644 /etc/davfs2/davfs2.conf && chown 0:0 /etc/davfs2 /etc/davfs2/davfs2.conf
 
 # Serial console: systemd serial-getty generator creates

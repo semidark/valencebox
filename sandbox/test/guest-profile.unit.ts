@@ -13,8 +13,10 @@ function assert(cond: boolean, msg: string): void {
   const p = x86_64Profile(ROOT, WS);
   assert(p.arch === "x86_64", "arch is x86_64");
   assert(p.qemuBinary === "qemu-system-x86_64", "qemu binary is x86_64");
-  assert(p.cpuFor("kvm") === undefined, "no -cpu for x86_64");
-  assert(p.cpuFor("tcg,thread=multi") === undefined, "no -cpu for x86_64 TCG");
+  assert(p.cpuFor("kvm") === "host", "cpuFor(kvm) → host (native ISA extensions)");
+  assert(p.cpuFor("hvf") === "host", "cpuFor(hvf) → host");
+  assert(p.cpuFor("whpx") === undefined, "cpuFor(whpx) → default (QEMU 9.2.4 rejects host under WHPX)");
+  assert(p.cpuFor("tcg,thread=multi") === "max", "cpuFor(tcg) → max");
 
   assert(p.rootImage === ROOT, "rootImage from factory");
   assert(p.workspaceImage === WS, "workspaceImage from factory");
