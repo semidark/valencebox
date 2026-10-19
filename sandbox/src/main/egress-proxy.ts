@@ -695,16 +695,17 @@ export class EgressProxy {
       }
 
       const rewrittenHeaders = rewriteHeaders(rawHeaders, this.config.secrets, targetHost);
-      const headers: Record<string, string> = Object.fromEntries(rewrittenHeaders);
-      delete headers["proxy-authorization"];
-      delete headers["proxy-connection"];
+      const filteredHeaders = rewrittenHeaders.filter(([name]) => {
+        const lower = name.toLowerCase();
+        return lower !== "proxy-authorization" && lower !== "proxy-connection";
+      });
 
       const options: https.RequestOptions = {
         hostname: targetHost,
         port,
         path,
         method,
-        headers,
+        headers: filteredHeaders.flat(),
       };
 
       const forwardReq = http.request(options, (forwardRes) => {
@@ -953,6 +954,10 @@ export class EgressProxy {
 
       // Rewrite headers, swapping placeholders for real secrets.
       const rewrittenHeaders = rewriteHeaders(rawHeaders, this.config.secrets, targetHost);
+      const filteredHeaders = rewrittenHeaders.filter(([name]) => {
+        const lower = name.toLowerCase();
+        return lower !== "proxy-authorization" && lower !== "proxy-connection";
+      });
 
       // Forward to the upstream server over TLS.
       const upstreamOpts: https.RequestOptions = {
@@ -960,7 +965,7 @@ export class EgressProxy {
         port: targetPort,
         path: req.url,
         method: req.method,
-        headers: Object.fromEntries(rewrittenHeaders),
+        headers: filteredHeaders.flat(),
         rejectUnauthorized: process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0",
       };
       // Custom upstream CA bundle (D9): verify against the configured CA in

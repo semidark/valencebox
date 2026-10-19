@@ -58,6 +58,7 @@ async function main() {
       workspaceImage,
       kernelCmdline: profile.kernelCmdline,
       shareConfigFile,
+      portForwards: [],
     });
 
     if (VERBOSE) {
@@ -137,9 +138,58 @@ async function main() {
     if (!synced) throw new Error("host seed file did not sync into /workspace");
     console.log("✓ host→guest sync round-trip");
 
-    // No .nephelemeta sidecars leaked into the guest workspace.
-    await run("ls -a /workspace | grep -c nephelemeta; echo META_DONE", /0[\s\S]*META_DONE/, 10000);
-    console.log("✓ no .nephelemeta sidecars in /workspace");
+    // Guest edits must propagate back to the host workspace (bidirectional sync).
+    // Write via a dedicated file in /tmp then mv to prevent partial writes.
+    // Use a unique per-run filename and payload so previous runs on persistent qcow2 cannot false-pass.
+    const guestRunId = Date.now().toString(36);
+    const guestFileName = `guest-created-${guestRunId}.txt`;
+    const guestPayload = `hello-from-guest-${guestRunId}`;
+    await run(
+      `echo ${guestPayload} > /tmp/guest-tmp && mv /tmp/guest-tmp /workspace/${guestFileName}; echo GUEST_SYNC_READY`,
+      /[\r\n]GUEST_SYNC_READY[\r\n]/,
+      5000
+    );
+    const guestFilePath = path.join(hostWorkspace, guestFileName);
+    let guestSynced = false;
+    for (let i = 0; i < 20 && !guestSynced; i++) {
+      if (fs.existsSync(guestFilePath)) {
+        try {
+          const content = fs.readFileSync(guestFilePath, "utf-8").trim();
+          if (content === guestPayload) {
+            guestSynced = true;
+            break;
+          }
+        } catch {
+          // File may be midway through write
+        }
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (!guestSynced) throw new Error("guest file did not sync back to host workspace");
+    console.log("✓ guest→host sync round-trip");
+
+    // No .nephelemeta sidecars leaked into the guest workspace or host tree (recursive check).
+    // find runs without pipe to wc so errors (e.g. unreadable/missing dir) exit non-zero and fail.
+    await run(
+      "find_out=$(find /workspace -name '*nephelemeta*') && [ -z \"$find_out\" ] && echo META_CHECK_OK || echo META_CHECK_FAIL; echo META_CHECK_DONE",
+      /[\r\n]META_CHECK_OK[\r\n][\s\S]*META_CHECK_DONE/,
+      10000
+    );
+
+    const hasNepheleMeta = (dir: string): boolean => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.includes("nephelemeta")) return true;
+        if (entry.isDirectory()) {
+          if (hasNepheleMeta(path.join(dir, entry.name))) return true;
+        }
+      }
+      return false;
+    };
+    if (hasNepheleMeta(hostWorkspace)) {
+      throw new Error(".nephelemeta sidecars detected in host workspace tree");
+    }
+    console.log("✓ no .nephelemeta sidecars in /workspace or host tree");
 
     console.log("ALL BOOT TESTS PASSED");
   } finally {
