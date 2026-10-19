@@ -25,7 +25,7 @@ Restart the app after changing the file — config is read at startup only.
   "memMb": 4096,                  // guest RAM
   "smp": 2,                       // guest vCPUs
   "balloonMinMb": 2048,           // memory-balloon floor
-  "workspaceDir": "~/src/project", // host dir served to the guest as /workspace
+  "workspaceDir": "/home/you/src/project", // absolute path (JSON: no ~ expansion)
   "gpuEnabled": true,             // false disables Chromium GPU accel (broken GLX hosts)
   "swapCtrlCmd": false,           // macOS: swap physical Ctrl/Cmd for terminal control
 
@@ -64,10 +64,10 @@ Restart the app after changing the file — config is read at startup only.
 | Key | Default | Notes |
 |---|---|---|
 | `guest` | auto | `x86_64` or `aarch64`. Auto-selects aarch64 only on Apple Silicon with ARM assets installed. |
-| `accel` | `"auto"` | `kvm` (Linux), `hvf` (Apple Silicon), `whpx` (Windows); always falls back to `tcg,thread=multi`. On x86-64, hardware accel runs the `microvm` machine; TCG runs `pc`. |
+| `accel` | `"auto"` | `kvm` (Linux), `hvf` (Apple Silicon), `whpx` (Windows); `tcg,thread=multi` is appended last as a candidate. Hardware accel on x86-64 runs the `microvm` machine; TCG runs `pc`. Fallback is a candidate, not a guaranteed working boot: machine and CPU arguments are chosen before launch, so macOS auto mode maps bare `tcg` to `microvm` (a mapping gap, not a verified boot path) and HVF startup failure may still fail launch. See `docs/qemu.md`. |
 | `memMb` / `smp` | 4096 / 2 | Guest RAM and vCPUs. |
 | `balloonMinMb` | 2048 | The host may reclaim guest memory down to this floor. |
-| `workspaceDir` | userData dir | Host directory served to the guest as `/workspace` (canonical side of the sync). `node_modules` and `.git` are never synced — run package managers inside the guest. |
+| `workspaceDir` | userData dir | Host directory served to the guest as `/workspace` (canonical side of the sync). Use an **absolute path in JSON** — `~` is not expanded for this config value (set it via the shell `WORKSPACE_DIR=~/…` env instead). `node_modules` and `.git` are never synced — run package managers inside the guest. |
 | `gpuEnabled` | `true` | Set `false` on hosts with broken GLX (e.g. SSH-forwarded X) to silence GPU-process errors. |
 | `swapCtrlCmd` | `false` | macOS terminal key handling. |
 

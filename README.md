@@ -6,13 +6,19 @@
 > ValenceBox runs a QEMU-backed x86-64 or aarch64 Linux microVM inside an
 > Electron app, providing an isolated coding sandbox for an AI agent with
 > native-speed file I/O, bidirectional host↔guest file sync, and controlled
-> network egress over SLIRP.
+> network egress. On Linux (the default) egress is strictly contained through a
+> virtio-serial tunnel with no guest NIC; SLIRP remains the opt-out and the
+> fallback for unverified platforms.
 
 A secure, high-performance coding sandbox for an AI agent: an x86-64 or aarch64
 Ubuntu 24.04 microVM running under QEMU inside an Electron app. The agent is
 isolated from the host but gets native-speed file I/O against a real ext4 disk,
 bidirectional host↔guest file sync via WebDAV + unison, and controlled network
-access over loopback SLIRP.
+access. On Linux the default is **strict containment**: the VM boots with no NIC
+(the only guest↔host path is a multiplexed virtio-serial tunnel), and all guest
+egress is forced through the host `EgressProxy`. Legacy loopback SLIRP is the
+explicit opt-out (`egress.enforce: false`) and the fallback where the tunnel is
+not yet verified. See `sandbox/docs/qemu.md` and `sandbox/docs/CONFIG.md`.
 
 ## Layout
 

@@ -2,9 +2,13 @@
 
 The original plan added a host-process HTTP CONNECT/forward proxy with
 allowlist/denylist policy and optional TLS interception for secret injection.
-It did **not** replace unrestricted SLIRP with a mandatory egress gate in the
-current implementation. Guest proxy environment variables configure cooperating
-HTTP(S) clients; they do not force all guest traffic through the proxy.
+In the current implementation this proxy is the enforcement point for guest
+egress, and on Linux it is a **mandatory** egress gate by default: strict mode
+(`egress.enforce`, default true) boots the VM with `-nic none` so every guest
+request reaches the proxy over the virtio-serial tunnel. In legacy mode
+(`egress.enforce: false`) the VM keeps unrestricted SLIRP and guest proxy
+environment variables configure cooperating clients only — they do not force
+all guest traffic through the proxy.
 
 ## Current status — implementation evidence and verification scope
 
@@ -19,9 +23,11 @@ is separate from current verification.
 
 - `src/main/main.ts` starts `EgressProxy` in Electron's main process, resolves
   secrets, generates a per-start auth token, and passes proxy config to
-  `VmManager`/`QemuProcess`. `src/main/qemu.ts` emits unrestricted
-  `-netdev user,id=net0` SLIRP plus a virtio NIC: no `restrict=on` or firewall
-  enforcing proxy-only egress is configured.
+  `VmManager`/`QemuProcess`. In strict mode (`egress.enforce`, default true on
+  Linux) `src/main/qemu.ts` boots the VM with `-nic none` and no SLIRP device;
+  guest streams are injected into the proxy/share over the mux tunnel. In legacy
+  mode it emits an unrestricted `-netdev user,id=net0` SLIRP plus a virtio NIC:
+  no `restrict=on` or firewall enforcing proxy-only egress is configured.
 - `guest/usr/local/libexec/mount-share.sh` writes HTTP(S) proxy environment
   variables with URL credentials `valencebox:<token>` and a `no_proxy` list
   including `127.0.0.1,localhost,10.0.2.2,::1`. The share server is separate from
@@ -43,10 +49,12 @@ is separate from current verification.
   CONNECT and forwarding; `[]` disables the port check. App defaults are
   policy `"none"`, ports `[80, 443]`, `allowAll: false`, and MITM off. Absent
   `egress` therefore means no host filtering, not all proxy ports allowed.
-- The proxy defaults to listening on `0.0.0.0` (configurable `listenHost`), while
-  WebDAV binds to `127.0.0.1`. QEMU host forwards default to `127.0.0.1` unless
-  explicitly overridden; the app defaults to SSH 2222 → 22, with `[]` disabling
-  forwards. These listener choices are distinct from guest egress enforcement.
+- The proxy binds `127.0.0.1` in strict mode (the guest reaches it through the
+  mux tunnel, never over TCP) and defaults to `0.0.0.0` in legacy mode
+  (configurable `listenHost`); the WebDAV share binds to `127.0.0.1` in both.
+  QEMU host forwards default to `127.0.0.1` unless explicitly overridden; the
+  app defaults to SSH 2222 → 22, with `[]` disabling forwards. These listener
+  choices are distinct from guest egress enforcement.
 
 ### MITM, secrets, and remaining implementation limitations
 
@@ -107,15 +115,19 @@ npm run test:egress
 npm run test:egress:integration
 ```
 
-- `test:egress` runs only `test/egress-proxy.unit.ts`: host policy and
-  normalization, secret resolution/env validation, header mismatch/replacement,
-  and response sanitization assertions.
+- `test:egress` runs `test/egress-proxy.unit.ts` (host policy and normalization,
+  secret resolution/env validation, header mismatch/replacement, response
+  sanitization), `test/egress-mux.unit.ts` (injection/chaining/tproxy unit), and
+  `test/mux-channel.unit.ts` (framing, credit flow control, HELLO reset,
+  PING/PONG liveness).
 - `test:egress:integration` runs `test/egress-proxy.integration.ts`: leaf SAN,
   signature and cache assertions; Basic auth; CONNECT host policy; MITM
   header secret injection with streamed body and a delayed response;
   one over-limit 503; outer-request rate limiting; strict custom upstream CA;
-  and log sink assertions. The certificate fixture asserts CA subject and
-  leaf signing behavior, not every CA property mentioned in its comments.
+  secret-forward chaining through an upstream proxy (origin rewrite + upstream
+  proxy-auth forwarding); and log sink assertions. The certificate fixture
+  asserts CA subject and leaf signing behavior, not every CA property mentioned
+  in its comments.
 - The integration suite's upstream fixture helper still invokes host `openssl`.
   `testMitmSecretInjection` uses a self-signed upstream without a custom CA and
   inherits upstream verification behavior from the host environment. The old

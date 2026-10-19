@@ -4,13 +4,17 @@ Status: **Phase 1 + Phase 2 implemented** (strict mode default on Linux; SLIRP
 is the opt-out). See "Implementation status" at the end for verified behavior
 and known gaps. Paths are relative to `sandbox/`.
 
-## Problem
+## Problem and motivation
 
-Today the VM runs QEMU with an unrestricted SLIRP user network
-(`-netdev user,id=net0` plus a virtio NIC). Proxy environment variables steer
-cooperating clients to the host-side `EgressProxy`, but any guest process can
-ignore them and egress directly through SLIRP. There is no enforced boundary:
-**the current design cannot guarantee that guest traffic passes host policy.**
+This documents the strict-mode design now implemented on Linux, and why it was
+introduced. In **legacy** mode the VM runs QEMU with an unrestricted SLIRP user
+network (`-netdev user,id=net0` plus a virtio NIC). Proxy environment variables
+steer cooperating clients to the host-side `EgressProxy`, but any guest process
+can ignore them and egress directly through SLIRP, so there is no enforced
+boundary: legacy networking cannot guarantee that guest traffic passes host
+policy. **Strict mode (the Linux default) closes this by construction** — no
+NIC means every guest egress must pass through the tunnel and therefore host
+policy.
 
 ## Non-negotiable requirements
 
@@ -68,9 +72,10 @@ host → 127.0.0.1:2222 (SSH debug) ─────── OPEN fwd:22 → guest 
   root guest can open arbitrary streams into the proxy either way. Hostname
   and port policy at `EgressProxy` is the actual boundary.
 - In strict mode the proxy listener binds `127.0.0.1` (legacy mode keeps
-  `0.0.0.0` for SLIRP reachability). Removing the TCP path also stops
-  leaking the proxy token through guest `/proc/cmdline` in the long run;
-  until then, delivery moves from kernel cmdline to the mux handshake.
+  `0.0.0.0` for SLIRP reachability). The proxy/share tokens are still delivered
+  to the guest on the kernel cmdline today; moving delivery to the mux handshake
+  (so tokens do not appear in the world-readable guest `/proc/cmdline`) is a
+  noted follow-up, not yet done.
 - Proxy/share tokens remain in place as defense-in-depth; they were never
   secret from the root guest and are not a compartment boundary.
 
@@ -117,7 +122,7 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
 ```jsonc
 {
   "egress": {
-    "enforce": true,             // default flips to true at M3; false = legacy SLIRP
+    "enforce": true,             // default true on Linux; false = legacy SLIRP
     "upstreamProxy": "http://user:pass@proxy.corp.example:8080",  // optional
     // … existing policy knobs unchanged …
   },
@@ -127,16 +132,19 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
 }
 ```
 
-- `egress.enforce?: boolean` — strict mode. Default `true` once the M3 gate
-  passes; before that the shipped default is `false`. `false` selects the
-  legacy SLIRP path unchanged.
+- `egress.enforce?: boolean` — strict mode. Default `true` on Linux (the M3 gate
+  passed: strict boot is verified on KVM and TCG). `false` selects the legacy
+  SLIRP path unchanged. On platforms where the tunnel is unverified (macOS,
+  Windows) a requested strict mode falls back to legacy with a warning (see
+  below).
 - `egress.upstreamProxy?: string` — **host-side** proxy chaining for
-  corporate networks. All `EgressProxy` outbound connections (CONNECT
-  tunnels, plain-HTTP forwarding, MITM re-encryption) dial through the
-  upstream via CONNECT. Host policy and port policy still apply **before**
-  chaining; MITM secret injection still works because TLS still terminates
-  at `EgressProxy`. This replaces the interim guest-side `upstreamProxy`
-  fw_cfg workaround (reverted at M2).
+  corporate networks. `EgressProxy` outbound connections dial through the
+  upstream proxy: CONNECT tunnels use HTTP CONNECT to the upstream, while plain
+  (non-TLS) forwarded requests are sent to the upstream in **absolute-form** with
+  the upstream `Proxy-Authorization`. MITM re-encryption tunnels through the
+  upstream and TLS still terminates at `EgressProxy`. Host policy and port policy
+  still apply **before** chaining. This replaces the interim guest-side
+  `upstreamProxy` fw_cfg workaround (reverted at M2).
 - `egress.upstreamNoProxy?: string | string[]` — no_proxy-style exceptions
   honored when chaining: matching targets (hostnames, `.suffix` domains, IP
   literals, CIDR ranges, `*`) are dialed **directly** — internal hosts that
@@ -155,7 +163,7 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
 | # | Deliverable | Gate |
 |---|---|---|
 | M1 | Protocol spec (`docs/mux-protocol.md`); config knobs and UDP fail-closed validation; strict QEMU args (`-nic none`, mux chardev + virtserialport; Unix socket on Linux/macOS, loopback TCP on Windows — named pipes have a chardev read bug); golden-args strict cases per machine type, including aarch64 `virt` (which skips `-nodefaults`, making `-nic none` mandatory) | `test:unit` |
-| M2 | `src/main/mux-channel.ts` (demux, per-stream Duplex shim with synthetic `remoteAddress = "mux:<id>"` so rate-limit buckets don't collapse to `"?"`, batched CREDIT flow control, HELLO reset, PING/PONG liveness); stream injection into proxy and share servers; `EgressProxy` upstream chaining; revert the interim fw_cfg `upstreamProxy` diff | `test:egress` + new mux/chaining unit tests against a mock upstream proxy |
+| M2 | `src/main/mux-channel.ts` (demux, per-stream Duplex shim with synthetic `remoteAddress = "mux-guest"` so rate-limit buckets don't collapse to `"?"`, batched CREDIT flow control, HELLO reset, PING/PONG liveness); stream injection into proxy and share servers; `EgressProxy` upstream chaining; revert the interim fw_cfg `upstreamProxy` diff | `test:egress` + new mux/chaining unit tests against a mock upstream proxy |
 | M3 | Rust guest daemon (`guest-mux/`, static musl via `rust:alpine` buildx stage, non-blocking + poll); `valencebox-mux.service` (`Restart=always`); `mount-share.sh` re-pointed from `10.0.2.2` to guest loopback; drop `network-online.target` dependency; image mode detection via `/dev/virtio-ports/mux` presence; **default flips to `enforce: true`** | New strict `test:boot` variant: no `eth0`, mux service active, WebDAV-over-tunnel sync active, curl via relay — passing on KVM **and** TCG |
 | M4 | TCP portForwards over the mux (host listener → `OPEN fwd:<port>` → guest dials loopback); strict proxy binds `127.0.0.1`; docs (AGENTS.md, qemu.md, HARDENING.md); benchmark rerun for the record | Full suite, both modes |
 

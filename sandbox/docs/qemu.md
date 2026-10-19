@@ -82,10 +82,10 @@ x86 guests on Intel Macs.
 |---|---|
 | Emulator | `qemu-system-x86_64` or `qemu-system-aarch64`; bundled binary preferred, `$PATH` fallback in the resolver |
 | Guest | Ubuntu 24.04, `linux-image-virtual`, initramfs, virtio devices, systemd |
-| Host↔guest share | Plain-HTTP WebDAV over SLIRP, authenticated with a per-session token |
+| Host↔guest share | Plain-HTTP WebDAV, authenticated with a per-session token, reached over the mux tunnel (strict) or loopback SLIRP (legacy) |
 | Working tree | Native qcow2 (`/dev/vdb`), mirrored by in-guest **unison**, not rsync/inotify |
 | Source of truth | Host dir is canonical; qcow2 is a synced cache, but still mutable disk state relevant to any future RAM restore |
-| Egress | Proxy-aware clients use `EgressProxy`; default host policy is `none`, configured port restrictions still apply; direct SLIRP bypass is not blocked |
+| Egress | Strict (Linux default): no NIC; all guest egress is forced through `EgressProxy` over the mux tunnel (configuration, not just steering). Legacy (`egress.enforce: false`): proxy-aware clients use `EgressProxy`; direct SLIRP bypass is not blocked |
 | Snapshots | **Unimplemented in the QEMU app.** Legacy `saveSnapshot` IPC handler in `main.ts` is a no-op; no QEMU save/restore backend |
 | Terminal | PTY channel over virtio-serial + Python daemon, serial fallback |
 | Platforms | Linux/macOS/Windows code paths and packaging targets; no claim that every host/arch/accelerator combination has been tested |
@@ -228,13 +228,17 @@ unauthenticated access to the **share endpoint**; it is not a claim that only
 Electron/QEMU/the guest can access the underlying host directory. Its owner's
 other processes and privileged host users remain outside that protection.
 
-`EgressProxy` enforces auth, host policy and configured ports only for traffic
-sent to it. Guest `HTTP_PROXY`/`HTTPS_PROXY` variables configure cooperating
-clients, and `no_proxy=127.0.0.1,localhost,10.0.2.2,::1` lets local/WebDAV traffic
-bypass it. QEMU still uses unrestricted user-mode SLIRP: there is no network
-rule forcing arbitrary guest sockets through the proxy. The proxy defaults to
-`0.0.0.0` (configurable), unlike the loopback-only share. Neither these controls
-nor the smoke tests constitute a security audit.
+`EgressProxy` enforces auth, host policy and configured ports for traffic sent
+to it. In **strict mode** (Linux default) every guest request reaches the proxy
+through the virtio-serial tunnel — there is no NIC, so this "sent to the proxy"
+condition covers all guest egress. In **legacy SLIRP mode** guest
+`HTTP_PROXY`/`HTTPS_PROXY` variables configure cooperating clients, and
+`no_proxy=127.0.0.1,localhost,10.0.2.2,::1` lets local/WebDAV traffic bypass the
+proxy; QEMU uses unrestricted user-mode SLIRP and there is no rule forcing
+arbitrary guest sockets through the proxy. The proxy's host-side TCP listener
+defaults to `127.0.0.1` in strict mode (the guest reaches it through the tunnel,
+not TCP) and `0.0.0.0` in legacy mode (configurable), unlike the loopback-only
+share. Neither these controls nor the smoke tests constitute a security audit.
 
 ---
 
@@ -595,8 +599,11 @@ a placeholder. App `ready` reflects QEMU/QMP startup, not completed guest boot
 or a successful sync round-trip.
 
 The proxy has auth, host/port filtering and optional MITM secret injection
-(`mitm-plan.md`). This does **not** remove unrestricted SLIRP routes: clients
-can bypass proxy environment variables. WebDAV/local addresses are in `no_proxy`.
+(`mitm-plan.md`). In strict mode (Linux default) the guest has no NIC and all
+egress is injected into `EgressProxy` over the virtio-serial tunnel, so host
+policy applies to every request. In legacy SLIRP mode clients can bypass proxy
+environment variables; WebDAV/local addresses are in `no_proxy`. See
+`NET-CONTAINMENT.md`.
 
 Current quit ordering is VM stop → proxy stop → share stop → runtime cleanup.
 Each stage logs its duration and has a deadline; failures do not skip later
