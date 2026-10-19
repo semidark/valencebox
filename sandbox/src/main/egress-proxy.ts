@@ -974,6 +974,12 @@ export class EgressProxy {
         return lower !== "proxy-authorization" && lower !== "proxy-connection";
       });
 
+      // Host-side upstream proxy chaining (plain HTTP only on this path).
+      const up = this.upstream;
+      if (up && !this.isDirectUpstream(targetHost)) {
+        if (up.authHeader) filteredHeaders.push(["proxy-authorization", up.authHeader]);
+      }
+
       const options: https.RequestOptions = {
         hostname: targetHost,
         port,
@@ -982,13 +988,10 @@ export class EgressProxy {
         headers: filteredHeaders.flat(),
       };
 
-      // Host-side upstream proxy chaining (plain HTTP only on this path).
-      const up = this.upstream;
       if (up && !this.isDirectUpstream(targetHost)) {
         options.hostname = up.host;
         options.port = up.port;
         options.path = `http://${targetHost}:${port}${path.startsWith("/") ? path : "/" + path}`;
-        if (up.authHeader) headers["proxy-authorization"] = up.authHeader;
       }
 
       const forwardReq = http.request(options, (forwardRes) => {
