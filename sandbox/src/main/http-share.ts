@@ -5,6 +5,7 @@ import FileSystemAdapter from "@nephele/adapter-file-system";
 import CustomAuthenticator, { User } from "@nephele/authenticator-custom";
 import { randomBytes } from "crypto";
 import { Socket } from "net";
+import { Duplex } from "stream";
 import { getRandomFreePort } from "./asset-paths";
 
 export interface ShareConfig {
@@ -14,7 +15,7 @@ export interface ShareConfig {
 
 export class HttpShare {
   private server: Server | null = null;
-  private sockets = new Set<Socket>();
+  private sockets = new Set<Socket | Duplex>();
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
   public readonly token: string;
@@ -77,6 +78,16 @@ export class HttpShare {
       });
       this.server.on("error", reject);
     });
+  }
+
+  /**
+   * Inject a connection stream directly (no TCP listener). Used in strict
+   * network mode to hand mux-tunnel streams to the WebDAV server. Basic auth
+   * (valence + token) still applies over the injected stream.
+   */
+  injectConnection(socket: Duplex): void {
+    if (!this.server) throw new Error("HttpShare not started");
+    this.server.emit("connection", socket);
   }
 
   forceStop(): void {

@@ -8,7 +8,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { generate as selfsignedGenerate } from "selfsigned";
-import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret } from "../config";
+import { EgressPolicy, EgressRuntimeConfig, ResolvedSecret, UpstreamProxy, UpstreamNoProxySet, parseUpstreamProxy, parseUpstreamNoProxy, matchesUpstreamNoProxy, UPSTREAM_NO_PROXY_LOOPBACK } from "../config";
 
 // ---- Helpers ----
 
@@ -338,15 +338,48 @@ export async function ensureLeafCertificate(
 // http.Server request handler knows where to proxy.
 const mitmTargetMap = new WeakMap<tls.TLSSocket, { host: string; port: number }>();
 
+// Map transparent plain-HTTP sockets to their SO_ORIGINAL_DST/Fake-DNS target.
+const tproxyTargetMap = new WeakMap<Duplex, { host: string; port: number }>();
+
+function looksLikePlainHttp(buf: Buffer): boolean {
+  if (buf.length < 5) return false;
+  const head = buf.subarray(0, Math.min(buf.length, 32)).toString("latin1");
+  return /^[A-Z]{3,16} (\/|https?:\/\/|\*)/.test(head);
+}
+
+/**
+ * Parse a `tproxy:<host>:<port>` mux target string. Supports IPv4, hostnames,
+ * and bracketed IPv6 (`tproxy:[::1]:443`). Returns null when malformed.
+ */
+export function parseTransparentTarget(target: string): { host: string; port: number } | null {
+  if (!target.startsWith("tproxy:")) return null;
+  const rest = target.slice("tproxy:".length);
+  const colonIdx = rest.lastIndexOf(":");
+  if (colonIdx <= 0) return null;
+  const rawHost = rest.slice(0, colonIdx);
+  const portStr = rest.slice(colonIdx + 1);
+  if (!/^\d+$/.test(portStr)) return null;
+  const port = parseInt(portStr, 10);
+  if (port < 1 || port > 65535) return null;
+  const host = normalizeHost(rawHost);
+  if (!host) return null;
+  return { host, port };
+}
+
 export class EgressProxy {
   private server: http.Server | null = null;
   private readonly config: EgressRuntimeConfig;
+  /** Parsed upstream proxy (host-side chaining), or null. Accepts a raw URL too. */
+  private readonly upstream: UpstreamProxy | null;
+  /** no_proxy exception set: hosts dialed directly even when chaining. */
+  private readonly upstreamNoProxy: UpstreamNoProxySet;
   private mitmCa: MitmCa | null = null;
   private caDir: string;
   private mitmServer: http.Server;
+  private tproxyHttpServer: http.Server;
   private logFile: string | undefined;
   private activeConnections = 0;
-  private sockets = new Set<net.Socket>();
+  private sockets = new Set<Duplex>();
   private requests = new Set<http.ClientRequest>();
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
@@ -359,10 +392,21 @@ export class EgressProxy {
     logFile?: string,
   ) {
     this.config = config;
+    const up = config.upstreamProxy as UpstreamProxy | string | undefined;
+    this.upstream = up
+      ? (typeof up === "string" ? parseUpstreamProxy(up) : up)
+      : null;
+    const np = config.upstreamNoProxy as UpstreamNoProxySet | string | string[] | undefined;
+    this.upstreamNoProxy = parseUpstreamNoProxy(
+      [UPSTREAM_NO_PROXY_LOOPBACK, ...(np === undefined ? [] : Array.isArray(np) ? np : [np])].join(","),
+    );
     this.caDir = caDir || path.join(process.cwd(), ".mitm-ca");
     this.logFile = logFile;
     this.mitmServer = http.createServer((req, res) => {
       this.handleMitmRequest(req, res);
+    });
+    this.tproxyHttpServer = http.createServer((req, res) => {
+      this.handleTransparentHttpRequest(req, res);
     });
   }
 
@@ -419,6 +463,10 @@ export class EgressProxy {
       this.mitmServer.headersTimeout = 66000;
       this.mitmServer.requestTimeout = 0;
 
+      this.tproxyHttpServer.keepAliveTimeout = 65000;
+      this.tproxyHttpServer.headersTimeout = 66000;
+      this.tproxyHttpServer.requestTimeout = 0;
+
       const port = this.config.port;
       const host = this.config.listenHost || "0.0.0.0";
       this.server.listen(port, host, () => {
@@ -432,12 +480,168 @@ export class EgressProxy {
     });
   }
 
+  /**
+   * Inject a connection stream directly (no TCP listener). Used in strict
+   * network mode to hand mux-tunnel streams to the proxy's HTTP/CONNECT
+   * handling: the same pattern the MITM server already uses to receive
+   * sockets. The injected stream keeps speaking the proxy dialect (CONNECT +
+   * Proxy-Authorization), so no protocol changes are needed.
+   */
+  injectConnection(socket: Duplex): void {
+    if (!this.server) throw new Error("EgressProxy not started");
+    // Emits through the same "connection" path as a TCP accept: trackConnection
+    // (limits, bookkeeping) and the http.Server request parser both run.
+    this.server.emit("connection", socket);
+  }
+
+  /**
+   * Inject a transparent connection (`tproxy:<host>:<port>` mux stream) from a
+   * guest client that ignored HTTP_PROXY and was redirected via Fake-DNS +
+   * netfilter OUTPUT REDIRECT. Enforces the same connection, rate, host, and
+   * port policies as explicit proxy connections, then peeks the first bytes to
+   * dispatch origin-form plain HTTP vs. TLS/MITM or raw TCP tunneling.
+   */
+  injectTransparentConnection(socket: Duplex, rawHost: string, targetPort: number): void {
+    if (!this.server) throw new Error("EgressProxy not started");
+    if (!this.trackConnection(socket as net.Socket, false)) return;
+
+    const clientIp = (socket as net.Socket).remoteAddress || "?";
+    if (!this.checkRateLimit(clientIp)) {
+      this.log("DENY", "TPROXY", clientIp, "rate limit exceeded");
+      socket.destroy();
+      return;
+    }
+
+    const targetHost = normalizeHost(rawHost);
+    if (!targetHost || !Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
+      this.log("DENY", "TPROXY", `${rawHost}:${targetPort}`, "invalid transparent target");
+      socket.destroy();
+      return;
+    }
+
+    if (!this.config.allowAll && !hostAllowed(targetHost, this.config.policy, this.config.allowHosts, this.config.denyHosts)) {
+      this.log("DENY", "TPROXY", `${targetHost}:${targetPort}`, "host blocked by policy");
+      socket.destroy();
+      return;
+    }
+
+    if (this.config.allowPorts.length > 0 && !this.config.allowPorts.includes(targetPort)) {
+      this.log("DENY", "TPROXY", `${targetHost}:${targetPort}`, "port blocked by policy");
+      socket.destroy();
+      return;
+    }
+
+    let dispatched = false;
+    const cleanup = () => {
+      clearTimeout(peekTimer);
+      socket.removeListener("data", onFirstChunk);
+      socket.removeListener("end", onEndOrClose);
+      socket.removeListener("close", onEndOrClose);
+      socket.removeListener("error", onError);
+    };
+
+    const dispatchTunnel = (initialData: Buffer) => {
+      if (dispatched) return;
+      dispatched = true;
+      cleanup();
+      socket.pause();
+      if (initialData.length > 0 && initialData[0] === 0x16 && this.config.enableMitm && this.isSecretHost(targetHost)) {
+        void this.handleMitmConnect(targetHost, targetPort, socket, initialData, false);
+        return;
+      }
+      void this.pipeTransparentTunnel(socket, targetHost, targetPort, initialData);
+    };
+
+    const onFirstChunk = (chunk: Buffer) => {
+      if (dispatched) return;
+      if (looksLikePlainHttp(chunk)) {
+        dispatched = true;
+        cleanup();
+        socket.pause();
+        tproxyTargetMap.set(socket, { host: targetHost, port: targetPort });
+        socket.unshift(chunk);
+        this.tproxyHttpServer.emit("connection", socket);
+        socket.resume();
+        return;
+      }
+      dispatchTunnel(chunk);
+    };
+
+    const onEndOrClose = () => {
+      if (dispatched) return;
+      dispatched = true;
+      cleanup();
+      socket.destroy();
+    };
+
+    const onError = () => {
+      if (dispatched) return;
+      dispatched = true;
+      cleanup();
+      socket.destroy();
+    };
+
+    // Server-speaks-first protocols (e.g. SSH on port 22) send no initial
+    // client bytes; after a short peek window, open the raw TCP tunnel.
+    const peekTimer = setTimeout(() => {
+      dispatchTunnel(Buffer.alloc(0));
+    }, 150);
+
+    socket.on("data", onFirstChunk);
+    socket.once("end", onEndOrClose);
+    socket.once("close", onEndOrClose);
+    socket.once("error", onError);
+  }
+
+  private async pipeTransparentTunnel(
+    clientSocket: Duplex,
+    targetHost: string,
+    targetPort: number,
+    head: Buffer,
+  ): Promise<void> {
+    try {
+      const upstream = await this.connectUpstream(targetHost, targetPort);
+      if (this.stopping || clientSocket.destroyed) {
+        upstream.destroy();
+        return;
+      }
+      if (head.length > 0) {
+        this.addBytes(targetHost, head.length, 0);
+        upstream.write(head);
+      }
+      clientSocket.on("data", (c: Buffer) => this.addBytes(targetHost, c.length, 0));
+      upstream.on("data", (c: Buffer) => this.addBytes(targetHost, 0, c.length));
+
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+      clientSocket.resume();
+
+      clientSocket.on("error", () => {
+        clientSocket.destroy();
+        upstream.destroy();
+      });
+      upstream.on("error", () => {
+        clientSocket.destroy();
+        upstream.destroy();
+      });
+      clientSocket.on("close", () => upstream.destroy());
+      upstream.on("close", () => clientSocket.destroy());
+
+      this.log("TPROXY", "CONNECT", `${targetHost}:${targetPort}`, "tunnel established");
+    } catch (err: any) {
+      this.log("ERROR", "TPROXY", `${targetHost}:${targetPort}`, err.message);
+      clientSocket.destroy();
+    }
+  }
+
   forceStop(): void {
     this.stopping = true;
     this.server?.closeAllConnections();
     this.mitmServer.closeAllConnections();
+    this.tproxyHttpServer.closeAllConnections();
     for (const request of this.requests) request.destroy();
-    // Includes upgraded CONNECT sockets, which closeAllConnections omits.
+    // Includes upgraded CONNECT sockets and injected mux streams, which
+    // closeAllConnections omits (injected streams are Duplex, not TCP).
     for (const socket of this.sockets) socket.destroy();
   }
 
@@ -461,19 +665,22 @@ export class EgressProxy {
    * Count a live TCP connection and enforce the max-connections limit.
    * Over-limit connections are rejected with 503 and destroyed.
    */
-  private trackConnection(socket: net.Socket): void {
+  private trackConnection(socket: net.Socket, writeHttp503 = true): boolean {
     this.trackSocket(socket);
     this.activeConnections++;
     socket.once("close", () => { this.activeConnections--; });
     if (this.activeConnections > this.config.maxConnections) {
       this.log("DENY", "", socket.remoteAddress || "?", `connection limit reached (${this.config.maxConnections})`);
-      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      if (writeHttp503) {
+        socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      }
       socket.destroy();
-      return;
+      return false;
     }
+    return true;
   }
 
-  private trackSocket(socket: net.Socket): void {
+  private trackSocket(socket: Duplex): void {
     if (this.sockets.has(socket)) return;
     this.sockets.add(socket);
     socket.once("close", () => this.sockets.delete(socket));
@@ -613,12 +820,49 @@ export class EgressProxy {
     }
   }
 
-  private async forwardRequest(req: http.IncomingMessage, res: http.ServerResponse, targetHost: string): Promise<void> {
+  private async handleTransparentHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const target = tproxyTargetMap.get(req.socket);
+    if (!target) {
+      this.send403(res, "transparent target unknown");
+      req.socket.destroy();
+      return;
+    }
+
+    let targetHost = target.host;
+    const headerHost = req.headers["host"] ? normalizeHost(req.headers["host"]) : "";
+    if (headerHost && headerHost !== targetHost) {
+      if (!this.config.allowAll && !hostAllowed(headerHost, this.config.policy, this.config.allowHosts, this.config.denyHosts)) {
+        this.log("DENY", req.method || "GET", headerHost, "host header blocked by policy");
+        this.send403(res, `host '${headerHost}' is not allowed`);
+        return;
+      }
+      if (isIpAddress(targetHost)) {
+        targetHost = headerHost;
+      }
+    }
+
+    try {
+      await this.forwardRequest(req, res, targetHost, target.port);
+    } catch (err: any) {
+      this.log("ERROR", req.method || "GET", `${targetHost}:${target.port}`, err.message);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "text/plain", "Connection": "close" });
+        res.end(`Bad Gateway: ${err.message}\n`);
+      }
+    }
+  }
+
+  private async forwardRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    targetHost: string,
+    defaultPort = 80,
+  ): Promise<void> {
     const rawUrl = req.url || "/";
 
     // In forward proxy mode, req.url is an absolute URL (e.g. http://host:port/path).
     // Parse it to extract the correct hostname, port, and path.
-    let port = 80;
+    let port = defaultPort;
     let path = rawUrl;
     let useTls = false;
     try {
@@ -645,12 +889,18 @@ export class EgressProxy {
       return;
     }
 
+    const headers: Record<string, string | string[] | undefined> = { ...req.headers };
+
+    // Strip proxy-specific headers before forwarding.
+    delete headers["proxy-authorization"];
+    delete headers["proxy-connection"];
+
     const options: https.RequestOptions = {
       hostname: targetHost,
       port,
       path,
       method: req.method,
-      headers: { ...req.headers },
+      headers,
     };
 
     // Custom upstream CA bundle (D9): verify internal/self-signed upstreams
@@ -659,9 +909,33 @@ export class EgressProxy {
       options.ca = [...tls.rootCertificates, this.config.caCert];
     }
 
-    // Strip proxy-specific headers before forwarding.
-    delete (options.headers as any)["proxy-authorization"];
-    delete (options.headers as any)["proxy-connection"];
+    // Host-side upstream proxy chaining.
+    const up = this.upstream;
+    if (up && !this.isDirectUpstream(targetHost)) {
+      if (!useTls) {
+        // Plain HTTP: absolute-form request sent to the upstream proxy.
+        options.hostname = up.host;
+        options.port = up.port;
+        options.path = /^https?:\/\//i.test(rawUrl)
+          ? rawUrl
+          : `http://${targetHost}:${port}${path.startsWith("/") ? path : "/" + path}`;
+        if (up.authHeader) headers["proxy-authorization"] = up.authHeader;
+      } else {
+        // TLS: CONNECT tunnel through the upstream, then speak TLS inside it.
+        const tunnel = await this.connectUpstream(targetHost, port);
+        if (this.stopping) { tunnel.destroy(); throw new Error("Proxy is stopping"); }
+        options.agent = false;
+        options.createConnection = () => tls.connect({
+          socket: tunnel,
+          servername: targetHost,
+          host: targetHost,
+          port,
+          ...(options.ca ? { ca: options.ca } : {}),
+        });
+        // One request per tunnel; the socket has no pooling agent.
+        headers["connection"] = "close";
+      }
+    }
 
     return new Promise((resolve, reject) => {
       const mod = useTls ? https : http;
@@ -700,6 +974,12 @@ export class EgressProxy {
         return lower !== "proxy-authorization" && lower !== "proxy-connection";
       });
 
+      // Host-side upstream proxy chaining (plain HTTP only on this path).
+      const up = this.upstream;
+      if (up && !this.isDirectUpstream(targetHost)) {
+        if (up.authHeader) filteredHeaders.push(["proxy-authorization", up.authHeader]);
+      }
+
       const options: https.RequestOptions = {
         hostname: targetHost,
         port,
@@ -707,6 +987,12 @@ export class EgressProxy {
         method,
         headers: filteredHeaders.flat(),
       };
+
+      if (up && !this.isDirectUpstream(targetHost)) {
+        options.hostname = up.host;
+        options.port = up.port;
+        options.path = `http://${targetHost}:${port}${path.startsWith("/") ? path : "/" + path}`;
+      }
 
       const forwardReq = http.request(options, (forwardRes) => {
         this.log("HTTP-SECRET", method, `${targetHost}:${port}`, `upstream responded ${forwardRes.statusCode}`);
@@ -847,9 +1133,12 @@ export class EgressProxy {
     targetPort: number,
     clientSocket: Duplex,
     _head: Buffer,
+    writeConnectResponse = true,
   ): Promise<void> {
     if (!this.mitmCa) {
-      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nMITM CA not initialized\n");
+      if (writeConnectResponse) {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nMITM CA not initialized\n");
+      }
       clientSocket.end();
       return;
     }
@@ -861,18 +1150,18 @@ export class EgressProxy {
       leaf = await ensureLeafCertificate(targetHost, this.mitmCa, certCacheDir);
     } catch (err: any) {
       this.log("ERROR", "MITM", `${targetHost}:${targetPort}`, `cert generation failed: ${err.message}`);
-      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nFailed to generate TLS certificate for interception\n");
+      if (writeConnectResponse) {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nFailed to generate TLS certificate for interception\n");
+      }
       clientSocket.end();
       return;
     }
 
     if (this.stopping || clientSocket.destroyed) return;
-    // Send 200 to the client to confirm CONNECT.
-    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-
-    // The HTTP CONNECT handler may have paused the socket; resume it so the
-    // TLSSocket can read incoming TLS ClientHello data.
-    clientSocket.resume();
+    if (writeConnectResponse) {
+      // Send 200 to the client to confirm CONNECT.
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    }
 
     // Wrap the client socket with TLS (server-side).
     const clientTls = new tls.TLSSocket(clientSocket, {
@@ -881,6 +1170,13 @@ export class EgressProxy {
       cert: fs.readFileSync(leaf.cert),
     });
     this.trackSocket(clientTls);
+
+    // Push back any already-peeked initial ClientHello bytes and resume so
+    // the TLSSocket can consume them.
+    if (_head.length > 0) {
+      clientSocket.unshift(_head);
+    }
+    clientSocket.resume();
 
     // Enable TCP keepalive on the client TLS socket so intermediate NAT /
     // firewalls don't tear down long-lived SSE streams.
@@ -973,6 +1269,23 @@ export class EgressProxy {
       if (this.config.caCert) {
         upstreamOpts.ca = [...tls.rootCertificates, this.config.caCert];
       }
+      // Host-side upstream proxy chaining: CONNECT tunnel, then TLS inside.
+      if (this.upstream) {
+        const tunnel = await this.connectUpstream(targetHost, targetPort);
+        if (this.stopping) {
+          tunnel.destroy();
+          this.sendMitmError(res, 502, "Bad Gateway: proxy is stopping");
+          return;
+        }
+        upstreamOpts.agent = false;
+        upstreamOpts.createConnection = () => tls.connect({
+          socket: tunnel,
+          servername: targetHost,
+          host: targetHost,
+          port: targetPort,
+          ...(upstreamOpts.ca ? { ca: upstreamOpts.ca } : {}),
+        });
+      }
       const upstreamReq = https.request(upstreamOpts, (upstreamRes) => {
         const statusCode = upstreamRes.statusCode || 200;
         this.log("MITM", method, `${targetHost}:${targetPort}`, `upstream responded ${statusCode}`);
@@ -1042,7 +1355,27 @@ export class EgressProxy {
     }
   }
 
+  /**
+   * Open a raw connection to `host:port` — directly, or tunneled through the
+   * configured upstream proxy via HTTP CONNECT (host-side chaining). The
+   * tunnel carries whatever the caller speaks (TLS, HTTP, ssh …).
+   */
   private connectUpstream(host: string, port: number): Promise<net.Socket> {
+    if (this.upstream && !this.isDirectUpstream(host)) {
+      return this.connectViaUpstreamProxy(host, port);
+    }
+    if (this.upstream) {
+      this.log("DEBUG", "CONNECT", `${host}:${port}`, "upstream bypassed (no_proxy match)");
+    }
+    return this.connectDirect(host, port);
+  }
+
+  /** True when the target must be dialed directly despite upstream chaining. */
+  private isDirectUpstream(host: string): boolean {
+    return matchesUpstreamNoProxy(host, this.upstreamNoProxy);
+  }
+
+  private connectDirect(host: string, port: number): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
       const socket = new net.Socket();
       this.trackSocket(socket);
@@ -1058,6 +1391,58 @@ export class EgressProxy {
         socket.destroy();
         reject(new Error(`upstream connection timeout: ${host}:${port}`));
       });
+    });
+  }
+
+  private connectViaUpstreamProxy(targetHost: string, targetPort: number): Promise<net.Socket> {
+    const upstream = this.upstream!;
+    return new Promise((resolve, reject) => {
+      const socket = new net.Socket();
+      this.trackSocket(socket);
+      if (this.stopping) { reject(new Error("Proxy is stopping")); return; }
+      let settled = false;
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(err);
+      };
+      socket.setTimeout(10000);
+      socket.connect(upstream.port, upstream.host, () => {
+        let req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
+        if (upstream.authHeader) req += `Proxy-Authorization: ${upstream.authHeader}\r\n`;
+        req += "\r\n";
+        socket.write(req);
+      });
+      let buf = Buffer.alloc(0);
+      const onData = (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        const idx = buf.indexOf("\r\n\r\n");
+        if (idx === -1) {
+          if (buf.length > 16384) {
+            socket.removeListener("data", onData);
+            fail(new Error("upstream proxy CONNECT response too large"));
+          }
+          return;
+        }
+        socket.removeListener("data", onData);
+        const statusLine = buf.subarray(0, buf.indexOf("\r\n")).toString("utf8");
+        const m = statusLine.match(/^HTTP\/\d\.\d (\d{3})/);
+        if (!m || m[1][0] !== "2") {
+          fail(new Error(`upstream proxy CONNECT failed: ${statusLine.trim()}`));
+          return;
+        }
+        settled = true;
+        socket.setTimeout(0);
+        // Bytes after the header belong to the tunnel payload; push them back.
+        const rest = buf.subarray(idx + 4);
+        if (rest.length > 0) socket.unshift(rest);
+        resolve(socket);
+      };
+      socket.on("data", onData);
+      socket.on("error", fail);
+      socket.on("timeout", () => fail(new Error(`upstream proxy timeout: ${upstream.host}:${upstream.port}`)));
+      socket.once("close", () => fail(new Error(`upstream proxy connection closed: ${upstream.host}:${upstream.port}`)));
     });
   }
 

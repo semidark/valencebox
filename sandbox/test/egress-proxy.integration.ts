@@ -770,6 +770,131 @@ async function testRepeatedHeadersPreserved() {
 
 // ---- Run all ----
 
+async function testSecretForwardThroughUpstreamChain() {
+  let capturedSecretHeaders: http.IncomingHttpHeaders | undefined;
+  let capturedUpstreamAuth: string | undefined;
+  let targetServer: http.Server | undefined;
+  let upstreamProxy: http.Server | undefined;
+  let proxy: EgressProxy | undefined;
+  let tmpDir: string | undefined;
+
+  try {
+    // Final origin server (the real destination behind the corp proxy).
+    targetServer = http.createServer((req, res) => {
+      capturedSecretHeaders = req.headers;
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("secret-ok");
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      targetServer!.once("error", reject);
+      targetServer!.listen(0, "127.0.0.1", () => resolve());
+    });
+    const targetPort = (targetServer.address() as any).port;
+
+    // The corporate upstream proxy: EgressProxy sends absolute-form requests
+    // here with the upstream Proxy-Authorization; it forwards to the origin.
+    // The target is a synthetic hostname so the proxy engages the chain
+    // (loopback targets are always dialed direct), and the upstream maps it to
+    // the loopback origin server.
+    upstreamProxy = http.createServer((req, res) => {
+      capturedUpstreamAuth = (req.headers["proxy-authorization"] as string) || undefined;
+      // Relay to the final origin (the proxy's request line is absolute-form).
+      const destUrl = new URL(req.url!);
+      const originHost = destUrl.hostname === "chain-target.test" ? "127.0.0.1" : destUrl.hostname;
+      const dest = http.request(
+        {
+          hostname: originHost,
+          port: destUrl.port || 80,
+          path: destUrl.pathname + destUrl.search,
+          method: req.method,
+          headers: { ...req.headers, host: destUrl.host },
+        },
+        (upRes) => {
+          res.writeHead(upRes.statusCode || 200, upRes.headers);
+          upRes.pipe(res);
+        },
+      );
+      dest.on("error", () => { res.writeHead(502); res.end(); });
+      req.pipe(dest);
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstreamProxy!.once("error", reject);
+      upstreamProxy!.listen(0, "127.0.0.1", () => resolve());
+    });
+    const upstreamPort = (upstreamProxy.address() as any).port;
+
+    tmpDir = fs.mkdtempSync("secret-chain-");
+    const proxyConfig: EgressRuntimeConfig = {
+      policy: "allowlist",
+      allowHosts: ["chain-target.test"],
+      denyHosts: [],
+      allowPorts: [targetPort, 80],
+      allowAll: false,
+      enableMitm: false,
+      secrets: [
+        { env: "SEC", value: "real-secret", placeholder: "psbx-sec-chain-1", hosts: ["chain-target.test"] },
+      ],
+      upstreamProxy: `http://corp-user:corp-pass@127.0.0.1:${upstreamPort}`,
+      upstreamNoProxy: "",
+      port: 0,
+      authToken: "test",
+      maxConnections: 256,
+      rateLimitPerMin: 0,
+      listenHost: "127.0.0.1",
+    };
+    proxy = new EgressProxy(proxyConfig, path.join(tmpDir, "ca"));
+    await proxy.start();
+    const proxyPort = proxy.port;
+    const auth = "Basic " + Buffer.from("psbx:test").toString("base64");
+
+    const sock = net.connect(proxyPort, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("connect timeout")), 3000);
+      sock.once("connect", () => { clearTimeout(timer); resolve(); });
+      sock.once("error", (e) => { clearTimeout(timer); reject(e); });
+    });
+
+    const request = [
+      `GET http://chain-target.test:${targetPort}/ HTTP/1.1`,
+      `Host: chain-target.test:${targetPort}`,
+      `Proxy-Authorization: ${auth}`,
+      "Authorization: Bearer psbx-sec-chain-1",
+      "Connection: close",
+      "",
+      "",
+    ].join("\r\n");
+    sock.write(request);
+
+    const resp = await new Promise<string>((resolve, reject) => {
+      let data = "";
+      const timer = setTimeout(() => { sock.destroy(); reject(new Error("response timeout")); }, 4000);
+      sock.on("data", (c) => (data += c.toString("utf-8")));
+      sock.on("end", () => { clearTimeout(timer); resolve(data); });
+      sock.on("error", (e) => { clearTimeout(timer); reject(e); });
+    });
+    sock.destroy();
+
+    assert(resp.includes("200 OK"), `chained secret forward responded 200 (got: ${resp.slice(0, 60).replace(/\n/g, "\\n")})`);
+    assert(capturedSecretHeaders !== undefined, "origin received headers");
+    assertEq(capturedSecretHeaders!["authorization"], "Bearer real-secret", "secret placeholder replaced at origin");
+    // The corporate proxy must have received its own proxy credential — this
+    // was silently dropped before the ordering fix.
+    assert(capturedUpstreamAuth !== undefined, "upstream proxy received Proxy-Authorization");
+    assertEq(capturedUpstreamAuth, "Basic " + Buffer.from("corp-user:corp-pass").toString("base64"),
+      "upstream proxy credential forwarded");
+
+    console.log("✓ secret forward chained through upstream proxy (origin rewrite + proxy auth)");
+  } finally {
+    if (proxy) await proxy.stop();
+    if (targetServer) await new Promise<void>((resolve) => targetServer!.close(() => resolve()));
+    if (upstreamProxy) await new Promise<void>((resolve) => upstreamProxy!.close(() => resolve()));
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   try {
     await testMitmCertGeneration();
@@ -777,6 +902,7 @@ async function main() {
     await testConnectPolicyEnforcement();
     await testMitmSecretInjection();
     await testRepeatedHeadersPreserved();
+    await testSecretForwardThroughUpstreamChain();
     await testMaxConnectionLimit();
     await testRateLimit();
     await testCustomUpstreamCa();

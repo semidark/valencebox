@@ -1,9 +1,12 @@
 # Bidir sync between /workspace (native qcow2) and /host-workspace (WebDAV mirror)
 # Depends on mount-share.service which formats/mounts /workspace and writes secrets.
+# No network-online dependency: in strict mode there is no NIC (the share is
+# reached via the mux relay), and in legacy mode SLIRP is up before userspace
+# with davfs mount retries in workspace-sync.sh.
 [Unit]
 Description=Workspace bidirectional sync via unison
-Requires=mount-share.service network-online.target
-After=mount-share.service network-online.target
+Requires=mount-share.service
+After=mount-share.service
 
 [Service]
 Type=simple

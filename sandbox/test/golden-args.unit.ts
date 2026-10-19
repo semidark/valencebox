@@ -4,6 +4,7 @@
 import { QemuProcess, QemuOptions } from "../src/main/qemu";
 import { x86_64Profile, aarch64Profile, GuestProfile } from "../src/main/guest-profile";
 import { PortForward } from "../src/config";
+import { VmTransport } from "../src/main/asset-paths";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(`ASSERTION FAILED: ${msg}`);
@@ -19,8 +20,8 @@ function buildOpts(p: GuestProfile, overrides: Partial<QemuOptions> = {}): QemuO
   };
 }
 
-function testCase(name: string, opts: QemuOptions, machine: string, checks: (args: string[]) => void, resolvedAccel?: string) {
-  const args = QemuProcess.buildArgs(opts, machine, resolvedAccel);
+function testCase(name: string, opts: QemuOptions, machine: string, checks: (args: string[]) => void, resolvedAccel?: string, muxTransport?: VmTransport | null) {
+  const args = QemuProcess.buildArgs(opts, machine, resolvedAccel, null, muxTransport);
   checks(args);
   console.log(`✓ ${name}: ${args.length} args`);
 }
@@ -211,6 +212,59 @@ testCase("port-forward aarch64 virt", buildOpts(pa, {
   const idx = args.indexOf("-netdev");
   assert(idx !== -1, "-netdev present");
   assert(args[idx + 1].includes("hostfwd=tcp:127.0.0.1:2222-:22"), "aarch64 SSH hostfwd");
+});
+
+// ---- Strict network mode tests (virtio-serial mux tunnel, -nic none) ----
+
+const muxTrUnix = { type: "unix" as const, local: "/tmp/mux.sock", connectPath: "/tmp/mux.sock" };
+const muxTrTcp = { type: "tcp" as const, local: "47000", connectPath: "47000" };
+
+// Case 14: strict pc with mux transport — no NIC, mux chardev + virtserialport
+testCase("strict x86_64 pc", buildOpts(p, {
+  strictNet: true,
+  portForwards: [{ hostPort: 2222, guestPort: 22 }],
+}), "pc", (args) => {
+  const nicIdx = args.indexOf("-nic");
+  assert(nicIdx !== -1, "-nic present");
+  assert(args[nicIdx + 1] === "none", "-nic none");
+  assert(!args.includes("-netdev"), "no -netdev in strict mode");
+  assert(!args.some(a => a.startsWith("virtio-net")), "no virtio-net device in strict mode");
+  const chardevIdx = args.indexOf("-chardev");
+  assert(chardevIdx !== -1, "mux -chardev present");
+  assert(args[chardevIdx + 1].includes("id=mux,path=/tmp/mux.sock,server=on,wait=off"), "unix mux chardev args");
+  assert(args.some(a => a === "virtio-serial-pci"), "virtio-serial-pci bus for pc");
+  assert(args.some(a => a === "virtserialport,chardev=mux,name=mux"), "mux virtserialport");
+  // portForwards are ignored in strict mode (host-side listeners instead)
+  assert(!args.some(a => a.includes("hostfwd")), "no SLIRP hostfwd in strict mode");
+}, undefined, muxTrUnix);
+
+// Case 15: strict microvm — MMIO virtio-serial device suffix
+testCase("strict microvm", buildOpts(p, { strictNet: true }), "microvm", (args) => {
+  const nicIdx = args.indexOf("-nic");
+  assert(nicIdx !== -1 && args[nicIdx + 1] === "none", "-nic none");
+  assert(args.some(a => a === "virtio-serial-device"), "virtio-serial-device for microvm");
+}, undefined, muxTrUnix);
+
+// Case 16: strict aarch64 virt — -nic none mandatory (virt skips -nodefaults)
+testCase("strict aarch64 virt", buildOpts(pa, { strictNet: true }), "virt", (args) => {
+  const nicIdx = args.indexOf("-nic");
+  assert(nicIdx !== -1 && args[nicIdx + 1] === "none", "-nic none for virt");
+  assert(!args.some(a => a.startsWith("virtio-net")), "no virtio-net for strict virt");
+  assert(args.some(a => a === "virtio-serial-pci"), "virtio-serial-pci for virt");
+}, undefined, muxTrUnix);
+
+// Case 17: strict with TCP (Windows) mux transport
+testCase("strict tcp mux transport", buildOpts(p, { strictNet: true }), "pc", (args) => {
+  const chardevIdx = args.indexOf("-chardev");
+  assert(chardevIdx !== -1, "mux -chardev present");
+  assert(args[chardevIdx + 1].includes("id=mux,host=127.0.0.1,port=47000,server=on,wait=off"), "tcp mux chardev args");
+}, undefined, muxTrTcp);
+
+// Case 18: strict without mux transport (channel attached later) — no mux args
+testCase("strict without mux transport", buildOpts(p, { strictNet: true }), "pc", (args) => {
+  const nicIdx = args.indexOf("-nic");
+  assert(nicIdx !== -1 && args[nicIdx + 1] === "none", "-nic none still present");
+  assert(!args.some(a => a.includes("chardev=mux")), "no mux virtserialport without transport");
 });
 
 console.log("ALL GOLDEN ARGS TESTS PASSED");

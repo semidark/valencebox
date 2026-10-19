@@ -1,0 +1,280 @@
+# Network Containment — Strict Egress via virtio-serial Tunnel
+
+Status: **Phase 1 + Phase 2 implemented** (strict mode default on Linux; SLIRP
+is the opt-out). See "Implementation status" at the end for verified behavior
+and known gaps. Paths are relative to `sandbox/`.
+
+## Problem and motivation
+
+This documents the strict-mode design now implemented on Linux, and why it was
+introduced. In **legacy** mode the VM runs QEMU with an unrestricted SLIRP user
+network (`-netdev user,id=net0` plus a virtio NIC). Proxy environment variables
+steer cooperating clients to the host-side `EgressProxy`, but any guest process
+can ignore them and egress directly through SLIRP, so there is no enforced
+boundary: legacy networking cannot guarantee that guest traffic passes host
+policy. **Strict mode (the Linux default) closes this by construction** — no
+NIC means every guest egress must pass through the tunnel and therefore host
+policy.
+
+## Non-negotiable requirements
+
+1. A path around the egress proxy is absolutely unacceptable. Strict mode is
+   fail-closed: no NIC, no direct egress, UDP and ICMP unsupported.
+2. Only egress that `EgressProxy` can apply policy to exists: HTTP(S) via the
+   proxy (CONNECT and plain-HTTP forwarding), with allowlist/denylist host
+   policy, port policy, rate limits and MITM secret injection unchanged.
+3. UDP port forwards are rejected (fail-closed), not silently dropped.
+4. Legacy SLIRP mode remains available as an explicit opt-out while the new
+   path is proven; once proven, **strict is the default and SLIRP is opt-in.**
+
+## Architecture (Phase 1)
+
+```
+guest                                  host (Electron main)
+------                                 --------------------
+tools → HTTP(S)_PROXY=127.0.0.1:P ─┐
+davfs2 → 127.0.0.1:S ─────────────┤    ┌─ EgressProxy (policy, MITM)
+                                   ├─→  mux-channel ─┤
+mux daemon bridges guest loopback ─┘    │  injects Duplex streams via
+to virtio-serial port "mux"             │  server.emit("connection", shim)
+                                         └─ HttpShare (WebDAV)
+host → 127.0.0.1:2222 (SSH debug) ─────── OPEN fwd:22 → guest loopback
+```
+
+- QEMU launches with `-nic none`. The only guest↔host data path is a
+  virtio-serial port (`-chardev socket,id=mux` + `-device virtserialport,
+  name=mux`), framed and multiplexed by both sides.
+- A guest Rust daemon (`valencebox-mux`) listens on guest loopback ports and
+  bridges each accepted TCP connection to one multiplexed stream.
+- The host demultiplexer (`src/main/mux-channel.ts`) injects each stream
+  directly into the in-process servers — the same pattern the MITM server
+  already uses (`egress-proxy.ts` feeds `mitmServer.emit("connection", …)`).
+  Proxy and share token authentication are unchanged; the guest keeps
+  speaking the proxy dialect (CONNECT + `Proxy-Authorization`).
+
+### What works in strict mode
+
+| Traffic | Support |
+|---|---|
+| TCP via HTTP proxy (apt, npm, pip, curl, git over HTTPS) | Yes, policy-enforced |
+| Other TCP (git over SSH, databases) via HTTP CONNECT | Yes, host:port policy applies |
+| DNS | Resolved host-side by the proxy; no in-guest DNS |
+| UDP (QUIC/HTTP3, NTP, WireGuard) | **No.** HTTP/3 clients fall back to TCP |
+| ICMP (ping, traceroute) | **No.** |
+| TCP port forwards (SSH debug) | Yes, host-initiated over the tunnel |
+| UDP port forwards | **Rejected at config load (fail-closed)** |
+| Non-proxy-aware TCP clients | Yes (Phase 2: Fake-DNS `198.18.0.0/15` on `127.0.0.1:53` + `lo` default route + `iptables OUTPUT REDIRECT` to `127.0.0.1:3129` → `tproxy:<host>:<port>`) |
+
+### Security notes
+
+- The tunnel is private to the QEMU host process ↔ guest, so third parties
+  cannot reach it. It is **not** a guest-compartment boundary: a compromised
+  root guest can open arbitrary streams into the proxy either way. Hostname
+  and port policy at `EgressProxy` is the actual boundary.
+- In strict mode the proxy listener binds `127.0.0.1` (legacy mode keeps
+  `0.0.0.0` for SLIRP reachability). The proxy/share tokens are still delivered
+  to the guest on the kernel cmdline today; moving delivery to the mux handshake
+  (so tokens do not appear in the world-readable guest `/proc/cmdline`) is a
+  noted follow-up, not yet done.
+- Proxy/share tokens remain in place as defense-in-depth; they were never
+  secret from the root guest and are not a compartment boundary.
+
+## Protocol (mux framing)
+
+Extends the existing PtyChannel framing style (`[u32BE len][u8 type]` on
+`/dev/virtio-ports/pty`) with a stream id:
+
+- Header: `[u32BE len][u8 type][u32BE streamId]`
+- Types: `HELLO, OPEN(target), OPEN_OK, OPEN_FAIL, DATA, FIN, RESET,
+  CREDIT(u32)`.
+- Targets: `proxy`, `share`, `fwd:<guestPort>`.
+- Per-stream credit window (~256 KiB) with **batched** CREDIT grants.
+- The guest daemon opens the port **non-blocking** and waits with `poll()`.
+  Benchmark evidence: blocking reads on virtio-serial stall 1–2 s under load
+  and occasionally desync the frame stream; non-blocking + poll eliminates
+  both (15/15 clean runs).
+- `HELLO` on daemon (re)start resets host stream state; a `PING/PONG`
+  liveness pair lets the host detect daemon death.
+- The QEMU chardev socket is single-connection with `server=on,wait=off`;
+  the host owns it with `0600` and must refuse a second connection.
+
+## Prototype benchmarks (pre-implementation, KVM, load-3 host)
+
+Synthetic Rust benchmark client vs. direct SLIRP TCP to `10.0.2.2`:
+
+| Test | virtio-serial mux | SLIRP TCP |
+|---|---|---|
+| Stream open p50 / p99 | 0.10–0.16 ms / ~1 ms | 0.51 ms / 2 ms |
+| Download 128 MiB | 190–230 MB/s | 185–245 MB/s |
+| Upload 128 MiB | 1,700–1,900 MB/s | 85–97 MB/s |
+| 50 × 4 MiB concurrent | ~240 MB/s aggregate, even | ~400 MB/s, uneven |
+| 2,000 × 64 KiB, conc 16 (npm-like) | ~3,500 req/s, p99 6–21 ms | ~1,650 req/s, p99 16–18 ms |
+| 3,000 × 4 KiB, conc 50 (metadata-like) | ~22,000 req/s, p99 3–11 ms | ~3,500 req/s, p99 28 ms |
+
+`npm install` patterns (many small/medium concurrent requests, well under
+50 MB/s aggregate) are 2–6× faster over the tunnel than over SLIRP. The only
+regression is ~40% lower aggregate throughput at high stream concurrency
+(~240 MB/s), far above real-world package-install demand. macOS (HVF),
+Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
+
+## Configuration
+
+```jsonc
+{
+  "egress": {
+    "enforce": true,             // default true on Linux; false = legacy SLIRP
+    "upstreamProxy": "http://user:pass@proxy.corp.example:8080",  // optional
+    // … existing policy knobs unchanged …
+  },
+  "portForwards": [
+    { "hostPort": 2222, "guestPort": 22, "label": "SSH debug access" }
+  ]
+}
+```
+
+- `egress.enforce?: boolean` — strict mode. Default `true` on Linux (the M3 gate
+  passed: strict boot is verified on KVM and TCG). `false` selects the legacy
+  SLIRP path unchanged. On platforms where the tunnel is unverified (macOS,
+  Windows) a requested strict mode falls back to legacy with a warning (see
+  below).
+- `egress.upstreamProxy?: string` — **host-side** proxy chaining for
+  corporate networks. `EgressProxy` outbound connections dial through the
+  upstream proxy: CONNECT tunnels use HTTP CONNECT to the upstream, while plain
+  (non-TLS) forwarded requests are sent to the upstream in **absolute-form** with
+  the upstream `Proxy-Authorization`. MITM re-encryption tunnels through the
+  upstream and TLS still terminates at `EgressProxy`. Host policy and port policy
+  still apply **before** chaining. This replaces the interim guest-side
+  `upstreamProxy` fw_cfg workaround (reverted at M2).
+- `egress.upstreamNoProxy?: string | string[]` — no_proxy-style exceptions
+  honored when chaining: matching targets (hostnames, `.suffix` domains, IP
+  literals, CIDR ranges, `*`) are dialed **directly** — internal hosts that
+  are not reachable through the corporate proxy stay on the normal network.
+  Loopback is always direct. Full configuration reference: `docs/CONFIG.md`.
+- Validation is fail-closed: `enforce: true` with any `protocol: "udp"`
+  port forward is a config-load error and the VM refuses to start with a
+  clear message. (Validation runs on the loaded config; it does not rely on
+  the silent `JSON.parse` → `{}` fallback for correctness.)
+- Platform gating follows the standing decision: strict requested but the
+  tunnel path unverified on a platform (macOS HVF, Windows) → warning +
+  SLIRP fallback, never a silent strict boot.
+
+## Milestones
+
+| # | Deliverable | Gate |
+|---|---|---|
+| M1 | Protocol spec (`docs/mux-protocol.md`); config knobs and UDP fail-closed validation; strict QEMU args (`-nic none`, mux chardev + virtserialport; Unix socket on Linux/macOS, loopback TCP on Windows — named pipes have a chardev read bug); golden-args strict cases per machine type, including aarch64 `virt` (which skips `-nodefaults`, making `-nic none` mandatory) | `test:unit` |
+| M2 | `src/main/mux-channel.ts` (demux, per-stream Duplex shim with synthetic `remoteAddress = "mux-guest"` so rate-limit buckets don't collapse to `"?"`, batched CREDIT flow control, HELLO reset, PING/PONG liveness); stream injection into proxy and share servers; `EgressProxy` upstream chaining; revert the interim fw_cfg `upstreamProxy` diff | `test:egress` + new mux/chaining unit tests against a mock upstream proxy |
+| M3 | Rust guest daemon (`guest-mux/`, static musl via `rust:alpine` buildx stage, non-blocking + poll); `valencebox-mux.service` (`Restart=always`); `mount-share.sh` re-pointed from `10.0.2.2` to guest loopback; drop `network-online.target` dependency; image mode detection via `/dev/virtio-ports/mux` presence; **default flips to `enforce: true`** | New strict `test:boot` variant: no `eth0`, mux service active, WebDAV-over-tunnel sync active, curl via relay — passing on KVM **and** TCG |
+| M4 | TCP portForwards over the mux (host listener → `OPEN fwd:<port>` → guest dials loopback); strict proxy binds `127.0.0.1`; docs (AGENTS.md, qemu.md, HARDENING.md); benchmark rerun for the record | Full suite, both modes |
+
+## Test plan
+
+- **golden-args (M1):** strict cases per machine type — `-nic none`, no
+  `-netdev`/`virtio-net`, mux chardev present; legacy cases retained.
+- **mux-channel unit (M2):** framing, demux, flow control, HELLO reset,
+  PING timeout, abort/reset.
+- **Chaining unit (M2):** CONNECT-through-upstream, upstream auth,
+  policy-before-chain ordering.
+- **Boot strict variant (M3):** asserts no `eth0`, mux service active,
+  workspace-sync active over the tunnel, curl through the relay. Keeps the
+  non-blocking-read regression check (blocking reads caused 1–2 s stalls
+  and frame desyncs in benchmarks).
+- **Legacy suites unchanged.** SLIRP mode stays fully tested while it exists.
+
+## Out of scope / follow-ups
+
+- **Real UDP / ICMP egress:** explicitly rejected by design. `valencebox-mux`
+  answers DNS `A`/`AAAA` queries locally on `127.0.0.1:53` (and `iptables`
+  redirects non-loopback UDP `:53` to it), while arbitrary UDP and ICMP have no
+  path out of the VM.
+- macOS HVF, Windows and TCG performance measurement beyond the M3
+  functional gate.
+- Migrating token delivery off the kernel cmdline (guest `/proc/cmdline` is
+  world-readable) — the mux handshake is the natural carrier.
+- **QEMU process containment** (Linux-only netns + seccomp backstop around
+  the QEMU process): evaluated and **deferred by maintainer decision** —
+  rationale and requirements recorded in `HARDENING.md`, section
+  "QEMU process containment (deferred — maintainer decision)".
+
+## Production benchmarks (`test/bench-tunnel.ts`, Oct 2026)
+
+Measured against the **shipped stack** — real `valencebox-mux` daemon (256 KiB
+credit windows, batched grants), real `MuxChannel` demux, streams injected
+into `EgressProxy` / the WebDAV share — from a guest curl over SSH-on-mux.
+TLS terminates on a host-local server (no WAN/proxy variance); each measured
+value is the best of 3 runs on a shared workstation (load 3–6).
+
+| Scenario | strict / KVM (microvm) | strict / TCG (pc) | legacy SLIRP / KVM |
+|---|---|---|---|
+| S1 tunnel ceiling: 128 MiB plain HTTP via relay | **90–136 MB/s** (typ. ~120) | 49–56 MB/s | n/a (no relay) |
+| S2 full chain: 128 MiB HTTPS via relay → EgressProxy → TLS | **59–82 MB/s** | 13–14 MB/s | 57–72 MB/s |
+| S3 npm-shape: 500 × 64 KiB HTTPS, conc 16 (fresh connection per request) | 160–180 req/s, ~10 MB/s, p50 38–56 ms, p99 92–118 ms | 14 req/s | 155–165 req/s, ~10 MB/s, p99 105–144 ms |
+| S4 S2 while unison syncs 100×256 KiB every 2 s | **59–77 MB/s** (≤ ~25% degradation, no collapse) | — | — |
+
+Reading the numbers:
+
+- **Tunnel ≈ SLIRP at every measured shape on KVM.** The strict design costs
+  nothing measurable in throughput or latency versus the legacy path it
+  replaces; small-request latency is dominated by per-connection TLS
+  handshakes and process spawn, not the transport.
+- The production tunnel ceiling (~120 MB/s) is ~60% of the prototype
+  harness (~200 MB/s): the cost of real credit windows, relay listeners and
+  the single poll loop. Comfortably above any realistic workspace workload.
+- Unison churn and proxied egress share the tunnel without head-of-line
+  collapse (S4).
+- TCG is CPU-bound: ~2.5× slower bulk, and small-request rates collapse
+  because every TLS handshake runs under emulation. Strict mode is fully
+  functional under TCG (boot gate passes); it is not the throughput target.
+
+## Implementation status (Phase 1)
+
+Implemented and verified on Linux x86-64 (KVM/microvm and TCG/pc):
+
+- **Config:** `egress.enforce` (default true), `egress.upstreamProxy`
+  (host-side chaining), UDP-portForward rejection at config load
+  (`validateNetworkConfig`), strict proxy listener defaults to `127.0.0.1`.
+- **QEMU args:** `-nic none` + mux chardev/virtserialport in strict mode
+  (golden-args cases 14–18); SLIRP path unchanged for legacy.
+- **Host tunnel:** `src/main/mux-channel.ts` (framing, credit flow control,
+  HELLO reset, PING/PONG liveness) injecting streams into `EgressProxy` and
+  `HttpShare` via `server.emit("connection", …)`; TCP port forwards via
+  `src/main/port-forwards.ts` (host listeners → `OPEN fwd:<port>`).
+- **Guest daemon:** `guest/guest-mux/` (static musl Rust, zero crates,
+  non-blocking + bounded poll), wired as `valencebox-mux.service`;
+  `mount-share.sh` and proxy env re-pointed to `127.0.0.1` relays in strict
+  mode; `network-online.target` dependency dropped.
+- **Upstream chaining:** CONNECT-through-upstream for tunnels, TLS-over-tunnel
+  for forwarded/intercepted requests, upstream auth; policy enforced before
+  chaining.
+- **Phase 2 transparent proxy (always-on in strict mode):** `valencebox-mux`
+  serves Fake-DNS on `127.0.0.1:53` (`A` → `198.18.0.2..198.19.255.254`, `AAAA`
+  → empty `NOERROR`) and listens on `127.0.0.1:3129` (`SO_ORIGINAL_DST`).
+  `mount-share.sh` sets `/etc/resolv.conf` to `127.0.0.1`, adds a default route
+  over `lo` (`src 198.18.0.1`) so non-proxy-aware `connect()` calls do not fail
+  with `ENETUNREACH` under `-nic none`, and installs `iptables -t nat OUTPUT
+  REDIRECT` rules steering non-loopback UDP `:53` to `:53` and non-loopback TCP
+  to `:3129`. `EgressProxy.injectTransparentConnection` enforces the same
+  host/port/rate policies (evaluating literal-IP connects strictly by IP, never
+  trusting client-supplied TLS SNI) and dispatches origin-form plain HTTP,
+  TLS/MITM secret injection, and raw TCP tunnels.
+
+Verified by: `test:unit` (config validation + strict golden args),
+`test:egress` (mux channel unit + injection/chaining/tproxy unit),
+`test/guest-mux.integration.ts` (real daemon ↔ host channel, relays, fwd
+dial, 4 MiB roundtrip, Fake-DNS + `tproxy:` mapping), `test:boot:strict` (full
+gate: no NIC, daemon active, WebDAV-over-tunnel sync active, explicit proxy
+relay roundtrip, Fake-DNS resolution, env-stripped transparent `curl` allowed +
+denied host checks, SSH over a mux forward) on **both microvm/KVM and pc/TCG**,
+and the legacy `test:boot` (SLIRP path unchanged).
+
+Gaps / notes:
+
+- The daemon deviates from the benchmark harness in one important way:
+  virtio_console returns **0-byte reads when idle** (not EAGAIN) and its poll
+  can miss wakeups, so the daemon drains the port unconditionally and caps
+  poll at 100 ms (benchmark reader pattern).
+- A synchronous `execFile*` call on the host freezes the event loop and
+  starves the tunnel (surfaced as apparent 10 s stalls during testing);
+  Electron main-process code must stay async around the mux.
+- The mux debug logging is env-gated (`MUX_DEBUG` on the host); no debug
+  output in production defaults.

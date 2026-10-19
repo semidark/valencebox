@@ -23,6 +23,21 @@ if [ -b /dev/vdb ] && ! mountpoint -q /workspace; then
   mount -o noatime /dev/vdb /workspace
 fi
 
+# ---- Strict network mode detection ----
+# Strict mode boots with -nic none: no SLIRP, no 10.0.2.2. Host services are
+# reached through the valencebox-mux daemon's guest-loopback relays (proxy on
+# valencebox.proxy_port, share on valencebox.share_port — the fw_cfg share
+# config carries the relay port as well). Legacy mode keeps the SLIRP gateway.
+STRICT=no
+if [ -e /dev/virtio-ports/mux ]; then
+  STRICT=yes
+  SHARE_HOST="127.0.0.1"
+  PROXY_HOST="127.0.0.1"
+else
+  SHARE_HOST="10.0.2.2"
+  PROXY_HOST="10.0.2.2"
+fi
+
 # ---- Grow filesystems if the qcow2 was resized larger on the host ----
 # resize2fs with no size argument grows the fs to the device size and is a
 # no-op (exit 0) when already full. Online resize is supported for mounted
@@ -40,6 +55,35 @@ fi
 proxy_port=$(sed -n 's/.*valencebox\.proxy_port=\([0-9]*\).*/\1/p' /proc/cmdline)
 proxy_token=$(sed -n 's/.*valencebox\.proxy_token=\([^ ]*\).*/\1/p' /proc/cmdline)
 secrets_raw=$(sed -n 's/.*valencebox\.secrets=\([^ ]*\).*/\1/p' /proc/cmdline)
+tproxy_port=$(sed -n 's/.*valencebox\.tproxy_port=\([0-9]*\).*/\1/p' /proc/cmdline)
+[ -n "$tproxy_port" ] || tproxy_port=3129
+dns_port=$(sed -n 's/.*valencebox\.dns_port=\([0-9]*\).*/\1/p' /proc/cmdline)
+[ -n "$dns_port" ] || dns_port=53
+
+# ---- Strict-mode transparent proxy (Fake-DNS + lo OUTPUT REDIRECT) ----
+# Non-proxy-aware clients resolve hostnames via valencebox-mux's Fake-DNS on
+# 127.0.0.1:53 (receiving synthetic 198.18.0.0/15 addresses) and connect().
+# A default route over `lo` prevents ENETUNREACH under `-nic none`, and
+# netfilter OUTPUT REDIRECT steers non-loopback TCP connections to
+# valencebox-mux's transparent listener (127.0.0.1:3129), which recovers the
+# original destination via SO_ORIGINAL_DST and opens `tproxy:<host>:<port>`.
+if [ "$STRICT" = "yes" ]; then
+  rm -f /etc/resolv.conf
+  printf 'nameserver 127.0.0.1\noptions ndots:1\n' > /etc/resolv.conf
+  chmod 0644 /etc/resolv.conf
+
+  ip link set lo up 2>/dev/null || true
+  ip addr add 198.18.0.1/32 dev lo 2>/dev/null || true
+  ip route replace default dev lo src 198.18.0.1
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -t nat -F OUTPUT 2>/dev/null || true
+    iptables -t nat -A OUTPUT -d 127.0.0.0/8 -j RETURN
+    iptables -t nat -A OUTPUT -d 198.18.0.1/32 -j RETURN
+    iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports "$dns_port"
+    iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-ports "$tproxy_port"
+  fi
+fi
 
 # ---- Read QEMU fw_cfg config ----
 # The host writes these files before boot; they are not visible on the command line.
@@ -57,7 +101,7 @@ fi
 # ---- WebDAV share ----
 if [ -n "$port" ] && [ -n "$token" ]; then
   mkdir -p /etc/davfs2
-  echo "http://10.0.2.2:${port}/ valence ${token}" > /etc/davfs2/secrets
+  echo "http://${SHARE_HOST}:${port}/ valence ${token}" > /etc/davfs2/secrets
   chmod 0600 /etc/davfs2/secrets
   chown 0:0 /etc/davfs2/secrets 2>/dev/null || true
   chown 0:0 /etc/davfs2 2>/dev/null || true
@@ -83,11 +127,12 @@ if [ -n "$proxy_port" ] && [ -n "$proxy_token" ]; then
   cat > /etc/profile.d/valencebox-proxy.sh <<'PROXYEOF'
 # ValenceBox egress proxy configuration.
 # Set by mount-share.sh from kernel cmdline parameters.
-HTTP_PROXY="http://valencebox:PROXY_TOKEN@10.0.2.2:PROXY_PORT/"
-HTTPS_PROXY="http://valencebox:PROXY_TOKEN@10.0.2.2:PROXY_PORT/"
-NO_PROXY="127.0.0.1,localhost,10.0.2.2,::1"
+HTTP_PROXY="http://valencebox:PROXY_TOKEN@PROXY_HOST:PROXY_PORT/"
+HTTPS_PROXY="http://valencebox:PROXY_TOKEN@PROXY_HOST:PROXY_PORT/"
+# curl honors only lowercase http_proxy for plain-HTTP URLs; export both cases.
 http_proxy="$HTTP_PROXY"
 https_proxy="$HTTPS_PROXY"
+NO_PROXY="127.0.0.1,localhost,10.0.2.2,::1"
 no_proxy="$NO_PROXY"
 NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/valencebox-mitm.crt
 # Python (requests/httpx/uv/litellm) and Rust/Go tools that ignore the system
@@ -99,12 +144,12 @@ export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy NODE_EXTR
 PROXYEOF
 
   # Substitute actual values sed -i is portable across Linux distros.
-  sed -i "s/PROXY_TOKEN/${proxy_token}/g; s/PROXY_PORT/${proxy_port}/g" /etc/profile.d/valencebox-proxy.sh
+  sed -i "s/PROXY_TOKEN/${proxy_token}/g; s/PROXY_PORT/${proxy_port}/g; s/PROXY_HOST/${PROXY_HOST}/g" /etc/profile.d/valencebox-proxy.sh
   chmod 0644 /etc/profile.d/valencebox-proxy.sh
 
   # Also export for the current shell (mount-share runs as root from systemd).
-  export HTTP_PROXY="http://valencebox:${proxy_token}@10.0.2.2:${proxy_port}/"
-  export HTTPS_PROXY="http://valencebox:${proxy_token}@10.0.2.2:${proxy_port}/"
+  export HTTP_PROXY="http://valencebox:${proxy_token}@${PROXY_HOST}:${proxy_port}/"
+  export HTTPS_PROXY="http://valencebox:${proxy_token}@${PROXY_HOST}:${proxy_port}/"
   export NO_PROXY="127.0.0.1,localhost,10.0.2.2,::1"
   export NODE_EXTRA_CA_CERTS="/usr/local/share/ca-certificates/valencebox-mitm.crt"
   export http_proxy="$HTTP_PROXY"

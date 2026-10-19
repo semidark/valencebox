@@ -22,8 +22,9 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
 - **Host share root and traversal test scope.** `src/main/http-share.ts` passes
   `workspaceDir` as the Nephele `FileSystemAdapter` root, binds the plain-HTTP
   server to `127.0.0.1`, and uses Basic authentication with username `valence`
-  and a random per-instance token. The guest reaches it at `10.0.2.2` through
-  SLIRP. `test/share.test.ts` contains auth and WebDAV CRUD assertions, raw
+  and a random per-instance token. The guest reaches it at `127.0.0.1:<relay>`
+  through the mux tunnel in strict mode, or at `10.0.2.2` through SLIRP in legacy
+  mode. `test/share.test.ts` contains auth and WebDAV CRUD assertions, raw
   traversal PUT/GET error assertions, and checks that selected encoded PUT
   paths do not create the specified files/directories outside the share root.
   Encoded paths are not all required to return errors. These are selected path
@@ -31,10 +32,15 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
   isolation; the test does not exercise symlinks or filesystem races. The share
   wrapper delegates filesystem handling to the adapter rather than implementing
   a separate realpath/symlink confinement check.
-- **Boot assertions are narrower than sync verification.** `test/boot.test.ts`
-  asserts `/workspace` is `/dev/vdb` ext4, root login, and service active states.
-  It does not start a host share or verify a WebDAV/unison round-trip, disconnect
-  recovery, or persistence after a crash. It was not run for this update.
+- **Boot assertion scope.** `test/boot.test.ts` starts a real host WebDAV share
+  and verifies `/workspace` is `/dev/vdb` ext4, root login, active `mount-share` /
+  `workspace-sync` units, the fw_cfg share-config read, **bidirectional**
+  host↔guest file-sync round-trips, and recursive metadata-sidecar checks.
+  `test/boot:strict` additionally runs under strict containment
+  (`-nic none`) and exercises the mux tunnel, share-over-tunnel sync, the
+  transparent proxy and Fake-DNS, and SSH over a mux forward. These are
+  functional round-trip checks, not proof of crash-safety, disconnect-recovery,
+  or unlimited durability; snapshot save/restore is unimplemented.
 - **Renderer Node isolation is configured; Electron's renderer sandbox is not.**
   `src/main/main.ts` sets `contextIsolation: true` and `nodeIntegration: false`,
   but explicitly sets `sandbox: false` for the preload. `src/main/preload.ts`
@@ -48,18 +54,40 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
 
 ## Network and proxy policy
 
-- **Proxy use is configured, not mandatory egress enforcement.**
+- **Strict mode (default on Linux) mediates all guest egress by construction,
+  not by convention.** `egress.enforce` (default true) boots the VM with
+  `-nic none`: there is no SLIRP device, no guest NIC, and therefore no UDP or
+  ICMP path at all. The only guest↔host channel is the virtio-serial mux
+  tunnel (`src/main/mux-channel.ts` + `guest/guest-mux/`), whose streams are
+  injected into `EgressProxy` / `HttpShare` (protocol in `docs/mux-protocol.md`,
+  architecture and verification scope in `docs/NET-CONTAINMENT.md`).
+  Non-proxy-aware guest TCP clients are steered through the same `EgressProxy`
+  policy via Fake-DNS (`127.0.0.1:53`, `198.18.0.0/15`), a default route over
+  guest `lo`, and netfilter `OUTPUT REDIRECT` to `valencebox-mux` (`127.0.0.1:3129`,
+  `SO_ORIGINAL_DST` → `tproxy:<host>:<port>` → `injectTransparentConnection`);
+  raw-IP connects are evaluated strictly as IP literals (TLS SNI is not trusted
+  for policy).
+  `protocol: "udp"` port forwards are rejected at config load. The tunnel is
+  **not** a guest-compartment boundary: a compromised root guest can open
+  arbitrary mux streams either way — host policy (allowlist/denylist/ports,
+  rate limits) at `EgressProxy` is the enforcement point, and the guest can
+  only reach the two services the host routes. `test:boot:strict` asserts the
+  no-NIC state, daemon liveness, share-over-tunnel sync, a proxied HTTP round
+  trip, and SSH over a host-initiated mux forward on microvm/KVM and pc/TCG.
+- **Legacy SLIRP mode (egress.enforce: false) is NOT egress enforcement.**
   `src/main/qemu.ts` creates an unrestricted `-netdev user,id=net0` SLIRP
   backend with a virtio NIC; it does not set `restrict=on` or install a firewall
   forcing traffic through the proxy. `mount-share.sh` sets HTTP(S) proxy
   environment variables for cooperating clients. They do not constrain clients
   that ignore them or other protocols. The proxy's policy applies to requests
-  that reach it; this is not evidence that all guest egress is mediated.
+  that reach it; in this mode that is not all guest egress.
 - **WebDAV is separate from the egress proxy.** `NO_PROXY`/`no_proxy` includes
   `127.0.0.1,localhost,10.0.2.2,::1`. The share and proxy are separate HTTP
   servers. This configures proxy bypass for cooperating clients accessing the
-  share, not a network enforcement rule. The application proxy defaults to
-  `0.0.0.0` (`egress.listenHost` can override it), unlike the loopback share.
+  share in legacy mode (in strict mode there is no bypass — the guest has no
+  NIC). The proxy's host-side TCP listener defaults to `127.0.0.1` in strict mode
+  and `0.0.0.0` in legacy mode (`egress.listenHost` can override), unlike the
+  loopback share.
 - **Basic proxy authentication, not bearer authentication.** `main.ts` generates
   a per-start token using `generatePlaceholder()` (`psbx-sec-` plus 12 random
   bytes as hex). `qemu.ts` delivers proxy port/token and `ENV=placeholder`
@@ -152,6 +180,35 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
   cannot sanitize encrypted headers. This is not general content filtering.
 
 ## Persistence and resource sizing
+
+## QEMU process containment (deferred — maintainer decision)
+
+Strict network mode removes the guest's NIC, but the **QEMU process itself**
+still runs with the full socket and filesystem reach of the launching user. A
+hypothetical QEMU device-emulation exploit (guest-controlled input reaching
+host-side code) would inherit that reach and could dial the corporate
+network or read user-writable files directly, outside every EgressProxy
+policy.
+
+A defense-in-depth backstop was evaluated: wrap the QEMU process in an
+unprivileged user + network namespace (fresh netns: no routes, nothing
+dialable), a minimal mount view (only images, firmware, sockets, `/dev/kvm`),
+and QEMU's built-in seccomp allow-list (`-sandbox enable=on`). This is the
+same pattern QEMU's virtiofsd and Firecracker's jailer use; unprivileged
+user namespaces were verified to work on the reference Linux host. It is
+orthogonal to the mux tunnel — it constrains the QEMU *process*, applies no
+policy filtering, and fails closed if namespace setup fails.
+
+**Decision (maintainer, 2026-10): deferred until further notice.** The
+technique is Linux-only; shipping a containment layer on a single platform
+was judged not worth the added launcher complexity and boot-matrix risk at
+this time. If QEMU-process containment is revisited, the requirements
+recorded here apply: Linux-only and purely additive (other platforms keep
+today's guarantees, no silent claim of parity); fail-closed on setup failure
+in strict mode (refuse to start rather than run uncontained); KVM **and**
+TCG must pass the strict boot gate under the sandbox; and the launcher must
+stay unprivileged (user namespaces, no root helper, no setuid).
+
 
 - **Host-canonical is a sync preference, not a durability guarantee.** `main.ts`
   starts the host share and writes `.valence-sync-marker`. At sync-script

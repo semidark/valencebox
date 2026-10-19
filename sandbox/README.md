@@ -28,27 +28,44 @@ flowchart TB
         direction LR
         Root["root fs /dev/vda"]
         Work["/workspace /dev/vdb"]
-        Net["eth0 (SLIRP)"]
+        Mux["mux tunnel (strict) / eth0 (legacy)"]
     end
     UpstreamHost["upstream servers"]
     Preload <-->|IPC| Renderer
     VM -->|virtio-blk| Root
     VM -->|virtio-blk| Work
-    Work <-->|unison via guest WebDAV mount| Share
-    Net <-->|HTTP to host loopback share| Share
-    Net -->|proxy-aware HTTP and CONNECT| Proxy
+    Work <-->|unison via guest WebDAV relay| Share
+    Mux -->|injected streams| Share
+    Mux -->|proxy-aware HTTP and CONNECT| Proxy
+    Share -->|HTTP/TLS| UpstreamHost
     Proxy -->|HTTP or TLS or tunnel| UpstreamHost
-    Net -.->|direct egress remains possible| UpstreamHost
+    Mux -.->|slirp netdev (legacy only)| UpstreamHost
 ```
+
+> **Network mode.** On Linux the default (`egress.enforce`, default true) is
+> **strict containment**: the VM boots with `-nic none` — no SLIRP device, no
+> guest NIC, no UDP/ICMP. The only guest↔host data path is a multiplexed
+> virtio-serial **mux tunnel** (`src/main/mux-channel.ts` + `guest/guest-mux/`),
+> whose streams are injected into `EgressProxy` and the WebDAV `HttpShare`, so
+> every guest egress passes host policy. Non-proxy-aware clients are steered
+> through the same proxy via Fake-DNS + `iptables` redirection. In **legacy
+> mode** (`egress.enforce: false`), QEMU uses an unrestricted SLIRP
+> `-netdev user` + virtio NIC; proxy variables steer cooperating clients only and
+> are not enforcement. The diagram's `eth0`/SLIRP edge applies to legacy mode
+> only. See `docs/NET-CONTAINMENT.md`.
 
 - `VmManager` spawns QEMU with direct kernel boot and two virtio-blk disks
   (root + workspace). Serial, QMP and PTY use Unix sockets on Linux/macOS and
   loopback TCP sockets on Windows.
-- `HttpShare` runs a plain-HTTP WebDAV server loopback-bound; the guest mirrors
-  it into the workspace qcow2 using unison.
-- `EgressProxy` filters requests from proxy-aware clients and optionally performs
-  TLS interception (MITM) for secret injection. Guest environment variables do
-  not enforce mandatory egress: clients can bypass the proxy through SLIRP.
+- `HttpShare` runs a plain-HTTP WebDAV server bound to host loopback; the guest
+  mirrors it into the workspace qcow2 using unison over the mux tunnel (strict)
+  or SLIRP gateway (legacy).
+- `EgressProxy` filters requests from the guest and optionally performs TLS
+  interception (MITM) for secret injection. In strict mode (Linux default) there
+  is no other egress path — the guest has no NIC and every request reaches the
+  proxy through the tunnel, so host policy applies to all guest egress. In
+  legacy SLIRP mode guest environment variables steer cooperating clients only,
+  and clients that ignore them can egress directly.
 - The renderer displays an xterm.js terminal using the PTY channel with serial
   fallback, plus boot status (acceleration, timing). Node integration is disabled
   and context isolation enabled; Electron's renderer sandbox is explicitly off.
@@ -133,11 +150,19 @@ disk size: `WORKSPACE_MB=<n> npm run images`.
 
 ## Egress proxy configuration
 
-Guest proxy environment variables direct cooperating HTTP/HTTPS clients to
-`EgressProxy`; WebDAV uses the separate direct share path. These settings do
-not block direct network access by clients that ignore them. Configure the proxy via
-`sandbox.config.json` in the Electron `userData` directory
-(`~/Library/Application Support/valencebox/` on macOS):
+How the guest reaches `EgressProxy` depends on the network mode:
+
+- **Strict (Linux default, `egress.enforce: true`)** — the VM has no NIC. The
+  guest reaches the proxy through its local mux relay at `127.0.0.1:3128`, and
+  the request is injected into `EgressProxy` over the virtio-serial tunnel. There
+  is no other egress path, so host policy applies to every guest request.
+- **Legacy (`egress.enforce: false`)** — guest proxy environment variables direct
+  cooperating HTTP/HTTPS clients to `EgressProxy` via the SLIRP gateway
+  (`10.0.2.2:<port>`); WebDAV uses a separate direct share path. These settings
+  do **not** block direct network access by clients that ignore them.
+
+Configure the proxy via `sandbox.config.json` in the Electron `userData`
+directory (`~/Library/Application Support/valencebox/` on macOS):
 
 Use **strict JSON**: comments or trailing commas cause the current loader to
 silently fall back to empty configuration, discarding the intended policy.
@@ -178,7 +203,7 @@ to a readable PEM bundle.
 | `caCertFile` | — | PEM bundle used to verify upstream TLS servers in addition to the system trust store (for internal/self-signed upstreams). Supports `~` |
 | `maxConnections` | `256` | Reject over-limit TCP connections with `503`; accounting recovery has a known gap (see HARDENING.md) |
 | `rateLimitPerMin` | `0` | Max requests/CONNECTs per client IP per minute; over-limit returns `429`. `0` disables |
-| `listenHost` | `"0.0.0.0"` | Interface the proxy binds to (guest reaches it via the SLIRP gateway `10.0.2.2`) |
+| `listenHost` | `"127.0.0.1"` in strict mode, `"0.0.0.0"` in legacy | Interface the proxy's host-side TCP listener binds to. Strict mode uses loopback (the guest reaches it through the mux tunnel, not TCP); legacy mode uses `0.0.0.0` so the guest reaches it via the SLIRP gateway `10.0.2.2` |
 
 Runtime MITM CA and leaf generation uses pure Node (`selfsigned` →
 `@peculiar/x509`), without host `openssl`. Integration fixtures still use it.
@@ -204,9 +229,10 @@ Upstream MITM TLS verification follows `NODE_TLS_REJECT_UNAUTHORIZED`;
 never set it to `0` during normal app use. See [HARDENING.md](HARDENING.md) for
 source evidence and follow-ups before using real credentials.
 
-The proxy defaults to `0.0.0.0`, unlike the loopback-bound WebDAV share. Review
-its listening interface and host firewall; token authentication is not equivalent
-to loopback-only exposure.
+In legacy mode the proxy defaults to `0.0.0.0`, unlike the loopback-bound WebDAV
+share — review its listening interface and host firewall; token authentication
+is not equivalent to loopback-only exposure. In strict mode the proxy binds
+`127.0.0.1` and the guest never reaches it over TCP.
 
 ### Verify from inside the guest
 
@@ -233,15 +259,19 @@ Run the non-UI suites individually; there is no umbrella test script:
 ```sh
 npm run test:unit     # guest profiles and generated QEMU argument assertions
 npm run test:share    # WebDAV auth/CRUD/traversal assertions, no VM
-npm run test:egress   # proxy policy and rewriting helpers (unit)
+npm run test:egress   # proxy policy, mux-channel, and rewriting helpers (unit)
 npm run test:qmp      # frozen QEMU query-status and process stop, no snapshots
 npm run test:boot     # x86-64 login, /workspace disk layout, fw_cfg share reading, and sync round-trip
+npm run test:boot:strict # strict-mode boot: no NIC, mux tunnel, share-over-tunnel sync, transparent proxy, SSH forward
 ```
 
 QMP requires staged QEMU/firmware; boot also requires x86-64 guest images.
-`test:boot` starts a host WebDAV share to exercise fw_cfg and verify a file-sync round-trip.
-Neither `test:e2e` nor `test:snapshot` exists as an npm script; these are future
-proposals, with no current full-lifecycle equivalent.
+`test:boot` starts a host WebDAV share to exercise fw_cfg and verify a
+bidirectional file-sync round-trip plus metadata-sidecar checks.
+`test:boot:strict` repeats this under strict network containment (no NIC) and
+additionally verifies the mux tunnel, the transparent proxy, Fake-DNS, and SSH
+over a mux forward. Neither `test:e2e` nor `test:snapshot` exists as an npm
+script; these are future proposals, with no current full-lifecycle equivalent.
 
 `test:egress:integration` exists for certificates, proxy auth/policy and injection.
 Its self-signed injection fixture currently requires this **test-only** override

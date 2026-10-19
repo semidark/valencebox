@@ -165,12 +165,15 @@ npm run test:boot
 ```
 
 `test/boot.test.ts` waits for Ubuntu serial login and **root auto-login**, checks
-hostname `sandbox`, `/workspace` mounted from `/dev/vdb` as ext4, and active
-`mount-share` / `workspace-sync` systemd units. It does **not** start a host
-WebDAV share or proxy and does not verify actual host↔guest synchronization,
-PTY traffic, legacy agent HELLO/PING, snapshots or restore. An active sync unit
-alone is not evidence that unison is transferring files. Boot time varies; the
-login timeout is 120 seconds.
+hostname `sandbox`, `/workspace` mounted from `/dev/vdb` as ext4, active
+`mount-share` / `workspace-sync` systemd units, and that the guest reads the
+WebDAV share config from fw_cfg. It starts a **real host WebDAV share** and
+verifies **bidirectional** host↔guest file-sync round-trips plus recursive
+metadata-sidecar checks. It does not verify snapshots or restore, crash
+durability, or disconnect recovery. The strict-mode variant `npm run test:boot:strict`
+exercises this under `-nic none` over the mux tunnel. An active sync unit alone
+is not evidence that unison is transferring files; the round-trip assertions in
+this suite are. Boot time varies; the login timeout is 120 seconds.
 
 Add `VERBOSE=1` to stream guest serial output:
 
