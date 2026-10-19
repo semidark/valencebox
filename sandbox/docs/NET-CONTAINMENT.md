@@ -94,9 +94,9 @@ Extends the existing PtyChannel framing style (`[u32BE len][u8 type]` on
 - The QEMU chardev socket is single-connection with `server=on,wait=off`;
   the host owns it with `0600` and must refuse a second connection.
 
-## Benchmarks (KVM, Linux x86-64, 2 vCPU microvm, load-3 host)
+## Prototype benchmarks (pre-implementation, KVM, load-3 host)
 
-Guest Rust benchmark client vs. today's direct SLIRP TCP to `10.0.2.2`:
+Synthetic Rust benchmark client vs. direct SLIRP TCP to `10.0.2.2`:
 
 | Test | virtio-serial mux | SLIRP TCP |
 |---|---|---|
@@ -186,6 +186,36 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
 - Migrating token delivery off the kernel cmdline (guest `/proc/cmdline` is
   world-readable) — the mux handshake is the natural carrier.
 
+## Production benchmarks (`test/bench-tunnel.ts`, Oct 2026)
+
+Measured against the **shipped stack** — real `valencebox-mux` daemon (256 KiB
+credit windows, batched grants), real `MuxChannel` demux, streams injected
+into `EgressProxy` / the WebDAV share — from a guest curl over SSH-on-mux.
+TLS terminates on a host-local server (no WAN/proxy variance); each measured
+value is the best of 3 runs on a shared workstation (load 3–6).
+
+| Scenario | strict / KVM (microvm) | strict / TCG (pc) | legacy SLIRP / KVM |
+|---|---|---|---|
+| S1 tunnel ceiling: 128 MiB plain HTTP via relay | **90–136 MB/s** (typ. ~120) | 49–56 MB/s | n/a (no relay) |
+| S2 full chain: 128 MiB HTTPS via relay → EgressProxy → TLS | **59–82 MB/s** | 13–14 MB/s | 57–72 MB/s |
+| S3 npm-shape: 500 × 64 KiB HTTPS, conc 16 (fresh connection per request) | 160–180 req/s, ~10 MB/s, p50 38–56 ms, p99 92–118 ms | 14 req/s | 155–165 req/s, ~10 MB/s, p99 105–144 ms |
+| S4 S2 while unison syncs 100×256 KiB every 2 s | **59–77 MB/s** (≤ ~25% degradation, no collapse) | — | — |
+
+Reading the numbers:
+
+- **Tunnel ≈ SLIRP at every measured shape on KVM.** The strict design costs
+  nothing measurable in throughput or latency versus the legacy path it
+  replaces; small-request latency is dominated by per-connection TLS
+  handshakes and process spawn, not the transport.
+- The production tunnel ceiling (~120 MB/s) is ~60% of the prototype
+  harness (~200 MB/s): the cost of real credit windows, relay listeners and
+  the single poll loop. Comfortably above any realistic workspace workload.
+- Unison churn and proxied egress share the tunnel without head-of-line
+  collapse (S4).
+- TCG is CPU-bound: ~2.5× slower bulk, and small-request rates collapse
+  because every TLS handshake runs under emulation. Strict mode is fully
+  functional under TCG (boot gate passes); it is not the throughput target.
+
 ## Implementation status (Phase 1)
 
 Implemented and verified on Linux x86-64 (KVM/microvm and TCG/pc):
@@ -217,13 +247,10 @@ the legacy `test:boot` (SLIRP path unchanged).
 
 Gaps / notes:
 
-- Full throughput re-benchmark of the production daemon was not rerun; the
-  earlier tunnel benchmarks plus a 4 MiB no-corruption roundtrip through the
-  real daemon stand in as functional evidence. The daemon deviates from the
-  benchmark harness in one important way: virtio_console returns **0-byte
-  reads when idle** (not EAGAIN) and its poll can miss wakeups, so the daemon
-  drains the port unconditionally and caps poll at 100 ms (benchmark
-  reader pattern).
+- The daemon deviates from the benchmark harness in one important way:
+  virtio_console returns **0-byte reads when idle** (not EAGAIN) and its poll
+  can miss wakeups, so the daemon drains the port unconditionally and caps
+  poll at 100 ms (benchmark reader pattern).
 - A synchronous `execFile*` call on the host freezes the event loop and
   starves the tunnel (surfaced as apparent 10 s stalls during testing);
   Electron main-process code must stay async around the mux.
