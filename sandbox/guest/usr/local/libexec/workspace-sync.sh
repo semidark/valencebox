@@ -58,4 +58,6 @@ exec unison /host-workspace /workspace \
   -ignore 'Name .DS_Store' \
   -ignore 'Name lost+found' \
   -ignore 'Name .valence-sync-marker' \
+  -ignore 'Name .nephelemeta' \
+  -ignore 'Name *.nephelemeta' \
   >/var/log/unison.log 2>&1

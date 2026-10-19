@@ -100,8 +100,9 @@ For a single explicit target, use `npm run images -- --arch amd64` or
 What happens for each target:
 - Builds Ubuntu 24.04 from `guest/Dockerfile` (`sandbox-guest` for amd64,
   `sandbox-guest-arm64` for ARM), exports its rootfs and extracts kernel/initramfs
-- Creates a sparse qcow2 root with ext4, sized with 25% slack and at least 5 GiB
-- Creates an **unformatted** workspace qcow2 (default 1 GiB, configurable with
+- Creates a sparse qcow2 root with ext4, sized with 25% slack and at least 25 GiB
+  (override with `MIN_ROOT_MB`)
+- Creates an **unformatted** workspace qcow2 (default 10 GiB, configurable with
   `WORKSPACE_MB`); guest `mount-share.service` formats it as ext4 on first boot
 - Prefers the bundled Darwin `qemu-img` from step 2, otherwise uses `$PATH`
 - Generates `images/vm-debug` SSH keys if absent and embeds the public key

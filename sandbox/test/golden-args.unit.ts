@@ -33,7 +33,9 @@ testCase("minimal x86_64 TCG", buildOpts(p, {
   rootImage: p.rootImage,
   workspaceImage: p.workspaceImage,
 }), "pc", (args) => {
-  assert(!args.includes("-cpu"), "x86_64 TCG has no -cpu flag");
+  const cpuIdx = args.indexOf("-cpu");
+  assert(cpuIdx !== -1, "x86_64 TCG has -cpu flag");
+  assert(args[cpuIdx + 1] === "max", "cpu = max under TCG");
   assert(!args.includes("-append"), "no -append without kernelCmdline");
 });
 
@@ -53,13 +55,14 @@ testCase("full x86_64 TCG", buildOpts(pFull, {
   proxyPort: 12345,
   proxyToken: "abc123def456",
 }), "pc", (args) => {
-  assert(!args.includes("-cpu"), "x86_64 TCG has no -cpu flag");
   const appendIdx = args.indexOf("-append");
   assert(appendIdx !== -1, "cmdline present");
   assert(!args[appendIdx + 1].includes("reboot=t"), "no reboot=t under pc");
   assert(args[appendIdx + 1].includes("valencebox.proxy_port=12345"), "proxy_port on cmdline");
   assert(args[appendIdx + 1].includes("valencebox.proxy_token=abc123def456"), "proxy_token on cmdline");
   assert(args.some(a => a === "virtio-balloon-pci"), "virtio-balloon-pci for pc");
+  const cpuIdx = args.indexOf("-cpu");
+  assert(cpuIdx !== -1 && args[cpuIdx + 1] === "max", "cpu = max under TCG");
 });
 
 // Case 3: no kernel, no cmdline (still works)
@@ -86,6 +89,22 @@ testCase("microvm x86_64 TCG", buildOpts(pFull, {
   assert(args.some(a => a.startsWith(`virtio-rng${microSuffix}`)), "virtio-rng-device for microvm");
   assert(args.some(a => a.startsWith(`virtio-balloon${microSuffix}`)), "virtio-balloon-device for microvm");
 });
+
+// Case 4b: x86_64 microvm under KVM → -cpu host (native ISA extensions)
+testCase("microvm x86_64 KVM", buildOpts(pFull, {
+  kernelCmdline: "console=ttyS0 root=/dev/vda quiet",
+}), "microvm", (args) => {
+  const cpuIdx = args.indexOf("-cpu");
+  assert(cpuIdx !== -1, "-cpu present under KVM");
+  assert(args[cpuIdx + 1] === "host", "cpu = host under KVM");
+}, "kvm");
+
+// Case 4c: x86_64 under WHPX → no -cpu (QEMU 9.2.4 rejects host under WHPX)
+testCase("pc x86_64 WHPX", buildOpts(pFull, {
+  kernelCmdline: "console=ttyS0 root=/dev/vda quiet",
+}), "pc", (args) => {
+  assert(!args.includes("-cpu"), "no -cpu under WHPX (host unsupported, default model used)");
+}, "whpx");
 
 // ---- aarch64 profile tests ----
 
