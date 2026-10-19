@@ -169,6 +169,35 @@ uncovered guarantees discussed below. Paths are relative to `sandbox/`.
 
 ## Persistence and resource sizing
 
+## QEMU process containment (deferred — maintainer decision)
+
+Strict network mode removes the guest's NIC, but the **QEMU process itself**
+still runs with the full socket and filesystem reach of the launching user. A
+hypothetical QEMU device-emulation exploit (guest-controlled input reaching
+host-side code) would inherit that reach and could dial the corporate
+network or read user-writable files directly, outside every EgressProxy
+policy.
+
+A defense-in-depth backstop was evaluated: wrap the QEMU process in an
+unprivileged user + network namespace (fresh netns: no routes, nothing
+dialable), a minimal mount view (only images, firmware, sockets, `/dev/kvm`),
+and QEMU's built-in seccomp allow-list (`-sandbox enable=on`). This is the
+same pattern QEMU's virtiofsd and Firecracker's jailer use; unprivileged
+user namespaces were verified to work on the reference Linux host. It is
+orthogonal to the mux tunnel — it constrains the QEMU *process*, applies no
+policy filtering, and fails closed if namespace setup fails.
+
+**Decision (maintainer, 2026-10): deferred until further notice.** The
+technique is Linux-only; shipping a containment layer on a single platform
+was judged not worth the added launcher complexity and boot-matrix risk at
+this time. If QEMU-process containment is revisited, the requirements
+recorded here apply: Linux-only and purely additive (other platforms keep
+today's guarantees, no silent claim of parity); fail-closed on setup failure
+in strict mode (refuse to start rather than run uncontained); KVM **and**
+TCG must pass the strict boot gate under the sandbox; and the launcher must
+stay unprivileged (user namespaces, no root helper, no setuid).
+
+
 - **Host-canonical is a sync preference, not a durability guarantee.** `main.ts`
   starts the host share and writes `.valence-sync-marker`. At sync-script
   startup, `workspace-sync.sh` checks mount usability, attempts stale-mount

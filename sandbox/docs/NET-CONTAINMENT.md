@@ -185,6 +185,10 @@ Windows and TCG are unmeasured; TCG coverage is required by the M3 gate.
   functional gate.
 - Migrating token delivery off the kernel cmdline (guest `/proc/cmdline` is
   world-readable) — the mux handshake is the natural carrier.
+- **QEMU process containment** (Linux-only netns + seccomp backstop around
+  the QEMU process): evaluated and **deferred by maintainer decision** —
+  rationale and requirements recorded in `HARDENING.md`, section
+  "QEMU process containment (deferred — maintainer decision)".
 
 ## Production benchmarks (`test/bench-tunnel.ts`, Oct 2026)
 
