@@ -66,19 +66,17 @@ is separate from current verification.
   Host-side integration tests do not verify actual guest CA installation/trust.
 - `resolveSecrets()` validates env names and resolves sources in order
   `value` > `fromFile` > `fromEnv`. Guest setup receives placeholders rather
-  than resolved values. **Header and body authorization differ:**
-  `rewriteHeaders()` checks each encountered placeholder's declared hosts;
-  `rewriteBody()` has no host argument and replaces from the entire secret
-  list. MITM and plain-HTTP secret paths pass all secrets after matching any
-  secret host. Header mismatch assertions do not prove host-scoped body
-  authorization. Ordinary forwards/opaque tunnels do not scan all placeholder
-  uses; there is no blanket “unauthorized placeholder always returns 403” or
-  “real secrets can never reach the guest” guarantee.
+  than resolved values. **Secret injection is header-only:**
+  `rewriteHeaders()` checks each encountered placeholder's declared hosts and
+  swaps it for the real secret value, or throws `PlaceholderViolation` on
+  unauthorized hosts. Request bodies are streamed via `req.pipe()` without
+  buffering, size caps, or inspection. Ordinary forwards/opaque tunnels do
+  not scan all placeholder uses; there is no blanket “unauthorized placeholder
+  always returns 403” or “real secrets can never reach the guest” guarantee.
 - **Plaintext secret injection exists independently of MITM enablement.**
-  Non-TLS forwards to secret hosts use `forwardRequestWithSecrets()` and send
-  rewritten credentials upstream via `http.request`. Both secret paths buffer
-  up to 10 MB. MITM returns 411 for chunked bodies and 413 for oversized bodies;
-  plain-HTTP secret forwarding returns 403 for those cases.
+  Non-TLS forwards use `forwardRequestWithSecrets()`, check headers, and send
+  rewritten credentials upstream via `http.request`. Request bodies are streamed
+  directly; chunked transfer encoding is supported on both HTTP and HTTPS MITM paths.
 - **TLS verification is environment-dependent.** MITM upstream requests set
   `rejectUnauthorized` from `NODE_TLS_REJECT_UNAUTHORIZED !== "0"`; ordinary
   HTTPS forwards use Node's defaults. `caCertFile` adds a PEM bundle to
@@ -111,11 +109,10 @@ npm run test:egress:integration
 
 - `test:egress` runs only `test/egress-proxy.unit.ts`: host policy and
   normalization, secret resolution/env validation, header mismatch/replacement,
-  body replacement, and response sanitization assertions. It does not run the
-  integration suite or prove cross-host body authorization.
+  and response sanitization assertions.
 - `test:egress:integration` runs `test/egress-proxy.integration.ts`: leaf SAN,
   signature and cache assertions; Basic auth; CONNECT host policy; MITM
-  header/body injection with Content-Length repair and a delayed response;
+  header secret injection with streamed body and a delayed response;
   one over-limit 503; outer-request rate limiting; strict custom upstream CA;
   and log sink assertions. The certificate fixture asserts CA subject and
   leaf signing behavior, not every CA property mentioned in its comments.
@@ -208,13 +205,13 @@ injection and the authorization limitations described above.
 - [x] **B2. Leaf generation/cache.** Pure-Node signing with DNS/IP SANs and
   normalized-host-hash disk cache. No snapshot sizing or performance claims.
 - [x] **B3. MITM CONNECT handler.** Select secret-host interception, TLS-terminate,
-  parse HTTP, rewrite, repair Content-Length, and forward HTTPS. Upstream
-  verification remains environment-dependent; chunked MITM bodies get 411.
+  parse HTTP, rewrite headers, stream request body, and forward HTTPS. Upstream
+  verification remains environment-dependent; chunked transfer encoding is supported.
 - [x] **B4. Placeholder validation helpers.** Header mismatch throws
-  `PlaceholderViolation`; body replacement lacks per-secret host validation.
+  `PlaceholderViolation`; secret replacement is header-only with direct body streaming.
   This task does not establish universal unauthorized-placeholder rejection.
-- [x] **B5. Add secret injection integration fixture.** Host-side header/body
-  assertions exist; suite/environment scope is documented above, not a guest
+- [x] **B5. Add secret injection integration fixture.** Host-side header injection and
+  body streaming assertions exist; suite/environment scope is documented above, not a guest
   trust or clean-environment pass claim.
 - [x] **B6. Guest CA setup.** Deliver via `opt/org.valencebox.mitm-ca` and read
   its guest sysfs `raw` file; install system CA and set `NODE_EXTRA_CA_CERTS`.

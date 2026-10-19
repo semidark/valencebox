@@ -81,8 +81,8 @@ npm start
   (proxy policy/rewriting helpers), `test:egress:integration` (proxy sockets,
   certificates, auth and injection), `test:share` (WebDAV auth/CRUD/traversal,
   no VM), `test:qmp` (frozen QEMU query-status and process stop), and `test:boot`
-  (x86-64 serial login, disk layout and service status; no host share or sync
-  round-trip). QMP tests do not test snapshot save/restore.
+  (x86-64 serial login, disk layout, service status, fw_cfg share reading,
+  and host-guest sync round-trip). QMP tests do not test snapshot save/restore.
 - **Existing legacy suite:** `test:ui` uses a stub preload and old renderer
   fields. Requires built renderer assets and Electron/display prerequisites;
   does not verify the live VM lifecycle or production security settings.
@@ -186,13 +186,14 @@ Place in the Electron `userData` dir (`~/.config/ValenceBox/` on Linux).
   honor it, including the direct WebDAV share path.
 - **Optional MITM TLS interception is implemented, not security-audited.** When `enableMitm: true` and a
   secret host is matched, the proxy TLS-terminates the connection, replaces
-  placeholders in headers/body, and re-encrypts to the upstream. Guest CA trust
+  placeholders in request headers, streams the request body without buffering,
+  and re-encrypts to the upstream. Guest CA trust
   is handled via `fw_cfg` — the CA cert is injected into the guest at boot and
   installed via `update-ca-certificates`. MITM CA and leaf certificates are
   generated in pure Node (`selfsigned` → `@peculiar/x509`) — no `openssl`
   required by runtime certificate generation. The CA persists across restarts.
-  Plain HTTP secret-host requests also rewrite credentials, even with MITM off.
-  Body host authorization, TLS verification and upstream secret echo limitations
+  Plain HTTP secret-host requests also rewrite credentials in headers, even with MITM off.
+  TLS verification and upstream secret echo limitations
   are documented in `sandbox/HARDENING.md`; do not promise the guest can never
   recover a secret.
 - Other config knobs per `docs/qemu.md`: `accel`, `workspaceDir`, `memMb`,

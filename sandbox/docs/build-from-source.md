@@ -231,7 +231,10 @@ booting...
 ✓ hostname set
 ✓ /workspace mounted from second disk (ext4)
 ✓ mount-share service started
-✓ workspace-sync service started
+✓ fw_cfg share config readable in guest (qemu_fw_cfg loaded)
+✓ workspace-sync service active
+✓ host→guest sync round-trip
+✓ no .nephelemeta sidecars in /workspace
 ALL BOOT TESTS PASSED
 ```
 
